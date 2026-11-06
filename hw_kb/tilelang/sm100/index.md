@@ -20,6 +20,11 @@ in here in the finish round.
 
 ## Recipes (none yet)
 
+The four mechanism skeletons currently live under `../sm90/` (they document the TileLang language
+surface, which is shared). Do **not** promote any of them onto this arch: a Blackwell reading is a
+different reading — the `T.gemm` path is `tcgen05`, not `wgmma` — and each sm100 entry has to carry
+its own `## Measured on` block taken on this arch.
+
 | Interface | Entry | Evidence |
 |---|---|---|
 | — | — | — |

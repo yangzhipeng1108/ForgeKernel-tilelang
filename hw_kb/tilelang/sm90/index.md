@@ -17,11 +17,19 @@ and the MMA path and infers part of the layout itself, so a DSL reading is a hyp
 `examples/` and `docs/`, the PTX ISA, and your own probes are authoritative; what you win on a probe gets written
 in here in the finish round.
 
-## Recipes (none yet)
+## Recipes (skeletons — mechanism documented, readings not taken)
+
+A row here is **not** a certified recipe. These four files exist so that the code a student needs
+is written down with the pitfalls already mapped; each carries `[to be measured]` where the
+evidence has to go. A row becomes certified only when its `## Measured on` block is filled with a
+`PROBE PASS` job id or a moved NCU census axis.
 
 | Interface | Entry | Evidence |
 |---|---|---|
-| — | — | — |
+| `T.Pipelined(num_stages=)` — stage budget, what it does and does not stage | `software_pipeline_stage_budget.md` | `[to be measured]` |
+| `T.copy` across scopes; `T.annotate_layout` only pins the buffers it names | `tiled_copy_scope_and_swizzle.md` | `[to be measured]` |
+| `T.gemm` operand orientation and `GemmWarpPolicy` | `gemm_operand_layout_and_policy.md` | `[to be measured]` |
+| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | `[to be measured]` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 
