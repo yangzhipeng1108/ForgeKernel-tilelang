@@ -1288,7 +1288,18 @@ def render_readme_section(problem: Problem, kernel_file: str = "kernel.py") -> s
 
 def write_card(op_dir: Path, problem: Problem, template_eval: Path, *,
                dps: bool = True, kernel_file: str = "kernel.py") -> list[Path]:
-    """Write the leaderboard files into a freshly scaffolded card."""
+    """Write the leaderboard files into a freshly scaffolded card.
+
+    Refuses a kernel file this module has no stub for, before writing anything: the
+    only two stubs here are the CuTe DSL and CUDA C++ ones, and falling through to
+    the CuTe DSL skeleton for a file another mode owns is the mismatch the mode split
+    exists to prevent (see taskcard._STUB_LANGUAGES)."""
+    if str(kernel_file).endswith("_tl.py"):
+        raise ValueError(
+            f"no leaderboard card stub for {kernel_file!r} yet: the TileLang stub "
+            f"waits on a spelling TileLang actually accepts (form it with "
+            f"`python -m tilelang.tools.compile_only`), then add it here and in "
+            f"taskcard.render_kernel_stub.")
     op_dir = Path(op_dir)
     lb_dir = op_dir / LEADERBOARD_DIR
     lb_dir.mkdir(parents=True, exist_ok=True)

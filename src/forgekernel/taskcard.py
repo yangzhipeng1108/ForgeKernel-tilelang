@@ -33,6 +33,11 @@ SUITE = "forgekernel"
 PROBLEM = lbmod.PROBLEM_FILE                     # eval/leaderboard/problem.json
 LB_DIR = lbmod.LEADERBOARD_DIR
 KERNEL_FILE = {"cutedsl": "kernel.py", "cuda": "kernel.cu", "tilelang": "kernel_tl.py"}
+# Languages this module can render a starter kernel for. A language can be a
+# registered mode (loop/lang_mode.py) before its stub exists: the mode reads the
+# right prompts and KB, the student just starts from an empty file instead of a
+# skeleton that teaches the wrong one.
+_STUB_LANGUAGES = frozenset({"cutedsl", "cuda"})
 CUTE_ARCH = {"sm90": "sm_90a", "sm100": "sm_100a", "sm103": "sm_103a", "sm120": "sm_120a"}
 EVAL_FILES = ("leaderboard.py", "timing.py", "precision.py", "closed_ref.py", "ncu_probe.py")
 NCU_PROBE_MODE = "cmd:ncu --csv --metrics gpu__time_active.sum python3 eval/ncu_probe.py"
@@ -371,6 +376,18 @@ def render_kernel_stub(task, check) -> str:
     shapes = "\n".join(f"    {s.name}: {json.dumps(s.axes)}" for s in task.shapes)
     ins = "\n".join(_spec(n, s) for n, s in check.definition["inputs"].items())
     outs = "\n".join(_spec(n, s) for n, s in check.definition["outputs"].items())
+    # No stub is better than a wrong one: a language whose stub is not written yet
+    # must refuse here, not fall through to the CuTe DSL skeleton. A TileLang student
+    # handed `def run(...): raise NotImplementedError` is taught to write CuTe DSL in
+    # a file the mode reads as TileLang -- the exact silent mismatch lang_mode exists
+    # to prevent. The TileLang stub waits on a form the language actually accepts.
+    if task.language not in _STUB_LANGUAGES:
+        raise ValueError(
+            f"no kernel stub for language {task.language!r} yet (have: "
+            f"{', '.join(sorted(_STUB_LANGUAGES))}). Fix the API spelling of the "
+            f"target DSL on a real box first -- `python -m tilelang.tools.compile_only` "
+            f"for TileLang -- then add its branch here and in leaderboard.py, or write "
+            f"{KERNEL_FILE.get(task.language, 'the kernel file')} by hand.")
     if task.language == "cuda":
         params = ", ".join(lbmod._cpp_param(n, s) for n, s in check.definition["inputs"].items())
         comment = "\n".join("// " + line for line in (

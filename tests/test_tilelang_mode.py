@@ -222,3 +222,63 @@ def test_the_tilelang_kb_is_not_prefilled_from_the_dsl_or_cuda_trees():
             assert not dsl_spelling.search(text), (entry.name, dsl_spelling.search(text))
             if entry.name != "index.md":
                 assert "## Measured on" in text, entry.name
+
+
+# ---------------------------------------------------------------- kernel stub
+def _task(language: str):
+    """Only the three fields render_kernel_stub reads; a full Task needs a directory,
+    a reference, two agent specs and a budget, none of which the stub looks at."""
+    import types
+
+    from forgekernel.task import Shape
+
+    return types.SimpleNamespace(
+        name="rmsnorm", language=language, arch="sm90",
+        shapes=(Shape(name="default", axes={"M": 4096, "N": 1024}),))
+
+
+def _check():
+    from forgekernel.judge import Check
+
+    return Check(definition={"name": "rmsnorm",
+                             "inputs": {"x": {"dtype": "F32", "shape": [4096, 1024]}},
+                             "outputs": {"y": {"dtype": "F32", "shape": [4096, 1024]}}},
+                 judge_src="")
+
+
+def test_a_language_with_no_stub_is_refused_and_never_falls_through_to_the_dsl_skeleton():
+    """A TileLang task must not be handed the CuTe DSL skeleton: `def run(...): raise
+    NotImplementedError` in a kernel_tl.py teaches exactly what the mode split exists to
+    prevent. Refusing is the honest answer until the TileLang spelling is settled on a
+    real box (P0-a) -- a wrong skeleton is worse than no skeleton, because the student
+    reads it as the intended shape."""
+    from forgekernel import taskcard
+
+    assert "tilelang" in taskcard.KERNEL_FILE           # the mode is registered...
+    assert "tilelang" not in taskcard._STUB_LANGUAGES   # ...but its stub is not written
+
+    for language in ("cutedsl", "cuda"):                # the two that ARE written still work
+        text = taskcard.render_kernel_stub(_task(language), _check())
+        assert "NotImplementedError" in text or "TORCH_CHECK(false" in text, language
+
+    with pytest.raises(ValueError, match="no kernel stub for language 'tilelang'"):
+        taskcard.render_kernel_stub(_task("tilelang"), _check())
+    # the message says how to unblock it, and names the file to write by hand
+    message = ""
+    try:
+        taskcard.render_kernel_stub(_task("tilelang"), _check())
+    except ValueError as e:
+        message = str(e)
+    assert "compile_only" in message and "kernel_tl.py" in message
+
+
+def test_the_leaderboard_card_refuses_a_tilelang_kernel_file_before_writing_anything(tmp_path):
+    """forge new --leaderboard writes its card through leaderboard.write_card, a second
+    stub writer. It has the CuTe DSL and CUDA stubs only, so a kernel_tl.py must be
+    refused up front -- after a partial card is written, the operator tree looks
+    scaffolded and the failure surfaces much later."""
+    from forgekernel import leaderboard as lbmod
+
+    with pytest.raises(ValueError, match="no leaderboard card stub"):
+        lbmod.write_card(tmp_path / "op", None, tmp_path / "eval", kernel_file="kernel_tl.py")
+    assert not (tmp_path / "op").exists() or not any((tmp_path / "op").iterdir())
