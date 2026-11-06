@@ -310,9 +310,68 @@ def test_export_refuses_a_drifted_signature(base: Path, fib_root: Path) -> None:
     ("from triton import language as tl\n", None, "triton"),
     ("import torch\n", None, "pytorch"),
     ("import torch\n", "triton", "triton"),
+    ("import tilelang\nimport tilelang.language as T\n", None, "tilelang"),
+    ("import tilelang\n", "tilelang", "tilelang"),
 ])
 def test_infer_language(src: str, loop_lang, want: str) -> None:
     assert lb.infer_language(src, loop_lang) == want
+
+
+def test_a_tilelang_kernel_is_never_filed_under_another_language(base: Path) -> None:
+    """Neither suite has a TileLang tag, so the export is refused. The failure this pins is the
+    quiet one: without the `tilelang` branch, `infer_language` falls through to `pytorch` and the
+    solution JSON claims `dependencies: ["torch"]` -- a solution another machine would try to
+    import as a torch module."""
+    card = base / "operators" / "rms"
+    board = card / lb.LEADERBOARD_DIR
+    board.mkdir(parents=True)
+    (board / "problem.json").write_text(json.dumps({
+        "suite": "flashinfer-bench", "entry": "run", "kernel_file": "kernel_tl.py",
+        "dps": True,
+        "definition": {"name": "rmsnorm", "inputs": {"x": {}}, "outputs": {"y": {}}}}))
+    (card / "kernel_tl.py").write_text(
+        "import tilelang\nimport tilelang.language as T\n\n"
+        "@T.prim_func\ndef run(x, y):\n    pass\n")
+    (card / "loop.toml").write_text('[loop]\nlanguage = "tilelang"\n')
+
+    with pytest.raises(ValueError, match=r"cannot export a tilelang kernel"):
+        lb.export_solution(card, name="n", author="a")
+    # even naming it explicitly must not get past: there is no tag to write
+    with pytest.raises(ValueError, match=r"cannot export a tilelang kernel"):
+        lb.export_solution(card, name="n", author="a", language="tilelang")
+    # an explicit override to a language the suite does know is still honoured
+    sol = lb.export_solution(card, name="n", author="a", language="cuda-sol")
+    assert sol["spec"]["language"] == "cuda"
+    assert "torch" not in json.dumps(sol["spec"])
+
+
+def test_the_export_language_choices_name_the_refusal_rather_than_hiding_it():
+    """`--language tilelang` must reach the explanatory ValueError, not argparse's
+    `invalid choice` (which reads like a typo)."""
+    assert "tilelang" in set(lb._EXPORT_LANG) | set(lb._EXPORT_UNSUPPORTED)
+    assert "tilelang" not in lb._EXPORT_LANG
+
+
+def test_show_says_a_tilelang_card_cannot_be_exported_before_the_export_fails(
+        base: Path, capsys) -> None:
+    """The student reads `show` first. Finding out at `export` (rc 2) that the mode they were
+    told to use has no suite tag is the wrong time to find out."""
+    card = base / "operators" / "rms"
+    board = card / lb.LEADERBOARD_DIR
+    board.mkdir(parents=True)
+    (board / "problem.json").write_text(json.dumps({
+        "suite": "flashinfer-bench", "entry": "run", "kernel_file": "kernel_tl.py",
+        "dps": True, "definition": {"name": "rmsnorm", "inputs": {"x": {}},
+                                    "outputs": {"y": {}}},
+        "workload": {"uuid": "u1", "axes": {}}}))
+    (card / "kernel_tl.py").write_text(
+        "import tilelang\nimport tilelang.language as T\n\n"
+        "@T.prim_func\ndef run(x, y):\n    pass\n")
+
+    assert lb.main(["rms", "show", "--base-dir", str(base)]) == 0
+    out = capsys.readouterr().out
+    assert "signature OK" in out
+    assert "export      not available for a tilelang kernel" in out
 
 
 def test_leaderboard_cli_show_and_export(base: Path, fib_root: Path, capsys,

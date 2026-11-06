@@ -262,6 +262,11 @@ baseline spanned 2.8 µs against 24 µs by events, and paged decode 7.6 vs 29 µ
 - Language: the export infers it from the card's language / the kernel's imports -- `cutedsl` (FlashInfer-Bench
   `python`, SOL `cute_dsl`), `triton`, otherwise a PyTorch host (FlashInfer-Bench `python`, SOL `pytorch`); the
   lower-level `forge <op> leaderboard export` takes `--language` to override it.
+- TileLang has no tag in either suite (SOL-ExecBench lists pytorch / triton / cutlass / cudnn / cute_dsl /
+  cutile / cuda_cpp), so a `kernel_tl.py` card is **refused** at export rather than filed under `pytorch` --
+  that would have emitted `dependencies: ["torch"]` for a kernel that does not use torch. `show` reports
+  `export      not available for a tilelang kernel`. `--language` still works when the kernel really is
+  written in one of the suite's languages and the inference simply guessed wrong.
 
 ## How it differs from an ordinary task (harness side)
 

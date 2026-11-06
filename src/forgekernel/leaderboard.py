@@ -1512,9 +1512,27 @@ _EXPORT_LANG = {
     "cuda-sol": ("cuda", ["cuda_cpp"], []),
 }
 
+# Languages ForgeKernel runs that neither suite can accept, with the reason a student is owed.
+# The export is refused here rather than guessed at: writing `pytorch` for a TileLang kernel
+# produces a solution JSON that another machine would try to import as a torch module.
+_EXPORT_UNSUPPORTED = {
+    "tilelang": ("neither leaderboard suite has a TileLang tag (SOL-ExecBench lists "
+                 "pytorch / triton / cutlass / cudnn / cute_dsl / cutile / cuda_cpp; "
+                 "FlashInfer-Bench has none either), so there is no language string to "
+                 "export. Refused rather than filed under pytorch, which would claim a "
+                 "dependency the kernel does not have."),
+}
+
 
 def infer_language(kernel_src: str, loop_language: str | None = None) -> str:
-    """cutedsl / triton / pytorch, from loop.toml's language or the kernel's imports."""
+    """cutedsl / triton / pytorch, from loop.toml's language or the kernel's imports.
+
+    A TileLang kernel is **not** reported here, and that is deliberate: neither leaderboard
+    suite has a tag for it (SOL-ExecBench lists PyTorch / Triton / CUTLASS / cuDNN / CuTe DSL /
+    cuTile / CUDA C++, and FlashInfer-Bench has no entry either). Inventing a tag would produce
+    a solution JSON the other side cannot run. ``export_solution`` refuses the export instead,
+    before it writes anything; see ``_EXPORT_UNSUPPORTED``.
+    """
     if loop_language in ("cutedsl", "triton"):
         return loop_language
     tree = ast.parse(kernel_src)
@@ -1524,6 +1542,11 @@ def infer_language(kernel_src: str, loop_language: str | None = None) -> str:
             mods.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             mods.add(node.module.split(".")[0])
+    # TileLang before cutlass: a TileLang kernel must never be reported as a DSL kernel, and
+    # it must not reach the `pytorch` fallback either (that would export a TileLang kernel
+    # claiming its dependency is `torch`, which is a wrong solution rather than a refused one).
+    if "tilelang" in mods:
+        return "tilelang"
     if "cutlass" in mods:
         return "cutedsl"
     if "triton" in mods:
@@ -1589,6 +1612,8 @@ def export_solution(op_dir: Path, *, name: str, author: str, language: str | Non
         raise ValueError("; ".join(bad))
     cuda = is_cuda_kernel_file(kfile)
     lang = "cuda-sol" if cuda else language or infer_language(src, _loop_language(op_dir))
+    if lang in _EXPORT_UNSUPPORTED:
+        raise ValueError(f"cannot export a {lang} kernel: {_EXPORT_UNSUPPORTED[lang]}")
     if lang not in _EXPORT_LANG:
         raise ValueError(f"language must be one of {sorted(_EXPORT_LANG)}, got {lang!r}")
     fib_lang, sol_langs, sol_deps = _EXPORT_LANG[lang]
@@ -1627,7 +1652,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default=None, help="export: write here (default: stdout)")
     p.add_argument("--name", default=None, help="export: solution name")
     p.add_argument("--author", default="forgekernel", help="export: solution author")
-    p.add_argument("--language", default=None, choices=sorted(_EXPORT_LANG),
+    p.add_argument("--language", default=None,
+                   choices=sorted(set(_EXPORT_LANG) | set(_EXPORT_UNSUPPORTED)),
                    help="export: override the inferred language")
     p.add_argument("--hardware", default="B200", help="export: target hardware")
     args = p.parse_args(argv)
@@ -1661,6 +1687,11 @@ def main(argv: list[str] | None = None) -> int:
         src = (op_dir / problem.get("kernel_file", "kernel.py")).read_text(encoding="utf-8")
         bad = signature_findings(src, problem)
         print("kernel.py   " + ("signature OK" if not bad else f"SIGNATURE: {bad[0]}"))
+        kfile = problem.get("kernel_file", "kernel.py")
+        if not is_cuda_kernel_file(kfile):
+            lang = infer_language(src, _loop_language(op_dir))
+            if lang in _EXPORT_UNSUPPORTED:
+                print(f"export      not available for a {lang} kernel")
         return 0
     try:
         sol = export_solution(op_dir, name=args.name or f"{args.op}_forgekernel",
