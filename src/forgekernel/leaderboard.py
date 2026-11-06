@@ -705,6 +705,42 @@ def is_cuda_kernel_file(kernel_file: str) -> bool:
     return Path(kernel_file).suffix in CUDA_KERNEL_SUFFIXES
 
 
+# The definition's dtype names, as the strings TileLang's T.Tensor takes.
+_LEADERBOARD_TL_DTYPE = {"F32": "float32", "F16": "float16", "BF16": "bfloat16",
+                         "I32": "int32", "I64": "int64", "I8": "int8", "U8": "uint8",
+                         "BOOL": "bool"}
+
+# A TileLang kernel file is Python, so the two cannot be told apart by the interpreter;
+# the suffix is what keeps them apart (loop/lang_mode.py owns the same rule).
+TILELANG_KERNEL_SUFFIXES = ("_tl.py",)
+
+
+def is_tilelang_kernel_file(kernel_file: str) -> bool:
+    return str(kernel_file).endswith(TILELANG_KERNEL_SUFFIXES)
+
+
+def kernel_language_or_none(kernel_file: str) -> str | None:
+    """The loop language a kernel file names, or None when its suffix names none.
+
+    ``kernel.py`` is the CuTe DSL default (the loop's unset-language default, and what
+    every card written before the modes existed holds); a suffix no mode claims is None
+    so a caller can refuse instead of quietly writing a CuTe DSL skeleton."""
+    from forgekernel.loop import lang_mode
+
+    if lang_mode.language_for_kernel_file(kernel_file):
+        return lang_mode.language_for_kernel_file(kernel_file)
+    return "cutedsl" if str(kernel_file).endswith(".py") else None
+
+
+def kernel_language(kernel_file: str) -> str:
+    """The loop language a card's kernel file implies, for the config writers.
+
+    One place, so ``forge new --leaderboard --kernel-file kernel_tl.py`` cannot write a
+    ``loop.toml.example`` that says cutedsl while the stub it just wrote is TileLang.
+    """
+    return kernel_language_or_none(kernel_file) or "cutedsl"
+
+
 def cuda_kernel_flags(src: str) -> list[str]:
     """The nvcc flags the card builds a CUDA kernel file with (no allow-list check here: the
     card's fence refuses a disallowed flag before a build)."""
@@ -771,6 +807,112 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &run);
 }}
 """
+
+
+def render_kernel_stub_tilelang(problem: Problem, *, dps: bool = True) -> str:
+    """The TileLang starter kernel for a leaderboard card.
+
+    Same shape as taskcard's: a real ``@T.prim_func`` whose body copies input to output,
+    so the student starts from something that lowers on the first submit instead of a
+    ``raise`` that teaches nothing about the language. Written against TileLang 0.1.15:
+    static extents (no ``T.const`` / ``T.symbolic``), ``with T.Kernel(..., threads=N)``,
+    and none of the legacy ``T.alloc_buffer`` / ``T.launch_thread`` forms."""
+    defn = problem.definition
+    axes = dict(defn.get("axes") or {})
+    ax_lines = [f"    {n}: " + (str(a.get("value")) if a.get("type") == "const"
+                                   else a.get("expression") if a.get("type") == "expr"
+                                   else _var_note(problem, n))
+                for n, a in axes.items()]
+    specs = {**defn["inputs"], **(defn["outputs"] if dps else {})}
+    params = []
+    for n in _signature(problem, dps):
+        spec = specs[n]
+        if spec.get("shape") is None:
+            raise ValueError(
+                f"parameter {n!r} is a python scalar; the TileLang stub only sizes tensors")
+        dims = [str(d).upper() if not isinstance(d, int) else str(d) for d in spec["shape"]]
+        params.append(f"{n}: T.Tensor(({', '.join(dims)}), "
+                      f'"{_LEADERBOARD_TL_DTYPE[str(spec.get("dtype") or "")]}")')
+    # Every constant has to be a concrete int the stub can parse: a placeholder like
+    # "<one of the shapes>" is a SyntaxError on the student's first submit. An axis with
+    # no single value takes this card's own workload and the prose says so.
+    consts = []
+    for n, a in axes.items():
+        const = str(n).upper()
+        if a.get("type") == "const":
+            consts.append(f"{const} = {a.get('value')!r}")
+            continue
+        pinned = (problem.workload.get("axes") or {}).get(n)
+        if not isinstance(pinned, int):
+            raise ValueError(
+                f"axis {n!r} is {a.get('type')!r} and this card's workload does not give a "
+                f"concrete int for it ({problem.workload.get('axes')}) -- the TileLang stub "
+                f"needs one to size a tensor")
+        consts.append(f"{const} = {pinned}   # this card's workload; the kernel must serve "
+                      f"every workload it is judged on")
+    inputs = "\n".join(_spec_line(n, s) for n, s in defn["inputs"].items())
+    outputs = "\n".join(_spec_line(n, s) for n, s in defn["outputs"].items())
+    style = ("DPS: the outputs arrive pre-allocated after the inputs; write them in "
+             "place, return nothing." if dps else "Value-returning: return the output tensor.")
+    first_in = next(iter(defn["inputs"]))
+    first_out = next(iter(defn["outputs"]))
+    in_spec, out_spec = defn["inputs"][first_in], defn["outputs"][first_out]
+    in_dt = _LEADERBOARD_TL_DTYPE[str(in_spec.get("dtype") or "")]
+    out_dt = _LEADERBOARD_TL_DTYPE[str(out_spec.get("dtype") or "")]
+    row_axis = str(next(iter(axes), "M")).upper()
+    in_col = str(in_spec["shape"][-1]).upper()
+    out_col = str(out_spec["shape"][-1]).upper()
+    return f'''"""{defn["name"]} — the student's kernel ({problem.suite} leaderboard card), TileLang.
+
+Signature frozen by the leaderboard definition: parameter names are the definition's
+input names{", then its output names" if dps else ""}, in order ({problem.suite}
+checks them). {style}
+
+Axes:
+{chr(10).join(ax_lines)}
+Inputs:
+{inputs}
+Outputs:
+{outputs}
+
+The mathematical specification is the definition's reference
+(eval/leaderboard/problem.json, "reference"); judged and timed by
+eval/leaderboard.py exactly as {problem.suite} does.
+
+TileLang 0.1.15. The body below lowers; replace the copy in the middle with the operator.
+Extents are static Python ints (do not introduce `T.const` / `T.symbolic`: this card
+lowers a fixed shape). `T.alloc_buffer` / `T.launch_thread` / `T.func_attr` are dead API.
+`@tilelang.autotune` and `do_bench` are not allowed in this file -- the driver measures.
+"""
+
+import tilelang  # noqa: F401
+import tilelang.language as T
+
+{chr(10).join(consts)}
+BLK = 64
+THREADS = 128
+
+
+@T.prim_func
+def kernel({", ".join(params)}):
+    with T.Kernel(T.ceildiv({row_axis}, BLK), threads=THREADS) as bx:
+        _tile_in = T.alloc_fragment((BLK, {in_col}), "{in_dt}")
+        _tile_out = T.alloc_fragment((BLK, {out_col}), "{out_dt}")
+        T.copy({first_in}[bx * BLK, 0], _tile_in)
+        T.copy(_tile_in, _tile_out)      # <-- replace this copy with the operator
+        T.copy(_tile_out, {first_out}[bx * BLK, 0])
+'''
+
+
+
+# One renderer per language. A language registered in loop/lang_mode.py but absent here
+# has no stub: write_card refuses instead of falling through to a skeleton that teaches
+# the wrong language (the mismatch the mode split exists to prevent).
+STUB_RENDERER = {
+    "cutedsl": render_kernel_stub,
+    "cuda": render_kernel_stub_cuda,
+    "tilelang": render_kernel_stub_tilelang,
+}
 
 
 BENCH_TEMPLATE = '''"""{name} — leaderboard-mode bench (GENERATED by `forge init --leaderboard {suite}`).
@@ -1065,7 +1207,7 @@ def render_loop_toml_example(problem: Problem, op: str, kernel_file: str = "kern
         ref_shape = (f"{problem.name} group of {len(problem.group)} workloads "
                      f"({', '.join(g['name'] for g in problem.group)}; geomean)")
     head = "# Suggested loop.toml for this leaderboard card — copy to loop.toml and review.\n"
-    language = "cuda-sol" if is_cuda_kernel_file(kernel_file) else "cutedsl"
+    language = kernel_language(kernel_file)
     common = f"""[loop]
 language    = "{language}"{' ' * (17 - len(language))}# what the student writes the kernel in
 kb_arch     = "sm100"            # B200
@@ -1241,6 +1383,12 @@ def render_readme_section(problem: Problem, kernel_file: str = "kernel.py") -> s
                  "extra nvcc options go on a `// fk-cuda-cflags: ...` line (code-generation / "
                  "diagnostic options only), and a compile failure is judged COMPILE_ERROR."
                  .format(kf) if is_cuda_kernel_file(kf) else "")
+    tilelang_line = ("\n- `{0}` is a TileLang kernel (Python: `@T.prim_func` with "
+                     "`with T.Kernel(<grid>, threads=N) as bx:` and static extents); it is "
+                     "compiled by eval/leaderboard.py and a compile failure is judged "
+                     "COMPILE_ERROR. `T.autotune` / `do_bench` inside the file are not "
+                     "allowed -- the driver measures the tree."
+                     .format(kf) if is_tilelang_kernel_file(kf) else "")
     if problem.group:
         what = (f"workload group ({len(problem.group)} workloads; one kernel has to be fast on the "
                 f"whole group):\n" + "\n".join(
@@ -1280,7 +1428,7 @@ def render_readme_section(problem: Problem, kernel_file: str = "kernel.py") -> s
   (`device_window_basis` names the timer actually used).
 {ref_line}
 - The `run` signature of `{kf}` is frozen by the board definition (parameter names = the
-  definition's inputs + outputs, DPS).{cuda_line}
+  definition's inputs + outputs, DPS).{cuda_line}{tilelang_line}
 {selftest}
 - Submission: `forge <op> leaderboard export` writes the board's solution JSON.{notes}
 """
@@ -1290,16 +1438,18 @@ def write_card(op_dir: Path, problem: Problem, template_eval: Path, *,
                dps: bool = True, kernel_file: str = "kernel.py") -> list[Path]:
     """Write the leaderboard files into a freshly scaffolded card.
 
-    Refuses a kernel file this module has no stub for, before writing anything: the
-    only two stubs here are the CuTe DSL and CUDA C++ ones, and falling through to
-    the CuTe DSL skeleton for a file another mode owns is the mismatch the mode split
-    exists to prevent (see taskcard._STUB_LANGUAGES)."""
-    if str(kernel_file).endswith("_tl.py"):
+    Refuses a kernel file this module has no stub for, before writing anything: falling
+    through to the CuTe DSL skeleton for a file another mode owns is the mismatch the
+    mode split exists to prevent (see taskcard._STUB_LANGUAGES). The language comes from
+    ``kernel_language``, the same rule the loop uses, so the stub written here and the
+    ``loop.toml.example`` beside it can never disagree."""
+    language = kernel_language_or_none(kernel_file)
+    if language is None or language not in STUB_RENDERER:
         raise ValueError(
-            f"no leaderboard card stub for {kernel_file!r} yet: the TileLang stub "
-            f"waits on a spelling TileLang actually accepts (form it with "
-            f"`python -m tilelang.tools.compile_only`), then add it here and in "
-            f"taskcard.render_kernel_stub.")
+            f"no leaderboard card stub for {kernel_file!r} (language {language!r}): "
+            f"have {', '.join(sorted(STUB_RENDERER))}. Add its renderer to "
+            f"leaderboard.STUB_RENDERER and taskcard.render_kernel_stub, or write "
+            f"{kernel_file} by hand.")
     op_dir = Path(op_dir)
     lb_dir = op_dir / LEADERBOARD_DIR
     lb_dir.mkdir(parents=True, exist_ok=True)
@@ -1337,8 +1487,7 @@ def write_card(op_dir: Path, problem: Problem, template_eval: Path, *,
     put("eval/ncu_run.py", NCU_TEMPLATE.format(**fmt))
     put("gpu_entry.sh", render_gpu_entry(problem))
     (op_dir / "gpu_entry.sh").chmod(0o755)
-    put(kernel_file, render_kernel_stub_cuda(problem, dps=dps) if is_cuda_kernel_file(kernel_file)
-        else render_kernel_stub(problem, dps=dps))
+    put(kernel_file, STUB_RENDERER[language](problem, dps=dps))
     put("window.toml", render_window_toml(problem))
     put("loop.toml.example", render_loop_toml_example(problem, op_dir.name, kernel_file))
     readme = op_dir / "README.md"

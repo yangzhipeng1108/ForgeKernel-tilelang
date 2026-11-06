@@ -246,41 +246,122 @@ def _check():
                  judge_src="")
 
 
-def test_a_language_with_no_stub_is_refused_and_never_falls_through_to_the_dsl_skeleton():
-    """A TileLang task must not be handed the CuTe DSL skeleton: `def run(...): raise
-    NotImplementedError` in a kernel_tl.py teaches exactly what the mode split exists to
-    prevent. Refusing is the honest answer until the TileLang spelling is settled on a
-    real box (P0-a) -- a wrong skeleton is worse than no skeleton, because the student
-    reads it as the intended shape."""
+def test_every_stub_language_renders_a_kernel_its_own_language_can_parse():
+    """A stub is what the student starts from, so it has to be *of the target language*.
+    The failure this replaces was a `def run(...): raise NotImplementedError` handed to a
+    TileLang student: valid Python, so nothing complained, and it taught CuTe DSL in a
+    file the mode reads as TileLang.
+
+    The TileLang stub is checked the way the language checks it: it must parse, and it
+    must contain the current spelling (`@T.prim_func` + `T.Kernel(..., threads=)`) and
+    none of the dead one (`T.alloc_buffer` / `T.launch_thread` / `T.const`), because a
+    symbolic extent is what fails to lower on this card."""
     from forgekernel import taskcard
 
-    assert "tilelang" in taskcard.KERNEL_FILE           # the mode is registered...
-    assert "tilelang" not in taskcard._STUB_LANGUAGES   # ...but its stub is not written
-
-    for language in ("cutedsl", "cuda"):                # the two that ARE written still work
+    for language in taskcard.STUB_RENDERER:
         text = taskcard.render_kernel_stub(_task(language), _check())
-        assert "NotImplementedError" in text or "TORCH_CHECK(false" in text, language
+        assert text.strip(), language
+        if language == "cuda":
+            continue                                   # C++, not parsed as Python
+        compile(text, f"<{language} stub>", "exec")     # a parse error here is the bug
 
-    with pytest.raises(ValueError, match="no kernel stub for language 'tilelang'"):
-        taskcard.render_kernel_stub(_task("tilelang"), _check())
-    # the message says how to unblock it, and names the file to write by hand
-    message = ""
-    try:
-        taskcard.render_kernel_stub(_task("tilelang"), _check())
-    except ValueError as e:
-        message = str(e)
-    assert "compile_only" in message and "kernel_tl.py" in message
+    dsl = taskcard.render_kernel_stub(_task("cutedsl"), _check())
+    assert "NotImplementedError" in dsl and "tilelang" not in dsl
+
+    from forgekernel.judge import Check
+
+    named = Check(definition={"name": "rmsnorm",
+                              "axes": {"M": {"type": "var"},
+                                       "N": {"type": "const", "value": 1024}},
+                              "inputs": {"x": {"dtype": "F32", "shape": ["M", "N"]}},
+                              "outputs": {"y": {"dtype": "F32", "shape": ["M", "N"]}}},
+                  judge_src="")
+    tl = taskcard.render_kernel_stub(_task("tilelang"), named)
+    assert "@T.prim_func" in tl and "T.Kernel(" in tl and "threads=" in tl
+    # The prose must be allowed to name the dead API (that is the warning); only the
+    # code after the closing docstring is the skeleton.
+    body = tl.split(chr(34) * 3)[-1]
+    for dead in ("T.alloc_buffer", "T.launch_thread", "T.const(", "T.symbolic",
+                 "NotImplementedError", "@tilelang.autotune", "T.Buffer("):
+        assert dead not in body, dead
+    # the extents are the concrete ints of the card's first shape, not a placeholder
+    assert "M = 4096" in tl and "N = 1024" in tl    # the first shape, concretely
+    # the staging fragments must not shadow the parameters (T.copy(x[...], x) is a no-op)
+    assert "T.copy(x[bx * BLK, 0], _tile_in)" in tl
 
 
-def test_the_leaderboard_card_refuses_a_tilelang_kernel_file_before_writing_anything(tmp_path):
-    """forge new --leaderboard writes its card through leaderboard.write_card, a second
-    stub writer. It has the CuTe DSL and CUDA stubs only, so a kernel_tl.py must be
-    refused up front -- after a partial card is written, the operator tree looks
-    scaffolded and the failure surfaces much later."""
+def test_a_rank_the_stub_cannot_tile_is_refused_instead_of_guessed():
+    """A rank-3 tensor needs a tile shape the stub cannot know; guessing one teaches a
+    sweep the student did not choose, so it refuses and says to write the file by hand."""
+    from forgekernel import taskcard
+    from forgekernel.judge import Check
+
+    task = _task("tilelang")
+    check = Check(definition={"name": "three", "axes": {"A": {"type": "const", "value": 4}},
+                              "inputs": {"x": {"dtype": "F32", "shape": [4, 8, 16]}},
+                              "outputs": {"y": {"dtype": "F32", "shape": [4, 8, 16]}}},
+                  judge_src="")
+    with pytest.raises(ValueError, match="rank-3"):
+        taskcard.render_kernel_stub(task, check)
+
+
+def test_the_two_stub_tables_are_the_same_set_and_the_loop_agrees():
+    """taskcard and leaderboard each write a kernel file (forge new / forge new
+    --leaderboard). Their renderer tables drifting apart is how one of them starts
+    writing a skeleton the other refuses."""
+    from forgekernel import leaderboard as lbmod
+    from forgekernel import taskcard
+
+    assert set(taskcard.STUB_RENDERER) == set(lbmod.STUB_RENDERER)
+    assert set(taskcard.STUB_RENDERER) == taskcard._STUB_LANGUAGES
+    # every language with a stub is a registered mode, so the loop can drive what the
+    # scaffold just wrote
+    # taskcard keys on the task.toml language ("cuda"), the loop on the loop one
+    # ("cuda-sol"); both must resolve to a registered mode.
+    loop_language = {"cutedsl": "cutedsl", "cuda": "cuda-sol", "tilelang": "tilelang"}
+    for language in taskcard.STUB_RENDERER:
+        assert lang_mode.mode_of(loop_language[language])
+
+
+def test_the_leaderboard_card_writes_a_tilelang_loop_toml_that_agrees_with_its_stub(tmp_path):
+    """write_card used to refuse a _tl.py outright. It now writes one -- and the failure
+    it has to avoid is the *other* one: a loop.toml.example that says cutedsl beside a
+    TileLang stub, which every later run inherits."""
+    from forgekernel import leaderboard as lbmod
+
+    problem = lbmod.Problem(
+        suite=lbmod.SUITE_SOL,
+        definition={"name": "rmsnorm", "axes": {"M": {"type": "var"},
+                                                "N": {"type": "const", "value": 1024}},
+                    "inputs": {"x": {"dtype": "F32", "shape": ["M", "N"]}},
+                    "outputs": {"y": {"dtype": "F32", "shape": ["M", "N"]}}},
+        workload={"uuid": "w", "axes": {"M": 4096, "N": 1024}},
+        reference_impl={"kind": "definition", "name": "torch"},
+        source={}, blobs={},
+    )
+    op = tmp_path / "op"
+    op.mkdir()
+    (op / "eval").mkdir()
+    # write_card copies leaderboard.py / timing.py / precision.py from the card template,
+    # so hand it the real one rather than a empty fixture directory.
+    template = REPO / "src" / "forgekernel" / "card_template" / "eval"
+    lbmod.write_card(op, problem, template, kernel_file="kernel_tl.py")
+
+    stub = (op / "kernel_tl.py").read_text(encoding="utf-8")
+    compile(stub, "<tilelang leaderboard stub>", "exec")
+    assert "@T.prim_func" in stub and "T.Kernel(" in stub
+    loop_toml = (op / "loop.toml.example").read_text(encoding="utf-8")
+    assert 'language    = "tilelang"' in loop_toml
+    assert "cutedsl" not in loop_toml
+
+
+def test_the_leaderboard_stub_refuses_a_kernel_file_no_language_claims(tmp_path):
+    """The remaining refusal has to stay: a kernel file whose suffix names no mode must
+    not be handed the CuTe DSL skeleton, and nothing may be written before the refusal."""
     from forgekernel import leaderboard as lbmod
 
     with pytest.raises(ValueError, match="no leaderboard card stub"):
-        lbmod.write_card(tmp_path / "op", None, tmp_path / "eval", kernel_file="kernel_tl.py")
+        lbmod.write_card(tmp_path / "op", None, tmp_path / "eval", kernel_file="kernel.metal")
     assert not (tmp_path / "op").exists() or not any((tmp_path / "op").iterdir())
 
 

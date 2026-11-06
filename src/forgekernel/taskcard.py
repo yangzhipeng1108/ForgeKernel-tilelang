@@ -33,11 +33,11 @@ SUITE = "forgekernel"
 PROBLEM = lbmod.PROBLEM_FILE                     # eval/leaderboard/problem.json
 LB_DIR = lbmod.LEADERBOARD_DIR
 KERNEL_FILE = {"cutedsl": "kernel.py", "cuda": "kernel.cu", "tilelang": "kernel_tl.py"}
-# Languages this module can render a starter kernel for. A language can be a
-# registered mode (loop/lang_mode.py) before its stub exists: the mode reads the
-# right prompts and KB, the student just starts from an empty file instead of a
-# skeleton that teaches the wrong one.
-_STUB_LANGUAGES = frozenset({"cutedsl", "cuda"})
+# Languages this module can render a starter kernel for (derived from STUB_RENDERER at
+# the bottom of this file, so the two cannot drift). A language can be a registered mode
+# (loop/lang_mode.py) before its stub exists: the mode reads the right prompts and KB,
+# the student just starts from an empty file instead of a skeleton that teaches the
+# wrong one.
 CUTE_ARCH = {"sm90": "sm_90a", "sm100": "sm_100a", "sm103": "sm_103a", "sm120": "sm_120a"}
 EVAL_FILES = ("leaderboard.py", "timing.py", "precision.py", "closed_ref.py", "ncu_probe.py")
 NCU_PROBE_MODE = "cmd:ncu --csv --metrics gpu__time_active.sum python3 eval/ncu_probe.py"
@@ -372,6 +372,197 @@ def _spec(name: str, spec: dict) -> str:
     return f"    {name}: {spec.get('dtype')} {dims}"
 
 
+def _tl_tensor_dtype(spec: dict) -> str:
+    """A definition dtype as the string TileLang's ``T.Tensor`` takes.
+
+    TileLang spells them lowercase and without a namespace (``float32``, ``bfloat16``);
+    the definition writes them the board's way (``F32``, ``BF16``). Anything this map
+    does not know is refused rather than guessed: a wrong dtype string in a stub the
+    student starts from is worse than an explicit error while scaffolding."""
+    dt = str(spec.get("dtype") or "")
+    table = {"F32": "float32", "F16": "float16", "BF16": "bfloat16",
+             "I32": "int32", "I64": "int64", "I8": "int8", "U8": "uint8", "BOOL": "bool"}
+    if dt not in table:
+        raise ValueError(
+            f"no TileLang dtype for {dt!r} (have: {', '.join(sorted(table))}) -- "
+            f"add it to taskcard._tl_tensor_dtype before scaffolding a TileLang card")
+    return table[dt]
+
+
+def _tl_shape_expr(spec: dict, axes: dict) -> str:
+    """One parameter's shape as TileLang Python: literal ints, or the name of the
+    axis constant the stub defines above (so a student can name the extent)."""
+    shape = spec.get("shape")
+    if shape is None:
+        return ""                      # a python scalar parameter, not a tensor
+    dims = []
+    for d in shape:
+        if isinstance(d, int):
+            dims.append(str(d))
+            continue
+        name = str(d)
+        if name not in axes:
+            raise ValueError(
+                f"shape dim {name!r} is not one of the definition's axes "
+                f"({', '.join(map(str, axes))}) -- the TileLang stub can only build a "
+                f"T.Tensor from axes it can name")
+        dims.append(name.upper())
+    return "(" + ", ".join(dims) + ")"
+
+
+def _tl_tile(shape_expr: str, axes: dict) -> tuple[str, str, str]:
+    """``(the row extent, the fragment shape, the [bx * BLK, ...] slice)``.
+
+    The stub tiles along the first dimension of the first input: the fragment is one
+    ``BLK``-row slab of the trailing dimensions, and the grid is ``ceildiv(row, BLK)``.
+    Only rank 1 and 2 are generated -- a higher rank needs a tile shape the stub cannot
+    guess, and guessing one would teach a sweep the student did not choose."""
+    dims = [d for d in shape_expr.strip("()").split(", ") if d]
+    if len(dims) == 1:
+        return dims[0], "(BLK,)", "[bx * BLK]"
+    if len(dims) == 2:
+        return dims[0], f"(BLK, {dims[1]})", "[bx * BLK, 0]"
+    raise ValueError(
+        f"a rank-{len(dims)} tensor ({dims}) has no obvious tile shape; the TileLang "
+        f"stub generates rank 1 and 2 only -- write this kernel file by hand")
+
+
+def _tl_axis_consts(axes: dict, shapes) -> tuple[str, str]:
+    """``(the constant lines, any note)`` for the axes the stub sizes tensors with.
+
+    Every line has to be **valid Python with a concrete int**: a stub the student
+    starts from must parse, or the first submit is a syntax error that says nothing
+    about their idea. A ``const`` axis has one value. An ``expr`` / ``var`` axis takes
+    several -- the stub pins the **first shape the card lists** and says so, because
+    the real kernel has to serve all of them and the student is the one who makes
+    that true."""
+    lines, notes = [], []
+    first = shapes[0].axes if shapes else {}
+    for name, a in axes.items():
+        const = str(name).upper()
+        kind = a.get("type")
+        if kind == "const":
+            lines.append(f"{const} = {a.get('value')!r}")
+            continue
+        pinned = first.get(str(name))
+        if not isinstance(pinned, int):
+            pinned = first.get(const) or first.get(str(name).lower())
+        if not isinstance(pinned, int):
+            pinned = next((v for v in first.values() if isinstance(v, int)), None)
+        if not isinstance(pinned, int):
+            raise ValueError(
+                f"axis {name!r} is {kind!r} and the card's shapes do not give a concrete "
+                f"int for it ({first}) -- the TileLang stub needs one to size a tensor")
+        lines.append(f"{const} = {pinned}")
+        note = (f"{const} = {pinned} is the FIRST shape the card lists; this kernel must "
+                f"serve every shape above ({kind} axis)")
+        if a.get("expression"):
+            note += f" -- the definition writes it as `{a['expression']}`"
+        notes.append(note)
+    return "\n".join(lines), "\n".join(notes)
+
+
+def render_kernel_stub_tilelang(task, check) -> str:
+    """The TileLang starter kernel: a real, lowering ``@T.prim_func`` with a body that
+    copies input to output, so the student starts from a shape the language accepts.
+
+    Written against TileLang 0.1.15 as measured, not from a tutorial:
+
+    * ``@T.prim_func`` + ``with T.Kernel(<grid>, threads=<n>) as bx:`` -- the current
+      spelling. The legacy ``def main(A: T.Buffer(...))`` + ``T.func_attr`` shape and
+      ``T.alloc_buffer`` / ``T.launch_thread`` are dead and are not written here.
+    * **Static shapes.** ``T.Tensor((M, N), "float32")`` with Python ints. A symbolic
+      extent (``T.const`` / ``T.symbolic``) lowers on a machine that can evaluate it,
+      but this mode's compile path fixes the shape, and a symbolic kernel fails with
+      "Cannot find value for constexpr variable".
+    * No allocation of its own beyond two fragments: the body has to **lower** on the
+      first submit, and every primitive a student adds later is one they chose.
+    """
+    defn = check.definition
+    # The axes live on the judge definition, not on the task: `Task` carries the
+    # per-shape values, the definition carries which of them are const / expr / var.
+    axes = dict(defn.get("axes") or {})
+    shapes = "\n".join(f"    {s.name}: {json.dumps(s.axes)}" for s in task.shapes)
+    ins = "\n".join(_spec(n, s) for n, s in defn["inputs"].items())
+    outs = "\n".join(_spec(n, s) for n, s in defn["outputs"].items())
+    consts, notes = _tl_axis_consts(axes, task.shapes)
+    params = []
+    for name, spec in defn["inputs"].items():
+        if spec.get("shape") is None:
+            raise ValueError(
+                f"input {name!r} is a python scalar; the TileLang stub only sizes tensors "
+                f"-- scalar parameters need a hand-written stub")
+        params.append(f"{name}: T.Tensor({_tl_shape_expr(spec, axes)}, "
+                      f'"{_tl_tensor_dtype(spec)}")')
+    for name, spec in defn["outputs"].items():
+        if spec.get("shape") is None:
+            raise ValueError(
+                f"output {name!r} is a python scalar; the TileLang stub only sizes tensors")
+        params.append(f"{name}: T.Tensor({_tl_shape_expr(spec, axes)}, "
+                      f'"{_tl_tensor_dtype(spec)}")')
+    first_out = next(iter(defn["outputs"]))
+    first_in = next(iter(defn["inputs"]))
+    out_spec = defn["outputs"][first_out]
+    in_spec = defn["inputs"][first_in]
+    row, frag, cut = _tl_tile(_tl_shape_expr(in_spec, axes), axes)
+    blk = 64
+    note_block = f"\n# NOTE: {notes}\n" if notes else ""
+    # The lowered kernel's name must not collide with a parameter, and the two staging
+    # fragments must not shadow the parameters either -- `T.copy(x[...], x)` reads as a
+    # self-copy and lowers to nothing.
+    kernel_name = "kernel"
+    taken = set(defn["inputs"]) | set(defn["outputs"]) | {"kernel"}
+    src_buf, dst_buf = "_tile_in", "_tile_out"
+    while src_buf in taken or dst_buf in taken:
+        src_buf, dst_buf = "_" + src_buf, "_" + dst_buf
+    return f'''"""{task.name} — the student's kernel (TileLang).
+
+Value-returning: run(<inputs, in order>) returns the outputs (a tensor, or a tuple in the
+order below), in the declared dtypes.
+
+Shapes (one kernel serves all of them):
+{shapes}
+Inputs:
+{ins}
+Outputs:
+{outs}
+
+Judged against the task's judge (eval/leaderboard/problem.json, "reference") on every input
+group of every shape, and timed on all of them (eval/leaderboard.py).
+
+TileLang 0.1.15. The body below lowers and runs as written; replace the copy in the middle
+with the operator. Three things this card cannot do for you:
+
+  * **Static shapes only.** Extents are the Python ints above. Do not introduce
+    `T.const` / `T.symbolic`: this card lowers a fixed shape, and a symbolic kernel fails
+    with "Cannot find value for constexpr variable".
+  * **No legacy API.** Write `@T.prim_func` + `with T.Kernel(..., threads=N) as bx:`.
+    `T.alloc_buffer`, `T.launch_thread`, `T.thread_binding` and the
+    `def main(A: T.Buffer(...))` + `T.func_attr({{"global_symbol": ...}})` shape are dead.
+  * **No autotune in this file.** `@tilelang.autotune`, `do_bench` and `Profiler` are the
+    driver's job here; a sweep inside the kernel makes the measured tree unpriceable.
+"""
+
+import tilelang  # noqa: F401
+import tilelang.language as T
+{note_block}
+# Extents of the shapes above (static by construction).
+{consts}
+BLK = {blk}
+THREADS = 128
+
+
+@T.prim_func
+def {kernel_name}({", ".join(params)}):
+    with T.Kernel(T.ceildiv({row}, BLK), threads=THREADS) as bx:
+        {src_buf} = T.alloc_fragment({frag}, "{_tl_tensor_dtype(in_spec)}")
+        {dst_buf} = T.alloc_fragment({frag}, "{_tl_tensor_dtype(out_spec)}")
+        T.copy({first_in}{cut}, {src_buf})
+        T.copy({src_buf}, {dst_buf})          # <-- replace this copy with the operator
+        T.copy({dst_buf}, {first_out}{cut})
+'''
+
+
 def render_kernel_stub(task, check) -> str:
     shapes = "\n".join(f"    {s.name}: {json.dumps(s.axes)}" for s in task.shapes)
     ins = "\n".join(_spec(n, s) for n, s in check.definition["inputs"].items())
@@ -380,22 +571,33 @@ def render_kernel_stub(task, check) -> str:
     # must refuse here, not fall through to the CuTe DSL skeleton. A TileLang student
     # handed `def run(...): raise NotImplementedError` is taught to write CuTe DSL in
     # a file the mode reads as TileLang -- the exact silent mismatch lang_mode exists
-    # to prevent. The TileLang stub waits on a form the language actually accepts.
-    if task.language not in _STUB_LANGUAGES:
+    # to prevent.
+    renderer = STUB_RENDERER.get(task.language)
+    if renderer is None:
+        # No stub is better than a wrong one: a language whose stub is not written yet
+        # must refuse here, not fall through to the CuTe DSL skeleton. A student handed
+        # `def run(...): raise NotImplementedError` for a TileLang file is taught to write
+        # CuTe DSL in a file the mode reads as TileLang -- the exact silent mismatch
+        # lang_mode exists to prevent.
         raise ValueError(
             f"no kernel stub for language {task.language!r} yet (have: "
-            f"{', '.join(sorted(_STUB_LANGUAGES))}). Fix the API spelling of the "
-            f"target DSL on a real box first -- `python -m tilelang.tools.compile_only` "
-            f"for TileLang -- then add its branch here and in leaderboard.py, or write "
+            f"{', '.join(sorted(STUB_RENDERER))}). Add its renderer to taskcard.STUB_RENDERER "
+            f"and leaderboard.STUB_RENDERER, or write "
             f"{KERNEL_FILE.get(task.language, 'the kernel file')} by hand.")
-    if task.language == "cuda":
-        params = ", ".join(lbmod._cpp_param(n, s) for n, s in check.definition["inputs"].items())
-        comment = "\n".join("// " + line for line in (
-            f"{task.name} -- the student's kernel, CUDA C++ (one file, its own torch binding).",
-            "", "Value-returning: return the output tensor.", "", "Shapes (one kernel serves all):",
-            *shapes.splitlines(), "Inputs:", *ins.splitlines(), "Outputs:", *outs.splitlines(),
-            "", "Judged against the task's judge (eval/leaderboard/problem.json, \"reference\")."))
-        return f"""{comment}
+    return renderer(task, check)
+
+
+def render_kernel_stub_cuda(task, check) -> str:
+    shapes = "\n".join(f"    {s.name}: {json.dumps(s.axes)}" for s in task.shapes)
+    ins = "\n".join(_spec(n, s) for n, s in check.definition["inputs"].items())
+    outs = "\n".join(_spec(n, s) for n, s in check.definition["outputs"].items())
+    params = ", ".join(lbmod._cpp_param(n, s) for n, s in check.definition["inputs"].items())
+    comment = "\n".join("// " + line for line in (
+        f"{task.name} -- the student's kernel, CUDA C++ (one file, its own torch binding).",
+        "", "Value-returning: return the output tensor.", "", "Shapes (one kernel serves all):",
+        *shapes.splitlines(), "Inputs:", *ins.splitlines(), "Outputs:", *outs.splitlines(),
+        "", "Judged against the task's judge (eval/leaderboard/problem.json, \"reference\")."))
+    return f"""{comment}
 
 #include <torch/extension.h>
 
@@ -407,6 +609,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &run);
 }}
 """
+
+
+def render_kernel_stub_cutedsl(task, check) -> str:
+    shapes = "\n".join(f"    {s.name}: {json.dumps(s.axes)}" for s in task.shapes)
+    ins = "\n".join(_spec(n, s) for n, s in check.definition["inputs"].items())
+    outs = "\n".join(_spec(n, s) for n, s in check.definition["outputs"].items())
     return f'''"""{task.name} — the student's kernel.
 
 Value-returning: run(<inputs, in order>) returns the outputs (a tensor, or a tuple in the
@@ -429,6 +637,16 @@ import torch  # noqa: F401
 def run({", ".join(check.inputs)}):
     raise NotImplementedError("write the kernel")
 '''
+
+
+# One renderer per language -- taskcard.render_kernel_stub is the lookup. A language
+# registered in loop/lang_mode.py but absent here has no stub and is refused.
+STUB_RENDERER = {
+    "cutedsl": render_kernel_stub_cutedsl,
+    "cuda": render_kernel_stub_cuda,
+    "tilelang": render_kernel_stub_tilelang,
+}
+_STUB_LANGUAGES = frozenset(STUB_RENDERER)
 
 
 def render_window_toml(task, check) -> str:
