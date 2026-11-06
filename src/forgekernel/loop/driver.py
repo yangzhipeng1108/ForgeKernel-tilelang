@@ -674,6 +674,18 @@ def _is_cuda(ctx: LoopContext) -> bool:
     return lang_mode.is_cuda(ctx.language) or lang_mode.is_cuda_kernel_file(ctx.kernel_file)
 
 
+def _is_tilelang(ctx: LoopContext) -> bool:
+    """A TileLang-mode run: its student edits a ``*_tl.py`` the card compiles.
+
+    The language and the file are checked together because either can be the one
+    that names the mode (an unset ``[loop] language`` follows the file). A run is
+    never both: ``lang_mode.language_problem`` refuses the combination, so a
+    ``_tl.py`` under the CUDA mode does not reach here, and the timeline /
+    census / job-env code below can branch on this without ordering it against
+    ``_is_cuda``."""
+    return lang_mode.is_tilelang(ctx.language) or lang_mode.is_tilelang_kernel_file(ctx.kernel_file)
+
+
 def _bindings(ctx: LoopContext) -> dict[str, str]:
     repo_root = ctx.meta_dir.parent
     return {
@@ -1882,8 +1894,9 @@ def _ncu_mode(ctx: LoopContext) -> str:
     workspace (seeded with the pricing toolkit) and the run has not opted out."""
     if getattr(ctx, "orch_census", False) and (
             Path(ctx.workspace) / "notes" / _ORCH_CENSUS_RUNNER).exists():
-        if _is_cuda(ctx):
-            # no JIT dump for a .cu: the runner reads the build of this kernel file
+        if _is_cuda(ctx) or _is_tilelang(ctx):
+            # no JIT dump for a .cu / a TileLang kernel file: the runner reads the
+            # build of this kernel file rather than a CuTe DSL cubin directory
             return f"{_ORCH_CENSUS_CMD} --kernel {ctx.kernel_file}"
         return _ORCH_CENSUS_CMD
     return "ncu"
@@ -5377,9 +5390,11 @@ _TIMELINE_CMD = "cmd:python3 notes/timeline_probe.py"
 
 def _timeline_cmd(ctx: LoopContext) -> str:
     """The probe job's command: a CUDA-mode run names its kernel.cu (the probe
-    stamps `FK_SEG` markers in C++ and runs the bench under ``--cuda-run``); every
-    other run uses exactly ``_TIMELINE_CMD``, which defaults to kernel.py."""
-    if _is_cuda(ctx):
+    stamps `FK_SEG` markers in C++ and runs the bench under ``--cuda-run``); a
+    TileLang run names its ``*_tl.py`` (so the probe reads that file, not the
+    ``kernel.py`` its default assumes); a CuTe DSL run uses exactly
+    ``_TIMELINE_CMD``."""
+    if _is_cuda(ctx) or _is_tilelang(ctx):
         return f"{_TIMELINE_CMD} --kernel {ctx.kernel_file}"
     return _TIMELINE_CMD
 
@@ -5409,13 +5424,17 @@ def _timeline_on(ctx: LoopContext) -> bool:
 
 def _timeline_markers(ctx: LoopContext) -> "tuple[bool, list]":
     """(the kernel keeps the no-op `_seg` definition, its marker site names) — the
-    `#define FK_SEG` line and `FK_SEG("...")` calls of a CUDA-mode kernel."""
+    `#define FK_SEG` line and `FK_SEG("...")` calls of a CUDA-mode kernel.
+
+    A TileLang kernel is Python, so it keeps the Python spelling (`def _seg` +
+    `_seg("...", i)` calls) and reads through the same parser as the CuTe DSL one;
+    only the CUDA mode's C++ spelling needs ``cuda=True``."""
     from forgekernel.skills.timeline_probe import has_marker_def, markers
     try:
         src = (Path(ctx.workspace) / str(ctx.kernel_file)).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False, []
-    if _is_cuda(ctx):
+    if _is_cuda(ctx) and not _is_tilelang(ctx):
         return has_marker_def(src, cuda=True), markers(src, cuda=True)
     return has_marker_def(src), markers(src)
 
@@ -5429,7 +5448,7 @@ def _timeline_unparsed_markers(ctx: LoopContext) -> list:
         src = (Path(ctx.workspace) / str(ctx.kernel_file)).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    if _is_cuda(ctx):
+    if _is_cuda(ctx) and not _is_tilelang(ctx):
         return unparsed_markers(src, cuda=True)
     return unparsed_markers(src)
 
@@ -5873,6 +5892,8 @@ def _timeline_student_note(ctx: LoopContext) -> str:
     from forgekernel.skills.timeline_probe import NSITE
     if _is_cuda(ctx):
         return _timeline_student_note_cuda(ctx, has_def, names, NSITE)
+    if _is_tilelang(ctx):
+        return _timeline_student_note_tilelang(ctx, has_def, names, NSITE)
     lines = ["\n## Timeline probe (enabled for this run)",
              "- Convention: keep `def _seg(site, row=0): return None` in the kernel (the driver turns it "
              "into stamping only in the probe build); put `_seg(\"<role>.<segment>.<stem>.begin\", i)` / "
@@ -6000,6 +6021,35 @@ def _timeline_student_note_cuda(ctx: LoopContext, has_def: bool, names: list, ns
                          f"wait {_fmt_cyc(r.get('wait'))}; largest three segments "
                          + ", ".join(f"`{sg['from']}`→`{sg['to']}` {_fmt_cyc(sg['median'])} ({sg['kind']})"
                                      for sg in top))
+    return "\n".join(lines) + "\n"
+
+
+def _timeline_student_note_tilelang(ctx: LoopContext, has_def: bool, names: list,
+                                    nsite: int) -> str:
+    """``_timeline_student_note`` for a TileLang-mode run.
+
+    The probe's stamped preamble is CuTe DSL (``import cutlass`` / ``@dsl_user_op`` /
+    ``cute.arch.*``); injected into a ``*_tl.py`` it would fail at trace time, not
+    stamp. Until a TileLang preamble exists the honest note is that the table will
+    not arrive and markers are not the thing to fix — asking for the CuTe DSL
+    spelling here is exactly how a student ends up rewriting the kernel around a
+    probe that cannot run. Marker/staleness lines are still reported when the tree
+    happens to carry them, so an inherited ``_seg`` is not silently invisible."""
+    lines = ["\n## Timeline probe (enabled for this run)",
+             "- **The timeline probe does not support TileLang yet**: its stamping preamble is CuTe "
+             "DSL (`import cutlass`, `@dsl_user_op`, `cute.arch.*`), which a TileLang kernel cannot "
+             "execute. No table will arrive for this run, and `PROBE_REQUEST: timeline` will not "
+             "produce one — **do not restructure the kernel around the probe**, and do not add "
+             "`_seg` calls to satisfy it. Bash timing / `ncu` counters are the instruments that work "
+             "in this mode."]
+    if has_def and names:
+        lines.append(f"- Markers in the current tree ({len(names)}): " + ", ".join(
+            f"`{n}`" for n in names[:24]) + ("…" if len(names) > 24 else "")
+            + " — left in place, not measured in this mode.")
+    stale = _timeline_probe_stale(ctx)
+    if stale:
+        lines.append(f"- `notes/timeline_probe.py` does not match the harness version (or is "
+                     f"missing): copy `{stale}` over it with your next submission.")
     return "\n".join(lines) + "\n"
 
 
@@ -10557,9 +10607,15 @@ def job_env_preflight(ctx: LoopContext, policy: str = "refuse") -> str | None:
         _seed_ws_stall_tools(ctx)   # idempotent; the check script rides the pricing toolkit
         checks = []
         if (Path(ctx.workspace) / "notes" / _JOB_ENV_CHECK_NAME).is_file():
-            # a CUDA-mode card also needs the toolchain its kernel is built with
-            checks.append(("tools", f"{_JOB_ENV_CHECK_CMD} --cuda" if _is_cuda(ctx)
-                           else _JOB_ENV_CHECK_CMD))
+            # a CUDA-mode card also needs the toolchain its kernel is built with;
+            # a TileLang card needs the TileLang install and its own toolchain
+            if _is_cuda(ctx):
+                tools_cmd = f"{_JOB_ENV_CHECK_CMD} --cuda"
+            elif _is_tilelang(ctx):
+                tools_cmd = f"{_JOB_ENV_CHECK_CMD} --tilelang"
+            else:
+                tools_cmd = _JOB_ENV_CHECK_CMD
+            checks.append(("tools", tools_cmd))
         checks.append(("ncu", _ncu_mode(ctx)))
         be.push_branch(branch)
         for channel, mode in checks:

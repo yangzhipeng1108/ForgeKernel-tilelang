@@ -282,3 +282,214 @@ def test_the_leaderboard_card_refuses_a_tilelang_kernel_file_before_writing_anyt
     with pytest.raises(ValueError, match="no leaderboard card stub"):
         lbmod.write_card(tmp_path / "op", None, tmp_path / "eval", kernel_file="kernel_tl.py")
     assert not (tmp_path / "op").exists() or not any((tmp_path / "op").iterdir())
+
+
+# ---------------------------------------------------------------- source dirs
+def _tilelang_site(site: Path, version: str = "0.1.15") -> Path:
+    """A site directory laid out like the ``tilelang`` wheel: one plain package
+    (``tilelang/``) with no ``dsl_packages`` indirection, and the version in its
+    dist-info. The CuTe DSL family's ``_fake_install`` (test_dsl_source.py) is the
+    other shape, and the point of this pair is that the probe tells them apart."""
+    pkg = site / "tilelang"
+    (pkg / "language").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "language" / "__init__.py").write_text("")
+    meta = site / f"tilelang-{version}.dist-info"
+    meta.mkdir()
+    (meta / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: tilelang\nVersion: {version}\n")
+    return pkg
+
+
+def _probe_env(site: Path) -> dict:
+    import os
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(site)
+    return env
+
+
+def _resolve_tl(cfg, site, *, submit_env=None, language="tilelang"):
+    import sys
+
+    from forgekernel.loop import dsl_source as ds
+
+    return ds.resolve(cfg, language=language, submit_env=submit_env or {},
+                      python=sys.executable, probe_env=_probe_env(site))
+
+
+def test_an_empty_key_defaults_a_tilelang_run_to_the_installed_package(tmp_path):
+    """The CuTe DSL default walks ``nvidia_cutlass_dsl/dsl_packages`` out of RECORD;
+    TileLang ships one plain package, so its import root IS the directory the student
+    reads. Both go through the same resolve() and must not be confused for each other:
+    the directory handed over, and the name the version is reported under."""
+    site = tmp_path / "site"
+    pkg = _tilelang_site(site, "0.1.15")
+    r = _resolve_tl({"loop": {"dsl_source_dirs": []}}, site,
+                    submit_env={"DSL_PIN": "0.1.15"})
+    assert r.defaulted and r.origin == "default"
+    assert r.dirs == (pkg.resolve(),)
+    assert r.version == "0.1.15"
+    assert r.distribution == "tilelang"          # not the CuTe DSL's name
+    assert "tilelang 0.1.15" in r.notes[0] and "matches [env] DSL_PIN" in r.notes[0]
+    assert r.describe().startswith("default ") and "tilelang 0.1.15" in r.describe()
+
+
+def test_a_tilelang_pin_mismatch_refuses_the_default(tmp_path):
+    site = tmp_path / "site"
+    _tilelang_site(site, "0.1.15")
+    r = _resolve_tl({"loop": {}}, site, submit_env={"DSL_PIN": "0.1.16"})
+    assert not r.defaulted and r.origin == "none"
+    assert r.version == "0.1.15" and "0.1.16" in r.notes[0]
+
+
+def test_a_declared_tilelang_source_dir_wins_over_the_default(tmp_path):
+    from forgekernel.loop import dsl_source as ds
+
+    site = tmp_path / "site"
+    _tilelang_site(site)
+    mine = tmp_path / "tilelang-checkout"
+    mine.mkdir()
+    r = _resolve_tl({"loop": {"dsl_source_dirs": [str(mine)]}}, site)
+    assert r.origin == ds.ORIGIN_EXPLICIT and r.dirs == (mine.resolve(),)
+
+
+def test_a_tilelang_install_overlapping_the_reference_is_refused(tmp_path):
+    site = tmp_path / "site"
+    pkg = _tilelang_site(site)
+    r = _resolve_tl({"loop": {"ref_source_paths": [str(pkg)]}}, site)
+    assert not r.defaulted
+    assert "overlaps the declared reference source" in r.notes[0]
+
+
+def test_cuda_sol_still_has_no_dsl_default_to_offer(tmp_path):
+    """A CUDA student reads headers named in ``[loop] cuda_source_dirs``; there is no
+    Python API to default to, and inventing one (the DSL package) would be the wrong
+    door. The message says language=, so it is not mistaken for 'nothing installed'."""
+    site = tmp_path / "site"
+    _tilelang_site(site)
+    r = _resolve_tl({"loop": {}}, site, language="cuda-sol")
+    assert r.origin == "none" and "no DSL source to default" in r.notes[0]
+
+
+# ---------------------------------------------------------------- policy
+def test_the_tilelang_notice_names_tilelang_sources_not_the_dsl_and_not_headers(tmp_path):
+    from forgekernel.loop import agent_policy as ap
+
+    src = tmp_path / "tl-src"
+    src.mkdir()
+    cfg = {"loop": {"tilelang_source_dirs": [str(src)]}}
+    pol = ap.from_config(cfg, oracle_mode="trace", repo_root=tmp_path,
+                         teacher_trees=[], language="tilelang")
+    notice = pol.notice("student")
+    assert "TileLang package sources" in notice
+    assert "DSL package sources" not in notice
+    assert "CUDA / CUTLASS headers" not in notice
+    assert str(src.resolve()) in notice
+
+
+def test_tilelang_source_dirs_is_its_own_key_and_falls_back_to_the_old_one(tmp_path):
+    """Its own key, the way cuda_source_dirs is: one mode's package tree must not be
+    handed to another mode's student. A config written before the key existed still
+    reads dsl_source_dirs."""
+    from forgekernel.loop import agent_policy as ap
+
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    both = ap.from_config({"loop": {"dsl_source_dirs": [str(old)],
+                                    "tilelang_source_dirs": [str(new)]}},
+                          oracle_mode="trace", repo_root=tmp_path,
+                          teacher_trees=[], language="tilelang")
+    assert both.dsl_source_dirs == (new.resolve(),)
+    only_old = ap.from_config({"loop": {"dsl_source_dirs": [str(old)]}},
+                              oracle_mode="trace", repo_root=tmp_path,
+                              teacher_trees=[], language="tilelang")
+    assert only_old.dsl_source_dirs == (old.resolve(),)
+    # and the DSL mode does not read the TileLang key
+    dsl = ap.from_config({"loop": {"tilelang_source_dirs": [str(new)]}},
+                         oracle_mode="trace", repo_root=tmp_path,
+                         teacher_trees=[], language="cutedsl")
+    assert dsl.dsl_source_dirs == ()
+
+
+def test_an_empty_tilelang_source_key_warns_only_in_the_tilelang_mode(tmp_path):
+    from forgekernel.loop import agent_policy as ap
+
+    cfg = {"loop": {}}
+    tl = ap.declaration_warnings(cfg, language="tilelang")
+    assert any("tilelang_source_dirs is empty" in w for w in tl)
+    cu = ap.declaration_warnings(cfg, language="cuda-sol")
+    assert any("cuda_source_dirs is empty" in w for w in cu)
+    assert not any("tilelang_source_dirs" in w for w in cu)
+    dsl = ap.declaration_warnings(cfg, language="cutedsl")
+    assert not any("tilelang_source_dirs" in w for w in dsl)
+
+
+# ---------------------------------------------------------------- driver routing
+def _ctx(kernel_file: str, language=None, workspace=None):
+    import types
+
+    return types.SimpleNamespace(kernel_file=kernel_file, language=language,
+                                 workspace=workspace, orch_census=False)
+
+
+def test_the_driver_routes_a_tilelang_run_by_its_kernel_file_alone():
+    """``[loop] language`` may be unset and follow the file (lang_mode), so the
+    driver's test must read the file too, exactly as _is_cuda does. A ``_tl.py``
+    under the CUDA mode never gets here: language_problem refuses it first."""
+    from forgekernel.loop import driver
+
+    assert driver._is_tilelang(_ctx("kernel_tl.py"))
+    assert driver._is_tilelang(_ctx("kernel_tl.py", "tilelang"))
+    assert not driver._is_tilelang(_ctx("kernel.py", "cutedsl"))
+    assert not driver._is_tilelang(_ctx("kernel.cu", "cuda-sol"))
+    assert not driver._is_cuda(_ctx("kernel_tl.py"))
+
+
+def test_the_probe_jobs_name_the_tilelang_kernel_file(tmp_path):
+    """The probe's default is kernel.py; a TileLang run's file is kernel_tl.py, and a
+    probe pointed at the wrong name measures nothing. Same fix as the CUDA mode's."""
+    from forgekernel.loop import driver
+
+    cmd = driver._timeline_cmd(_ctx("kernel_tl.py", "tilelang"))
+    assert "--kernel kernel_tl.py" in cmd
+    assert driver._timeline_cmd(_ctx("kernel.py", "cutedsl")) == driver._TIMELINE_CMD
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / driver._ORCH_CENSUS_RUNNER).write_text("", encoding="utf-8")
+    census_ctx = _ctx("kernel_tl.py", "tilelang", tmp_path)
+    census_ctx.orch_census = True
+    assert "--kernel kernel_tl.py" in driver._ncu_mode(census_ctx)
+
+
+def test_the_tilelang_markers_are_read_with_the_python_spelling(tmp_path):
+    """A ``_tl.py`` is Python: ``def _seg`` + literal-string calls, the same parser as
+    the CuTe DSL one. The C++ spelling (``#define FK_SEG``) is the CUDA mode's only."""
+    from forgekernel.loop import driver
+
+    src = tmp_path / "kernel_tl.py"
+    src.write_text('def _seg(site, row=0):\n    return None\n\n\n'
+                   'def k():\n    _seg("load.begin", 0)\n    _seg("load.end", 0)\n',
+                   encoding="utf-8")
+    has_def, names = driver._timeline_markers(_ctx("kernel_tl.py", "tilelang", tmp_path))
+    assert has_def and names == ["load.begin", "load.end"]
+
+
+def test_the_tilelang_student_note_says_the_probe_cannot_stamp_not_add_markers(tmp_path):
+    """The stamped preamble imports cutlass, so asking a TileLang student to add _seg
+    calls is asking them to restructure the kernel around a probe that cannot run.
+    The note has to say that plainly — and it must not carry the CuTe DSL convention
+    line (cutlass.const_expr and friends)."""
+    from forgekernel.loop import driver
+
+    (tmp_path / "kernel_tl.py").write_text("def k():\n    pass\n", encoding="utf-8")
+    ctx = _ctx("kernel_tl.py", "tilelang", tmp_path)
+    ctx.timeline_probe = "on"
+    note = driver._timeline_student_note(ctx)
+    assert "does not support TileLang yet" in note
+    assert "do not restructure the kernel around the probe" in note
+    assert "cutlass.const_expr" not in note
+    assert "keep `def _seg(site, row=0): return None`" not in note

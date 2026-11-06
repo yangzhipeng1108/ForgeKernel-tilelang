@@ -50,9 +50,39 @@ def cuda_toolchain_problem(env=None) -> str | None:
     return None
 
 
+def tilelang_toolchain_problem(env=None) -> str | None:
+    """What a TileLang-mode card (``--tilelang``: the student's kernel is a Python
+    TileLang module the job compiles and runs) is missing on this image, or None.
+
+    Three things decide whether a TileLang build can run at all, and each fails with
+    a different line, so each is checked and named: the package itself, a compiler
+    TileLang's host-side codegen needs, and — because TileLang JITs through TVM —
+    the ``apache-tvm-ffi`` runtime it links against. Missing, every build reads
+    COMPILE_ERROR when it is the image's."""
+    import os
+    env = os.environ if env is None else env
+    try:
+        import tilelang  # noqa: F401
+    except ImportError:
+        return "tilelang not importable in the job's python3"
+    try:
+        import tvm_ffi  # noqa: F401  (TileLang's JIT runtime)
+    except ImportError:
+        return "tvm_ffi (apache-tvm-ffi) not importable in the job's python3"
+    # TileLang lowers to CUDA C and compiles it with nvcc on this image; a driver
+    # alone is not enough for the codegen path the kernel goes through.
+    if shutil.which("nvcc") is None and not any(
+            os.path.isfile(os.path.join(env.get(k, ""), "bin", "nvcc"))
+            for k in ("CUDA_HOME", "CUDA_PATH") if env.get(k)):
+        return "nvcc not found (PATH / CUDA_HOME)"
+    return None
+
+
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     exe = shutil.which("python3") or "(no python3 on PATH)"
+    want_cuda = "--cuda" in args
+    want_tilelang = "--tilelang" in args
     try:
         p = subprocess.run(["python3", "-c", "import torch; print(torch.__version__)"],
                            capture_output=True, text=True, timeout=600)
@@ -60,11 +90,15 @@ def main(argv=None) -> int:
         print(f"JOB-ENV-FAIL python3={exe} could not run it: {e}", flush=True)
         return 0
     if p.returncode == 0:
-        if "--cuda" in args and (why := cuda_toolchain_problem()) is not None:
+        if want_cuda and (why := cuda_toolchain_problem()) is not None:
+            print(f"JOB-ENV-FAIL python3={exe} {why}", flush=True)
+            return 0
+        if want_tilelang and (why := tilelang_toolchain_problem()) is not None:
             print(f"JOB-ENV-FAIL python3={exe} {why}", flush=True)
             return 0
         print(f"JOB-ENV-OK python3={exe} torch={p.stdout.strip()}"
-              + (" cuda-toolchain=ok" if "--cuda" in args else ""), flush=True)
+              + (" cuda-toolchain=ok" if want_cuda else "")
+              + (" tilelang-toolchain=ok" if want_tilelang else ""), flush=True)
         return 0
     err = (p.stderr or p.stdout or "").strip()
     if err:

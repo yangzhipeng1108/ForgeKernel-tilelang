@@ -86,6 +86,13 @@ KEY_DSL_SOURCE_DIRS = "dsl_source_dirs"
 # an offline CUDA student may read. Falls back to dsl_source_dirs, where older
 # configs declared them.
 KEY_CUDA_SOURCE_DIRS = "cuda_source_dirs"
+# The TileLang mode's counterpart. Separate from dsl_source_dirs on purpose: the two
+# modes read different packages (tilelang vs. the CuTe DSL family), so one run's
+# directory must not be silently handed to the other mode's student -- the same
+# reason cuda_source_dirs is its own key. A ``dsl_source_dirs`` declared for a
+# cutedsl run is still read when this is empty, for configs written before the mode
+# existed.
+KEY_TILELANG_SOURCE_DIRS = "tilelang_source_dirs"
 KEY_EXTRA_ALLOW_WRITE = "agent_allow_write"
 # A source run whose ref_source_paths / ref_source_urls name OTHER implementations (earlier
 # runs on the operator, sister libraries) rather than the oracle itself: true denies them
@@ -304,13 +311,21 @@ class AgentPolicy:
 
     def notice(self, role: str) -> str:
         lines = ["## Runtime environment constraints (enforced by the harness, not advice)"]
-        cuda = lang_mode.is_cuda(self.language)
+        if lang_mode.is_cuda(self.language):
+            source_words = "CUDA / CUTLASS headers"
+            source_label = "- Readable local CUDA / CUTLASS header directories: "
+        elif lang_mode.is_tilelang(self.language):
+            source_words = "TileLang package sources"
+            source_label = "- Readable local TileLang package sources: "
+        else:
+            source_words = "DSL package sources"
+            source_label = "- Readable local DSL package sources: "
         if self.offline(role):
             lines.append(
                 "- **No network this turn**: WebFetch / WebSearch are removed, and every outbound "
                 "connection from Bash (curl, pip, git clone, python networking) is refused by the "
                 "sandbox. Do not try to go online; look up interface details in the KB, the local "
-                + ("CUDA / CUTLASS headers" if cuda else "DSL package sources")
+                + source_words
                 + " and your own probes.")
             lines.append(
                 "- **You may write only your own working directory**: the rest of the repo "
@@ -321,8 +336,7 @@ class AgentPolicy:
                 "`.gitattributes` come from the card, and every job runs the card's copy; a delivery "
                 "that modifies them is not evaluated at all and is REVERTed outright.")
             if self.dsl_source_dirs:
-                lines.append(("- Readable local CUDA / CUTLASS header directories: " if cuda
-                              else "- Readable local DSL package sources: ") + ", ".join(
+                lines.append(source_label + ", ".join(
                     f"`{p}`" for p in self.dsl_source_dirs))
         elif role == ROLE_STUDENT:
             lines.append(
@@ -541,7 +555,8 @@ def declaration_warnings(cfg: dict, dsl_source=None, language: str | None = None
     """``dsl_source``: the resolved ``loop.dsl_source.DslSource`` when the caller
     derived one. Its own notes then say what happened to the empty key (defaulted,
     or why not); without it an empty key gets the bare warning. ``language``: a
-    CUDA-mode run is checked for its header trees instead (``cuda_source_dirs``)."""
+    CUDA-mode run is checked for its header trees (``cuda_source_dirs``), a
+    TileLang-mode run for its package checkout (``tilelang_source_dirs``)."""
     lc = cfg.get("loop", {})
     out = []
     if lang_mode.is_cuda(language):
@@ -552,6 +567,20 @@ def declaration_warnings(cfg: dict, dsl_source=None, language: str | None = None
         if not (lc.get(KEY_CUDA_SOURCE_DIRS) or lc.get(KEY_DSL_SOURCE_DIRS)):
             out.append(f"[loop] {KEY_CUDA_SOURCE_DIRS} is empty — the CUDA student is offline, "
                        f"so it can read CUTLASS / CuTe C++ headers only from a local copy named here")
+        return out
+    if lang_mode.is_tilelang(language):
+        for key in (KEY_REF_SOURCE_PATHS, KEY_TILELANG_SOURCE_DIRS, KEY_DSL_SOURCE_DIRS):
+            for raw in lc.get(key, []) if isinstance(lc.get(key), list) else []:
+                if not _abs(raw).exists():
+                    out.append(f"[loop] {key} entry {raw!r} does not exist on this machine")
+        if not (lc.get(KEY_TILELANG_SOURCE_DIRS) or lc.get(KEY_DSL_SOURCE_DIRS)):
+            if dsl_source is not None:
+                if not dsl_source.defaulted:   # a default is news, not a warning
+                    out.extend(f"[loop] {n}" for n in dsl_source.notes)
+            else:
+                out.append(f"[loop] {KEY_TILELANG_SOURCE_DIRS} is empty — the TileLang student "
+                           f"is offline, so it can read the TileLang API only from a local "
+                           f"checkout named here")
         return out
     for key in (KEY_REF_SOURCE_PATHS, KEY_DSL_SOURCE_DIRS):
         for raw in lc.get(key, []) if isinstance(lc.get(key), list) else []:
@@ -597,6 +626,8 @@ def from_config(cfg: dict, *, oracle_mode: str, repo_root: Path,
     declared = lc.get(KEY_DSL_SOURCE_DIRS, [])
     if lang_mode.is_cuda(language):
         declared = lc.get(KEY_CUDA_SOURCE_DIRS) or declared
+    elif lang_mode.is_tilelang(language):
+        declared = lc.get(KEY_TILELANG_SOURCE_DIRS) or declared
     return AgentPolicy(
         oracle_mode=oracle_mode,
         repo_root=_abs(repo_root),
