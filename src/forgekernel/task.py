@@ -79,9 +79,9 @@ GLOBAL_FILES = ("models.toml", "loop.toml")
 DESCRIPTION_FILE = "description.md"
 SHAPES_FILE = "shapes.json"
 
-LANGUAGES = ("cutedsl", "cuda")
+LANGUAGES = ("cutedsl", "cuda", "tilelang")
 # The loop's own language name for each task language (forgekernel.loop.lang_mode).
-LOOP_LANGUAGE = {"cutedsl": "cutedsl", "cuda": "cuda-sol"}
+LOOP_LANGUAGE = {"cutedsl": "cutedsl", "cuda": "cuda-sol", "tilelang": "tilelang"}
 TIMINGS = ("device", "e2e")
 BACKENDS = ("claude",)
 ROLES = ("teacher", "student")

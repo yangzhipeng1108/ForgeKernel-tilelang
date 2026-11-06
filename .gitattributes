@@ -1,0 +1,10 @@
+# Every file in this repo is LF on disk and in the index (see `git ls-files --eol`).
+# Without this, a checkout on Windows silently rewrites the tree to CRLF and the next
+# diff becomes the whole repository.
+* text=auto eol=lf
+
+# Binary assets the KB may carry later; never line-ending-normalized.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.cubin binary

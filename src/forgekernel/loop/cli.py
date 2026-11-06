@@ -1978,7 +1978,8 @@ def _student_denied_oracle(mode: str, oracle_flag: str | None, cfg: dict,
 
 
 # valid kernel implementation languages (governs the student prompt + harness).
-LANGUAGES = ("cuda-cpp", "inline-ptx", "triton", "cutlass-cpp", "cutedsl", "cuda-sol")
+LANGUAGES = ("cuda-cpp", "inline-ptx", "triton", "cutlass-cpp", "cutedsl", "cuda-sol",
+             "tilelang")
 
 
 def _card_kernel_file(op_dir: Path) -> str:

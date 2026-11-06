@@ -32,7 +32,7 @@ from forgekernel.paths import repo_root, template_dir
 SUITE = "forgekernel"
 PROBLEM = lbmod.PROBLEM_FILE                     # eval/leaderboard/problem.json
 LB_DIR = lbmod.LEADERBOARD_DIR
-KERNEL_FILE = {"cutedsl": "kernel.py", "cuda": "kernel.cu"}
+KERNEL_FILE = {"cutedsl": "kernel.py", "cuda": "kernel.cu", "tilelang": "kernel_tl.py"}
 CUTE_ARCH = {"sm90": "sm_90a", "sm100": "sm_100a", "sm103": "sm_103a", "sm120": "sm_120a"}
 EVAL_FILES = ("leaderboard.py", "timing.py", "precision.py", "closed_ref.py", "ncu_probe.py")
 NCU_PROBE_MODE = "cmd:ncu --csv --metrics gpu__time_active.sum python3 eval/ncu_probe.py"

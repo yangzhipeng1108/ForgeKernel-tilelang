@@ -120,6 +120,10 @@ _DERIVE_STOPLIST = {
     # CuTe DSL idioms every warp-specialized kernel spells the same way — a KB
     # entry naming them cites the DSL, not the reference.
     "sharedstorage", "namedbarrier",
+    # TileLang idioms the same way: the `T.` surface every kernel spells the same
+    # way, and the words a TileLang entry cannot avoid using.
+    "tilelang", "kernel", "copy", "gemm", "pipelined", "annotate", "layout",
+    "prim_func", "alloc", "fragment", "shared", "local", "reduce", "parallel",
 }
 _SOURCE_EXTS = {".py", ".cu", ".cuh", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".h"}
 _PY_DEF = re.compile(r"^\s*(?:def|class)\s+([A-Za-z_]\w{5,})", re.MULTILINE)
@@ -213,6 +217,9 @@ SOURCE_WHITELIST = [
     "cute/",         # include/cute/... headers
     "CuTeDSL",
     "cpasync",       # cutlass.cute.nvgpu.cpasync submodule, often cited bare
+    "tilelang.com",  # TileLang's own docs site
+    "tile-ai/tilelang",   # the upstream repo; its examples/ are public infra
+    "tilelang/",     # a path into a local tilelang checkout (docs/, examples/)
     "quack",
     "third_party",
     "examples/python",
