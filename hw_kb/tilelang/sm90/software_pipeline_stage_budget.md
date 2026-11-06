@@ -17,7 +17,10 @@ instead of being paid on the critical path.
 - arch: `[to be measured]` — this file lives under `sm90/`; the Hopper reading is the one that
   certifies it
 - Certification: `[to be measured]` — a `PROBE PASS` job id, **or** the NCU census axis that
-  moved (`smsp__inst_executed_op_ldgsts` or the emitted `cp.async`/TMA group count, before → after).
+  moved. On this repo the axis is one of `inner/ncu.py`'s `KEY_METRICS` short keys:
+  `stall_long_sb` (waiting on the feed) and `dram_pct` are the two that a working pipeline
+  moves; `smem_dynamic` gives the stage count the compiler actually allocated. Report
+  before → after on the same job.
 
 Without that line this entry is a description, not evidence. TileLang chooses part of the
 schedule itself, so the only honest reading is one taken of the code it emitted for this
@@ -67,7 +70,22 @@ consumer. It is a budget, not a command: the pass decides how many of them it ac
 
 - how many of the `num_stages` buffers are actually materialized;
 - where the wait is placed relative to the consumer;
-- whether the copy becomes `cp.async`, a bulk copy, or a plain load for this shape and dtype.
+- whether the copy becomes a bulk copy, a TMA descriptor feed, or a plain load for this shape
+  and dtype;
+- **how many threads the kernel actually launches.** This one surprises people: with
+  `num_stages > 0` TileLang adds a producer warpgroup. A kernel traced with `threads=128`
+  compiles to `__launch_bounds__(256, 1)`. Verified on 0.1.15:
+
+  | traced `threads=` | `num_stages` | emitted `__launch_bounds__` |
+  |---|---|---|
+  | 128 | 0 | `(128, 1)` |
+  | 128 | 3 | `(256, 1)` |
+  | 256 | 3 | `(384, 1)` |
+
+  So `threads=` is the **consumer** count, not the launch count. A grid/occupancy calculation
+  built from `threads=` alone is wrong whenever the pipeline is on, and a smem or register
+  budget derived from it is wrong in the same way. Read `__launch_bounds__` out of the emitted
+  source (or `launch__registers_per_thread` from NCU) rather than trusting the source you wrote.
 
 **Decided by you** (these are the knobs the milestone prices):
 
@@ -81,11 +99,17 @@ consumer. It is a budget, not a command: the pass decides how many of them it ac
 
 ## Gotchas
 
+- **`threads=` is not the launched thread count when the pipeline is on.** See the table above:
+  `threads=128, num_stages=3` launches 256 threads. Any occupancy or register argument that
+  starts from `threads=` has to start from `__launch_bounds__` instead.
 - **`num_stages` lives where the copy is.** A `T.copy` outside the `T.Pipelined` body is not
   staged, whatever the stage count says.
 - **`num_stages=0` is off, not "let the compiler choose"** (0.1.15 docstring: "if `num_stages`
   is 0, pipeline will not be enabled"). If a stage sweep produces byte-identical output at
-  every value, check this first.
+  every value, check this first. The emitted source makes it visible without a GPU: at
+  `num_stages=0` a Hopper matmul lowers with **zero** `tma` and **zero** `mbarrier`
+  occurrences; at `num_stages=2` and above it has 4 and 14+. (`cp.async` is the Ampere-era
+  spelling and does **not** appear in Hopper output — counting it is a false negative.)
 - **Buffers must be declared outside the loop.** Allocating `a_s` inside the `T.Pipelined` body
   defeats the buffering — each iteration gets a fresh buffer and there is nothing to overlap.
 - **The stage count is a ceiling on shared memory.** `STAGES x (BM x BK + BK x BN) x sizeof(dtype)`

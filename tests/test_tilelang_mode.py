@@ -574,3 +574,55 @@ def test_the_tilelang_student_note_says_the_probe_cannot_stamp_not_add_markers(t
     assert "do not restructure the kernel around the probe" in note
     assert "cutlass.const_expr" not in note
     assert "keep `def _seg(site, row=0): return None`" not in note
+
+# ---------------------------------------------------------------- the KB measurement script
+# scripts/measure_kb_entries.py exists so that filling the four skeletons is a command, not a
+# manual reading. Two things about it have to stay true or the readings it prints are wrong
+# in a way nobody would notice: the NCU keys it asks for must be the ones inner/ncu.py parses,
+# and the KB directory name must not be mistaken for the CUDA target name.
+def _measure_script():
+    import importlib.util
+
+    path = REPO / "scripts" / "measure_kb_entries.py"
+    spec = importlib.util.spec_from_file_location("measure_kb_entries", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_kb_measurement_script_asks_for_metrics_the_parser_knows():
+    """ncu prints whatever you ask for; the parser only reads KEY_METRICS. A metric that is
+    requested but not parsed costs an NCU counter slot and yields nothing, and the report would
+    print an empty axis without saying why."""
+    from forgekernel.inner import ncu
+
+    mod = _measure_script()
+    unknown = set(mod.NCU_SHORT) - set(ncu.KEY_METRICS)
+    assert not unknown, f"requested but not parsed by inner/ncu.py: {sorted(unknown)}"
+    assert set(mod.NCU_SHORT.values()) <= set(ncu.KEY_METRICS.values())
+
+
+def test_the_kb_measurement_script_maps_directory_names_to_real_cuda_targets():
+    """`sm90` is a directory; tilelang refuses it as a target ("Target {...} is not supported").
+    The map has to name the accelerated variant, and it has to cover every KB tree so a new
+    tree cannot silently fall through."""
+    mod = _measure_script()
+    trees = {p.name for p in TL_KB.iterdir() if p.is_dir()}
+    assert trees == set(mod.KB_ARCH_TO_TARGET)
+    assert mod.KB_ARCH_TO_TARGET["sm90"] == "sm_90a"
+    assert mod.KB_ARCH_TO_TARGET["sm100"] == "sm_100a"
+    for tree, target in mod.KB_ARCH_TO_TARGET.items():
+        assert target.startswith("sm_") and target[len("sm_"):][-1].isalpha(), (tree, target)
+
+
+def test_every_kb_skeleton_still_carries_an_unfilled_measured_on_block():
+    """Writing a number into `## Measured on` without running the script is the failure mode this
+    guards: a skeleton whose Certification line was filled by hand is a claim, not a reading.
+    Filled entries move out of this assertion by being renamed to a non-skeleton file."""
+    skeletons = ["software_pipeline_stage_budget", "tiled_copy_scope_and_swizzle",
+                 "gemm_operand_layout_and_policy", "gpu_probe_ladder"]
+    for name in skeletons:
+        text = (TL_KB / "sm90" / f"{name}.md").read_text(encoding="utf-8")
+        assert "## Measured on" in text, name
+        assert "[to be measured]" in text, name
+        assert "- arch: `[to be measured]`" in text, name

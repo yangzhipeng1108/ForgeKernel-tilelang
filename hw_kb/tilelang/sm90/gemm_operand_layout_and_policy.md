@@ -14,8 +14,10 @@ and splits the output tile across warps according to a policy.
 
 - TileLang version: `0.1.15`
 - arch: `[to be measured]` (this file is under `sm90/`)
-- Certification: `[to be measured]` — a `PROBE PASS` job id, or the NCU census axis that moved
-  (`sm__inst_executed_pipe_tensor`, or the emitted MMA instruction count for the tile).
+- Certification: `[to be measured]` — a `PROBE PASS` job id, or the NCU census axis that moved.
+  On this repo the axis is one of `inner/ncu.py`'s `KEY_METRICS` short keys: `tensor_pct` is
+  the one a warp-policy change moves; `smem_wavefronts_ld`/`_st` show what the chosen split
+  costs on the feed side. Report before → after on the same job.
 
 ## When needed (trigger)
 
@@ -65,22 +67,53 @@ the good outcome — see Gotchas for the bad one.
 - which MMA instruction the arch gets (this is the "MMA path" `../README.md` warns about — a
   DSL reading of an equivalent hand-written kernel does **not** transfer);
 - the register layout of the accumulator fragment;
-- how the instruction is tiled inside the warp.
+- how the instruction is tiled inside the warp;
+- **whether your `policy` has any effect at all.** Measured on 0.1.15, sm_90a: for several tile
+  shapes all three policies lower to **byte-identical** source.
+
+  | tile `(BM, BN, BK)` | `threads=` | policies that differ from `Square` |
+  |---|---|---|
+  | (128, 128, 32) | 128 | none |
+  | (64, 64, 32) | 128 | none |
+  | (64, 128, 32) | 128 | none |
+  | (128, 256, 32) | 256 | `FullRow` only |
+
+  So a policy sweep that reports "no difference" on a small tile is not reporting a
+  measurement — it is reporting that the knob was inert. Check the emitted source differs
+  before spending a GPU job on it.
 
 **Decided by you:**
 
-- `policy`, one of `GemmWarpPolicy.Square` / `.FullRow` / `.FullCol`. This is the **only**
-  warp-split knob, and it is a policy name, not a warp count: the actual split is derived from
-  `threads=` and the tile shape.
+- `policy`, one of `GemmWarpPolicy.Square` / `.FullRow` / `.FullCol`. It is a policy name, not
+  a warp count: the actual split is derived from `threads=` and the tile shape, and is
+  discarded when the shape admits only one split.
 - the tile shape (`BM`, `BN`, `BK`) and therefore the smem budget;
 - `clear_accum`, when the accumulator must not be zeroed per call.
 
+### What a policy change looks like when it does take
+
+On `(128, 256, 32)` with `threads=256`, `FullRow` vs `Square` differs in exactly one place: the
+`wgmma` N operand.
+
+```
+Square:   tl::wgmma_ss<..., 64, 128, 16, ...>
+FullRow:  tl::wgmma_ss<..., 64, 256, 16, ...>
+```
+
+`FullRow` gives one warpgroup the whole 256-wide output row; `Square` splits it. That is the
+mechanism, and it is the only one — the instruction count is unchanged, which is why an
+instruction-count diff cannot certify a policy decision.
+
 ## Gotchas
 
+- **`policy` is inert on most tile shapes.** Before sweeping it, lower the kernel twice and
+  diff the emitted source; if the two are identical there is nothing to measure. See the table
+  above.
 - **`policy` does not change the instruction count; it changes which warps get which part of
   the output tile.** A row-split and a column-split can execute the same number of MMA
   instructions and differ in smem traffic and in the reduction that follows. Do not infer "the
-  policy did nothing" from an unchanged instruction count.
+  policy did nothing" from an unchanged instruction count — and do not infer "the policy
+  worked" from one either.
 - **`threads=` and the tile shape have to admit the split.** A policy whose split does not
   divide the tile evenly fails at compile time; `[to be measured: the exact refusal text for
   this card's skeleton]`.
