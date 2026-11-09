@@ -22,6 +22,25 @@ The four rungs of `scripts/measure_kb_entries.py --arch sm120` all returned `PAS
 - Certification: the harness itself ran and returned verdicts on hardware. Its certification is
   "the harness works", not a performance axis.
 
+### Reading the compiled SASS off a TileLang kernel
+
+`orch_census_run.py --kernel <name>_tl.py` works on a TileLang kernel file, and the mechanism is
+worth knowing because it differs from the JIT-dump path the runner was written for:
+
+- TileLang has **no keep-the-cubin switch**, and does not need one — every compile writes
+  `<TILELANG_CACHE_DIR>/<version>/cuda-binaries/<sha>/kernel.cubin` as part of normal caching.
+  Pointing `TILELANG_CACHE_DIR` at a temp dir (and forcing `TILELANG_DISABLE_CACHE=0`) is the
+  entire mechanism. The env has to reach the **child** that compiles, not just the wrapper.
+- That cache also holds every *other* kernel the process compiled, so **do not pick by size and
+  do not pick by CSV row count.** A torch `randn`/reference launch emits one CSV row per metric
+  and can outrow the kernel under test. The runner takes the CSV kernel names in order and
+  requires one to exist as a symbol in the dumped cubins (`matched ... by symbol`), falling back
+  to largest-by-instruction-count only when none does.
+
+Verified on an RTX 6000D with a 2048³ f16 matmul where the CSV carried four rows for torch's
+`distribution_elementwise_...` and two for `k_kernel`: the runner printed
+`matched kernel.cubin by symbol k_kernel` and censused 616 instructions.
+
 ## When needed (trigger)
 
 - **The kernel hangs**: `torch.cuda.synchronize()` never returns and the job is killed by its own

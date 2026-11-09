@@ -169,3 +169,99 @@ def test_main_propagates_ncu_rc_and_survives_launch_failure(monkeypatch, capsys)
     monkeypatch.setattr(R, "_run_ncu", boom)
     assert R.main([]) == 1
     assert "ORCH-CENSUS-SKIP reason=ncu-launch-failed:OSError" in capsys.readouterr().out
+
+# ---- TileLang: the cubin comes from the compile cache, not a dump switch --------------
+
+_TL_CSV = (
+    '"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream",'
+    '"Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit",'
+    '"Metric Value"\n'
+    '"0","1","python3.14","h","normal_kernel","1","7","(256, 1, 1)","(1, 1, 1)","0",'
+    '"12.0","m","launch__shared_mem_per_block_dynamic","byte/block","0"\n'
+    '"1","1","python3.14","h","k_kernel","1","7","(256, 1, 1)","(64, 64, 1)","0",'
+    '"12.0","m","launch__shared_mem_per_block_dynamic","byte/block","16384"\n'
+    '"1","1","python3.14","h","k_kernel","1","7","(256, 1, 1)","(64, 64, 1)","0",'
+    '"12.0","m","launch__registers_per_thread","register/thread","40"\n'
+)
+
+
+def test_the_ncu_kernel_name_skips_the_header_and_the_process_column():
+    """`Kernel Name` is the 5th CSV field, and the header row has that literal string in it
+    while a data row carries the process name (`python3.14`) earlier in the same column
+    position. Either one chosen as "the kernel" would send the census to a cubin that does not
+    exist, and the report would say no-cubin-dumped on a run that dumped fine."""
+    assert R._ncu_kernel_names(_TL_CSV)[0] == "k_kernel"
+
+
+def test_the_ncu_kernel_name_orders_by_rows_without_trusting_row_count():
+    """Row count is an ordering hint, not an identification: a torch reference launch emits one
+    row per requested metric and can outrow the kernel under test. The list comes back ordered
+    so the likeliest is first, and `pick_kernel` then requires that symbol to exist in the
+    dump -- see test_pick_kernel_prefers_the_symbol_the_csv_named."""
+    text = ('"1","1","python3.14","h","k_kernel","1","7",\n'
+            '"1","1","python3.14","h","k_kernel","1","7",\n'
+            '"1","1","python3.14","h","huge_tuning_kernel","1","7",\n')
+
+
+def test_no_parseable_row_yields_no_candidates():
+    assert R._ncu_kernel_names("") == []
+    assert R._ncu_kernel_names("==PROF== Connected to process 1\n") == []
+
+
+def test_pick_kernel_prefers_the_symbol_the_csv_named(tmp_path, monkeypatch):
+    """In the TileLang path the cache holds every kernel the process compiled, so the largest
+    dump is not necessarily the kernel NCU profiled. A matching symbol has to win outright."""
+    d = _dump(tmp_path, ["small.cubin", "big.cubin"])
+    _stub_disasm(monkeypatch, {"small.cubin": (0, "Function : k_kernel\n" + SASS_SMALL),
+                               "big.cubin": (0, "Function : other_kernel\n" + SASS_BIG)})
+    picked = R.pick_kernel(d, out=lambda *_: None, want=["k_kernel"])
+    assert picked[1] == "k_kernel"
+    assert os.path.basename(picked[0]) == "small.cubin"
+
+
+def test_pick_kernel_falls_back_to_largest_when_no_symbol_matches(tmp_path, monkeypatch):
+    """A dump whose symbols do not name the CSV row must still produce a census: the contract
+    is "degrade, never fail", and largest-by-instruction-count is the format-free fallback."""
+    d = _dump(tmp_path, ["a.cubin", "b.cubin"])
+    _stub_disasm(monkeypatch, {"a.cubin": (0, _SMALL_KERNEL),
+                               "b.cubin": (0, "Function : main_kernel\n" + SASS_BIG)})
+    picked = R.pick_kernel(d, out=lambda *_: None, want=["not_in_this_dump"])
+    assert os.path.basename(picked[0]) == "b.cubin"
+
+
+def test_main_points_the_tilelang_cache_at_the_dump_dir(tmp_path, monkeypatch, capsys):
+    """TileLang has no keep-cubin switch; the cubin exists because every compile writes it into
+    TILELANG_CACHE_DIR. The runner therefore has to hand the *child* that env, or the NCU task
+    compiles into ~/.tilelang and the dump dir stays empty."""
+    seen = {}
+
+    def fake_ncu(env):
+        seen["env"] = env
+        # a compile writes <cache>/<version>/cuda-binaries/<sha>/kernel.cubin
+        d = Path(env[R.TL_CACHE_DIR_ENV]) / "0.1.15" / "cuda-binaries" / "abc"
+        d.mkdir(parents=True)
+        (d / "kernel.cubin").write_bytes(b"\x7fELF")
+        return 0, _TL_CSV
+    monkeypatch.setattr(R, "_run_ncu", fake_ncu)
+    _stub_disasm(monkeypatch, {"kernel.cubin": (0, "Function : k_kernel\n" + SASS_BIG)})
+    kernel = tmp_path / "matmul_tl.py"
+    kernel.write_text("import tilelang\n", encoding="utf-8")
+
+    assert R.main(["--kernel", str(kernel)]) == 0
+    env = seen["env"]
+    assert env[R.TL_CACHE_DIR_ENV] == env[R.DUMP_DIR_ENV]
+    assert env["TILELANG_DISABLE_CACHE"] == "0"
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2].startswith("ORCH-CENSUS cubin=kernel.cubin kernel=k_kernel")
+    assert lines[-1].startswith("ORCH-SUMMARY-JSON: ")
+
+
+def test_main_skips_a_tilelang_kernel_file_that_is_not_there(tmp_path, monkeypatch, capsys):
+    """A typo'd --kernel must say so by name. Without the check it degrades to
+    no-cubin-dumped, which points the reader at TileLang's cache instead of at their path."""
+    monkeypatch.setattr(R, "_run_ncu", lambda env: (0, _TL_CSV))
+    missing = tmp_path / "nope_tl.py"
+    assert R.main(["--kernel", str(missing)]) == 0
+    out = capsys.readouterr().out
+    assert "ORCH-CENSUS-SKIP reason=tilelang-kernel-missing" in out
+    assert str(missing) in out

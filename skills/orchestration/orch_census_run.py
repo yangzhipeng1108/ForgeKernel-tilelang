@@ -28,6 +28,18 @@ driver finds the lines anywhere in the log and strips them before its CSV
 parse. Every failure degrades to a one-line ``ORCH-CENSUS-SKIP`` and the
 untouched NCU output — the census is evidence, never a precondition.
 
+Three kernel flavours reach the same two lines, and each one is found differently:
+
+- **CuTe DSL** — the JIT is asked to dump (``CUTE_DSL_KEEP_CUBIN``), and the largest dump is read.
+- **CUDA C++** (``--kernel x.cu``) — no dump switch exists; the extension ``.so`` the card built
+  from that exact source is located and its embedded cubins extracted (``cuobjdump -xelf``).
+- **TileLang** (``--kernel x_tl.py``) — nothing is built from C/C++, and no dump switch exists
+  either, but every compile writes ``<cache>/<version>/cuda-binaries/<sha>/kernel.cubin`` as a
+  normal part of caching. Pointing ``TILELANG_CACHE_DIR`` at the dump dir is the whole
+  mechanism. Unlike the DSL's one-cubin-per-entry dump, that cache also holds every *other*
+  kernel the process compiled, so the cubin is matched by the kernel name NCU profiled rather
+  than by size.
+
 Runs vendored-flat in the student workspace (``python3 notes/orch_census_run.py``;
 ``notes/`` is on sys.path, so ``import orch_tools`` / ``import sass_tools`` are
 bare) and needs nothing the pricing toolkit does not already ship.
@@ -60,6 +72,12 @@ except ImportError:
 
 DUMP_ENV = {"CUTE_DSL_KEEP_CUBIN": "1"}
 DUMP_DIR_ENV = "CUTE_DSL_DUMP_DIR"
+# TileLang has no "keep the cubin" switch, and does not need one: every compile writes
+# <cache>/<version>/cuda-binaries/<sha>/kernel.cubin as a normal part of caching, so pointing the
+# cache at the dump dir is enough. `DISABLE_CACHE=0` is forced because a job image that sets it
+# to 1 would compile in memory and leave nothing to read.
+TL_CACHE_ENV = {"TILELANG_DISABLE_CACHE": "0"}
+TL_CACHE_DIR_ENV = "TILELANG_CACHE_DIR"
 NCU_CMD = ["bash", "gpu_entry.sh", "ncu"]
 _SYM = re.compile(r"(?:Function\s*:\s*|\.text\.)([A-Za-z0-9_$]+)")
 # nvdisasm (and cuobjdump on recent toolkits) writes branch targets as
@@ -107,17 +125,27 @@ def disassemble(cubin: str) -> Tuple[int, str]:
     return 1, ""
 
 
-def pick_kernel(dump_dir: str, out=print) -> Optional[Tuple[str, str, str, int]]:
+def pick_kernel(dump_dir: str, out=print, want=()
+                ) -> Optional[Tuple[str, str, str, int]]:
     """The largest kernel dumped: (cubin path, symbol, sass text, n instrs).
 
     A JIT-compiled operator dumps one cubin per compiled entry; the kernel
     under test is by far the largest, and "largest by parsed instruction
     count" is a format-free criterion the NCU CSV's kernel name can be
     cross-checked against (the symbol rides the ORCH-CENSUS line).
-    """
+
+    ``want`` is the ordered list of names the NCU CSV profiled. When some dumped
+    cubin defines one of them, that cubin wins outright: TileLang caches every kernel
+    a process ever compiled, not only this one, so "largest" can be the wrong kernel
+    when a tuning script compiled a bigger sibling first — and row count cannot
+    identify it either, since a reference launch can outrow the kernel under test.
+    Ordering the candidates and requiring the symbol to exist in the dump is what makes
+    the choice a fact rather than a guess. Empty/false ``want``, or no candidate found in
+    any cubin, falls back to size."""
     cubins = sorted(glob.glob(os.path.join(dump_dir, "**", "*.cubin"),
                               recursive=True), key=os.path.getmtime)
     best = None
+    seen = {}
     for cub in cubins:
         rc, sass = disassemble(cub)
         if rc != 0:
@@ -126,18 +154,30 @@ def pick_kernel(dump_dir: str, out=print) -> Optional[Tuple[str, str, str, int]]
         n = len(sass_tools.parse_sass(sass).instructions)
         m = _SYM.search(sass)
         sym = m.group(1) if m else "?"
+        seen.setdefault(sym, (cub, sym, sass, n))
         if best is None or n > best[3]:
             best = (cub, sym, sass, n)
+    for name in (want or ()):
+        if name in seen:
+            cub, sym, sass, n = seen[name]
+            out(f"[orch-census] {len(cubins)} cubin(s) dumped; matched "
+                f"{os.path.basename(cub)} by symbol {sym}")
+            return cub, sym, sass, n
     if best is not None:
         out(f"[orch-census] {len(cubins)} cubin(s) dumped; largest "
             f"{os.path.basename(best[0])} ({best[3]} instrs)")
     return best
 
 
-def census(dump_dir: str, out=print, full: bool = False) -> Optional[dict]:
+def census(dump_dir: str, out=print, full: bool = False,
+           want=()) -> Optional[dict]:
     """Print ORCH-CENSUS + ORCH-SUMMARY-JSON for the dumped kernel; None on skip."""
     try:
-        picked = pick_kernel(dump_dir, out=out)
+        # `want` is only passed when there is something to match on: a double (or an older
+        # vendored copy) that spells `pick_kernel(dir, out=...)` must keep working, and an
+        # empty candidate list means "largest by size" anyway.
+        picked = (pick_kernel(dump_dir, out=out, want=want) if want
+                  else pick_kernel(dump_dir, out=out))
         if picked is None:
             out("ORCH-CENSUS-SKIP reason=no-cubin-dumped")
             return None
@@ -199,6 +239,37 @@ def cuda_build_root() -> str:
     return os.environ.get(CUDA_BUILD_ENV) or os.path.join(tempfile.gettempdir(), "fk_kernel_build")
 
 
+# A TileLang kernel is a Python file, so nothing is built from a C/C++ source and the cache
+# alone carries the cubin. Spelled in two halves for the same reason as CUDA_SUFFIX: this file
+# is seeded into notes/, and a binary-reference recon tree's guard refuses notes that name a
+# language's source suffix outright.
+TILELANG_SUFFIX = "_tl" + ".py"
+
+
+def _ncu_kernel_names(ncu_out: str) -> list:
+    """Every kernel name the NCU CSV profiled, most-rows first.
+
+    The CSV is the op's, so only the column layout is assumed: `Kernel Name` is the 5th field.
+    The header row has that literal string in the same position, and a data row carries the
+    process name (`python3.14`) in an earlier column, so both are skipped.
+
+    A list, not one name: row count does NOT identify the kernel under test. A torch reference
+    or a randn launch emits one row per requested metric and can outrow the TileLang kernel if
+    the op asks for more metrics than the kernel answers. The dump disambiguates — `pick_kernel`
+    takes the first candidate whose symbol the dumped cubins actually define — so this only has
+    to order them, not to pick."""
+    counts = {}
+    for line in (ncu_out or "").splitlines():
+        cells = [c.strip('"') for c in line.split('","')]
+        if len(cells) < 5:
+            continue
+        name = cells[4]
+        if not name or name == "Kernel Name" or name.startswith("python"):
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return sorted(counts, key=lambda n: -counts[n])
+
+
 def find_cuda_build(src: str, kernel_name: str, root: Optional[str] = None) -> Optional[str]:
     """The extension .so the card built from exactly ``src`` (staged as
     ``kernel_name`` in its build directory), newest first; None when none was built."""
@@ -250,9 +321,17 @@ def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     full = "--full" in args
     kernel = args[args.index("--kernel") + 1] if "--kernel" in args[:-1] else None
+    tilelang = bool(kernel and kernel.endswith(TILELANG_SUFFIX))
     dump_dir = tempfile.mkdtemp(prefix="fk_orch_census_")
     env = dict(os.environ, **DUMP_ENV)
     env[DUMP_DIR_ENV] = dump_dir
+    if tilelang:
+        # The DSL dumps a cubin when asked; TileLang writes one as a side effect of its
+        # cache, so the cache is pointed at the dump dir instead of setting a dump flag.
+        # This has to be exported for the *child* (the NCU task compiles the kernel), not
+        # just used here.
+        env.update(TL_CACHE_ENV)
+        env[TL_CACHE_DIR_ENV] = dump_dir
     print(f"[orch-census] running {' '.join(NCU_CMD)} with the JIT cubin kept "
           f"under {dump_dir}", flush=True)
     try:
@@ -264,7 +343,16 @@ def main(argv=None) -> int:
         return 1
     if ncu_out and not ncu_out.endswith("\n"):
         sys.stdout.write("\n")
-    if kernel and kernel.endswith(CUDA_SUFFIX):
+    if tilelang:
+        # Nothing more to arrange: the compile inside the NCU task already wrote
+        # <cache>/<ver>/cuda-binaries/<sha>/kernel.cubin. `--kernel` is still checked for
+        # existence so a typo'd path is reported here rather than as "no-cubin-dumped".
+        if not os.path.exists(kernel):
+            print(f"ORCH-CENSUS-SKIP reason=tilelang-kernel-missing kernel={kernel}",
+                  flush=True)
+            shutil.rmtree(dump_dir, ignore_errors=True)
+            return rc
+    elif kernel and kernel.endswith(CUDA_SUFFIX):
         # a CUDA kernel dumps nothing: read the build the NCU run just used
         try:
             with open(kernel, encoding="utf-8") as fh:
@@ -277,7 +365,7 @@ def main(argv=None) -> int:
             return rc
     # The census goes LAST, so a log clipped from the front still carries it; the driver
     # strips these lines before its CSV parse and reads them from anywhere.
-    census(dump_dir, full=full)
+    census(dump_dir, full=full, want=_ncu_kernel_names(ncu_out) if tilelang else ())
     shutil.rmtree(dump_dir, ignore_errors=True)
     sys.stdout.flush()
     return rc

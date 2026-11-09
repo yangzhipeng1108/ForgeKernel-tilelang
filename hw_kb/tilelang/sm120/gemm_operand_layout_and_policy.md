@@ -75,6 +75,33 @@ the instruction being scheduled is a different one.
 Practical consequence for a probe: **do not use `wgmma`/`tcgen05` counts to decide whether the
 matrix path is working here.** They are 0 on a kernel that runs correctly at 133 TFLOP/s.
 
+The SASS confirms it, and names the exact opcode. `orch_census_run.py --kernel <x>_tl.py` reads
+the compiled cubin out of the TileLang cache and emits `SASS-PRECISION-JSON` and
+`ORCH-SUMMARY-JSON`:
+
+```
+SASS-PRECISION-JSON: {"accums":["f32"],"inputs":["f16"],"kernel":"k_kernel",
+                      "ops":{"HMMA:f16/f32":64}}
+WGMMA-SERIAL-SKIP kernel=k_kernel reason=no-wgmma-instructions
+ORCH-SUMMARY-JSON: {"cache_ops":["UTMALDG.2D"], "loops":{"copy-producer":5,"scalar":2},
+                    "mbar_per_role":{"copy-producer":3,"spin":3}, "mbar_tiers":{"CONST":2},
+                    "nbar_verdicts":["symmetric rendezvous (all sides SYNC -> lockstep)"],
+                    "supply":["addr-source loads hoisted; prefetched"]}
+```
+
+Three readings worth keeping:
+
+- the matrix op is **`HMMA`** (the SASS spelling of `mma.sync.aligned`), 64 of them, `f16` in and
+  `f32` accumulate — so "the MMA path is working" is checkable from the dump, without a counter;
+- the copy into shared is **`UTMALDG.2D`**, i.e. TMA, which is why `smem_wavefronts_st` drops to 0
+  the moment the pipeline is on (see `software_pipeline_stage_budget.md`);
+- `mbar_per_role` splits 3 producer / 3 spin over 2 `CONST` barrier tiers, and the verdict is a
+  symmetric rendezvous — the producer warpgroup and the consumers arrive in lockstep.
+
+Read this off the *dump*, not the CUDA source: grepping the emitted source for `mma.sync` tells
+you what was requested, the SASS tells you what ptxas emitted, and those differ often enough to
+matter.
+
 ## When needed (trigger)
 
 - The GEMM's achieved throughput is well under the machine's and you want to know whether the

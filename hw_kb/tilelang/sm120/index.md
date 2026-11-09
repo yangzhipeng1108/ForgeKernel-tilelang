@@ -51,7 +51,7 @@ are the kind of thing only a counter can settle:
 | `T.Pipelined(num_stages=)`, the producer warpgroup, the `sm_120a` target gate | `software_pipeline_stage_budget.md` | ✅ NCU census, plateau at 2 |
 | `T.gemm` → `mma.sync` on this arch; `GemmWarpPolicy` sweep | `gemm_operand_layout_and_policy.md` | ✅ NCU census, `Square` reads shared 25 % less |
 | `T.copy` across scopes; the 99 KiB shared-memory ceiling | `tiled_copy_scope_and_swizzle.md` | ✅ NCU census, swizzle inert on a DRAM-bound copy |
-| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS |
+| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS readable via `orch_census_run.py --kernel` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 
@@ -60,7 +60,7 @@ are the kind of thing only a counter can settle:
 | **`nvcc` fails with `warpgroup_reg_alloc` / `warpgroup_reg_dealloc` static assertion** | The target is not `a`-suffixed. Fix the target before touching the kernel — see the table above. This is the first thing to rule out on this arch, and it is not a kernel bug. |
 | **`CUDA_ERROR_NO_BINARY_FOR_GPU` at load** | The binary was built for another arch (an `sm_100a` cubin will compile cleanly here and then not load). The build target and the device capability must agree exactly. |
 | **Lower-only says the pipeline is on, but compilation fails** | `compile_kernel_source` does not invoke `nvcc`; it cannot see arch-gated intrinsics. Confirm any arch conclusion with an actual `tilelang.compile(...)`, not with the lower output alone. |
-| **MMA path is neither `wgmma` nor `tcgen05`** | On sm120 both counters are 0 in the emitted source. Do not infer "the matrix path is broken" from that — probe the instruction that *is* emitted before writing an entry about it. |
+| **MMA path is neither `wgmma` nor `tcgen05`** | On sm120 both counters are 0 in the emitted source — the opcode is `HMMA` and the copy is `UTMALDG.2D`. Do not infer "the matrix path is broken" from that; read the compiled cubin (`orch_census_run.py --kernel <x>_tl.py`) and check `SASS-PRECISION-JSON` before writing an entry about it. |
 | **Kernel hangs / never returns after launch** | One rung per process, each with its own budget in seconds; a bare timed run only burns the whole clock and tells you nothing. |
 | **Writing a multi-contract GPU probe**; or a round comes back all FAIL with only one fact | One contract per rung, self-contained digest per rung, verdicts and facts on separate channels. |
 | **smem traffic over the line** (`smem_wavefronts_st/ld` above the reference) | Wavefronts × bankconf four quadrants, to separate conflict-type from volume-type before touching the swizzle — **but check `dram_pct` first.** If it is above ~90 % the kernel is bandwidth bound and the smem counters are not on the critical path; `tiled_copy_scope_and_swizzle.md` measured a 2.6 % conflict rate against 93 % DRAM utilization and found swizzle worth nothing. |
