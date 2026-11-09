@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +54,21 @@ NCU_SHORT = {
     "launch__registers_per_thread": "regs_per_thread",
 }
 NCU_ARG = ",".join(NCU_SHORT)
+
+# Which NCU configurations each entry's report block cites. The collector runs exactly these and
+# `render` prints exactly these, from one table, so a label cannot be printed without having been
+# collected. "Square@N" is (policy, num_stages); "copy-*" is the copy kernel under each layout.
+NCU_ENTRY_LABELS = {
+    "software_pipeline_stage_budget": ["Square@0", "Square@2", "Square@3", "Square@4"],
+    "tiled_copy_scope_and_swizzle": ["copy-default", "copy-padded"],
+    "gemm_operand_layout_and_policy": ["Square@3", "FullRow@3", "FullCol@3"],
+}
+NCU_CONFIGS = ([(label, ["gemm", label.split("@")[1], label.split("@")[0]])
+                for label in dict.fromkeys(
+                    NCU_ENTRY_LABELS["software_pipeline_stage_budget"]
+                    + NCU_ENTRY_LABELS["gemm_operand_layout_and_policy"])]
+               + [("copy-default", ["copy", "default"]),
+                  ("copy-padded", ["copy", "padded"])])
 
 # The KB directory name is NOT the CUDA target name. `sm90` is a directory; the target that
 # emits Hopper code is `sm_90a` (the `a` is the architecture-accelerated variant, and `sm_90`
@@ -309,12 +326,167 @@ def run_rung(body: Path, rung: str, target: str, budget: float, outdir: Path,
     return result
 
 
-def ncu_cmd(arch_probe: str) -> str:
-    return (f"ncu --metrics {NCU_ARG} --target-processes all --csv "
-            f"--kernel-name-base demangled python <kernel_tl.py> ")
+# A kernel under ncu: run each variant once, parse the CSV for the launch whose demangled name
+# matches the TileLang-generated `k_kernel`. Executed rather than printed: an NCU invocation
+# that is left for the reader to copy is one that never gets run, and the entries stay pending.
+NCU_SCRIPT = r'''
+import json, sys
+import torch
+import tilelang
+import tilelang.layout
+import tilelang.language as T
+
+M = N = K = 4096
 
 
-def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
+def build(stages, policy_name):
+    BM, BN, BK = 128, 128, 32
+    policy = getattr(T.GemmWarpPolicy, policy_name)
+
+    @T.prim_func
+    def k(A: T.Tensor((M, K), "float16"), B: T.Tensor((K, N), "float16"),
+          C: T.Tensor((M, N), "float32")):
+        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
+            a_s = T.alloc_shared((BM, BK), "float16")
+            b_s = T.alloc_shared((BK, BN), "float16")
+            acc = T.alloc_fragment((BM, BN), "float32")
+            T.clear(acc)
+            for kk in T.Pipelined(T.ceildiv(K, BK), num_stages=stages):
+                T.copy(A[by * BM, kk * BK], a_s)
+                T.copy(B[kk * BK, bx * BN], b_s)
+                T.gemm(a_s, b_s, acc, policy=policy)
+            T.copy(acc, C[by * BM, bx * BN])
+    return k
+
+
+def build_copy(swizzle):
+    """A shared-tile copy kernel, with or without an explicit swizzled layout.
+
+    `swizzle=False` is the layout the compiler picks; `swizzle=True` annotates the shared tile
+    with `make_swizzled_layout`, which is the comparison the entry prices. Both move the same
+    bytes, so any wavefront/bank-conflict delta between them is attributable to the layout.
+
+    A padded tile (`alloc_shared((BLK, BLK+4))`) was tried first and does NOT work: the copy
+    lowers as a TMA bulk transfer, and `LowerBulk` rejects a shared tile whose row stride is not
+    the extent. Swizzling is the supported knob on this arch."""
+    BLK = 64
+
+    @T.prim_func
+    def k(x: T.Tensor((M, N), "float32"), y: T.Tensor((M, N), "float32")):
+        with T.Kernel(T.ceildiv(N, BLK), T.ceildiv(M, BLK), threads=256) as (bx, by):
+            s = T.alloc_shared((BLK, BLK), "float32")
+            if swizzle:
+                T.annotate_layout({s: tilelang.layout.make_swizzled_layout(s)})
+            T.copy(x[by * BLK, bx * BLK], s)
+            T.copy(s, y[by * BLK, bx * BLK])
+    return k
+
+
+if __name__ == "__main__":
+    kind, arch = sys.argv[1], sys.argv[2]
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    if kind == "copy":
+        swizzle = len(sys.argv) > 3 and sys.argv[3] == "padded"
+        x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+        kern = tilelang.compile(build_copy(swizzle), out_idx=[1],
+                                target={"kind": "cuda", "arch": arch})
+        kern(x)
+    else:
+        stages, policy_name = int(sys.argv[3]), sys.argv[4]
+        kern = tilelang.compile(build(stages, policy_name), out_idx=[2],
+                                target={"kind": "cuda", "arch": arch})
+        kern(a, b)
+    torch.cuda.synchronize()
+'''
+
+
+def _parse_ncu_csv(text: str) -> dict:
+    """Pick the TileLang kernel out of ncu's CSV and return {short_metric: value}.
+
+    Every other launch in the process (torch's randn, the elementwise reference, the reduce)
+    also emits rows. Matching on the generated name `k_kernel` is what keeps the reading about
+    the kernel under test; without it the last row wins and the numbers belong to torch."""
+    rows = [line for line in text.splitlines() if line.startswith('"')]
+    if not rows:
+        return {}
+    header = None
+    for line in rows:
+        cells = [c.strip('"') for c in line.split('","')]
+        if "Metric Name" in cells:
+            header = cells
+            break
+    if header is None:
+        return {}
+    i_name = header.index("Kernel Name")
+    i_metric = header.index("Metric Name")
+    i_value = header.index("Metric Value")
+    i_unit = header.index("Metric Unit") if "Metric Unit" in header else None
+    out = {}
+    for line in rows:
+        cells = [c.strip('"') for c in line.split('","')]
+        if len(cells) <= max(i_name, i_metric, i_value):
+            continue
+        if "k_kernel" not in cells[i_name]:
+            continue
+        short = NCU_SHORT.get(cells[i_metric])
+        if short is None:
+            continue
+        raw = cells[i_value].replace(",", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            value = raw
+        out[short] = (value, cells[i_unit].strip() if i_unit is not None else "")
+    return out
+
+
+def run_ncu(rung_script: Path, argv: list[str], label: str, target: str,
+            outdir: Path, budget: float) -> dict:
+    """Collect the NCU counters for one configuration.
+
+    `ncu` needs `NVIDIA GPU Performance Counters` access, which is root-only on a default
+    install, so the invocation is wrapped in sudo. `-n` (no password) is tried first and the
+    password is fed on stdin as a fallback: a box that has NOPASSWD set should not need the
+    password, and a box that does not should not require editing sudoers to take a reading."""
+    out = outdir / f"ncu-{label}.csv"
+    # `sudo` resets PATH, and ncu lives in the CUDA toolkit's bin, not /usr/bin. Resolve it
+    # before elevating: the first run of this script failed with "sudo: 'ncu': command not
+    # found" for exactly that reason.
+    ncu = shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
+    base = [ncu, "--metrics", NCU_ARG, "--target-processes", "all",
+            "--csv", sys.executable, str(rung_script)] + argv[:1] + [target] + argv[1:]
+    pw = os.environ.get("FK_SUDO_PASS")
+    attempts = [(["sudo", "-n"] + base, None)]
+    if pw:
+        attempts.append((["sudo", "-S", "-p", ""] + base, pw + "\n"))
+    last = "ncu not run"
+    for cmd, stdin_text in attempts:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=budget,
+                                  input=stdin_text)
+        except FileNotFoundError:
+            return {"available": False, "reason": "ncu or sudo not installed"}
+        except subprocess.TimeoutExpired:
+            return {"available": False, "reason": "ncu timed out"}
+        text = proc.stdout + proc.stderr
+        if "interactive authentication is required" in text or "no tty present" in text:
+            last = "sudo needs a password (set FK_SUDO_PASS)"
+            continue
+        out.write_text(text, encoding="utf-8")
+        if "ERR_NVGPUCTRPERM" in text:
+            return {"available": False,
+                    "reason": "no permission for GPU performance counters "
+                              "(run under sudo, or set NVreg_RestrictProfilingToAdminUsers=0)"}
+        if "ERR_NVGPU" in text or proc.returncode != 0:
+            tail = " | ".join(line.strip() for line in text.splitlines()[-3:])
+            return {"available": False, "reason": f"ncu failed: {tail[:200]}"}
+        return {"available": True, "metrics": _parse_ncu_csv(text)}
+    return {"available": False, "reason": last}
+
+
+def render(arch: str, version: str, results: dict, compile_only: bool,
+           ncu: dict | None = None) -> str:
     lines = [f"# hw_kb/tilelang measurements — {arch}", "",
              f"- TileLang: `{version}`",
              f"- arch: `{arch}`",
@@ -325,6 +497,35 @@ def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
     def facts_of(rung: str) -> dict:
         r = results.get(rung) or {}
         return r.get("facts") or {}
+
+    def ncu_block(labels: list[str]) -> list[str]:
+        """One line per configuration, from a real NCU run.
+
+        Without --ncu this says so rather than printing a command: a command left in the report
+        is one nobody runs, and the entry then sits at "[fill]" forever without anyone noticing
+        it was never collected."""
+        if ncu is None or not ncu.get("available"):
+            why = (ncu or {}).get("reason", "not collected")
+            return [f"- NCU: not collected ({why})"]
+        out = []
+        for label in labels:
+            m = (ncu.get("readings") or {}).get(label, {}).get("metrics") or {}
+            if not m:
+                out.append(f"- NCU {label}: no row for the TileLang kernel")
+                continue
+            parts = []
+            for short in ("time_ns", "smem_dynamic", "regs_per_thread", "stall_long_sb",
+                          "dram_pct", "tensor_pct", "smem_wavefronts_st", "smem_wavefronts_ld",
+                          "bankconf_st", "bankconf_ld"):
+                if short in m:
+                    value, unit = m[short]
+                    if isinstance(value, float):
+                        shown = f"{value:.4g}"
+                    else:
+                        shown = str(value)
+                    parts.append(f"{short}={shown}{(' ' + unit) if unit else ''}".strip())
+            out.append(f"- NCU {label}: " + ", ".join(parts))
+        return out
 
     lines += ["## software_pipeline_stage_budget.md", "",
               "```", f"- TileLang version: `{version}`", f"- arch: `{arch}`"]
@@ -345,9 +546,7 @@ def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
                          f"tma={st.get('tma')}/mbarrier={st.get('mbarrier')}, "
                          f"stages=2 has tma={nz.get('tma')}/mbarrier={nz.get('mbarrier')}")
     if not compile_only:
-        lines.append(f"- smem_dynamic per stage: to be read from `{ncu_cmd(arch)}` "
-                     f"(launch__shared_mem_per_block_dynamic)")
-        lines.append("- axis that moved: `stall_long_sb` / `dram_pct`, before → after")
+        lines += ncu_block(NCU_ENTRY_LABELS["software_pipeline_stage_budget"])
     lines += ["- Certification: [fill with the PROBE PASS job id or the before → after above]",
               "```", ""]
 
@@ -358,8 +557,7 @@ def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
         lines.append(f"- baseline lowered: {cs.get('lowered')} ({cs.get('chars')} chars), "
                      f"tma={'yes' if cs.get('has_tma') else 'no'}")
     if not compile_only:
-        lines.append(f"- smem_wavefronts_st/ld, bankconf_st/ld: `{ncu_cmd(arch)}`; "
-                     f"take the pair (default layout, annotate_layout) in one job")
+        lines += ncu_block(NCU_ENTRY_LABELS["tiled_copy_scope_and_swizzle"])
     lines += ["- Certification: [fill]", "```", ""]
 
     lines += ["## gemm_operand_layout_and_policy.md", "",
@@ -379,7 +577,7 @@ def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
                      "byte-identical source. Do not spend a GPU job sweeping it — change the "
                      "tile (e.g. (128,256,32) with threads=256) if the milestone prices policy.")
     if not compile_only:
-        lines.append(f"- tensor_pct per policy: `{ncu_cmd(arch)}`; wavefronts show the feed cost")
+        lines += ncu_block(NCU_ENTRY_LABELS["gemm_operand_layout_and_policy"])
     lines += ["- Certification: [fill]", "```", ""]
 
     lines += ["## gpu_probe_ladder.md", "",
@@ -401,6 +599,9 @@ def main() -> int:
     ap.add_argument("--compile-only", action="store_true",
                     help="skip the GPU rung; every other rung still runs (needs tilelang only)")
     ap.add_argument("--out", help="write the report here instead of stdout")
+    ap.add_argument("--ncu", action="store_true",
+                    help="also collect the NCU counters (needs sudo; this is what turns an "
+                         "executed reading into a certified one)")
     args = ap.parse_args()
 
     if args.arch not in KB_ARCH_TO_TARGET:
@@ -441,7 +642,26 @@ def main() -> int:
                               args.compile_only)
         print(f"    -> {results[rung].get('verdict')}", file=sys.stderr)
 
-    report = render(args.arch, version, results, args.compile_only)
+    ncu: dict = {"available": False, "reason": "not requested (pass --ncu)"}
+    if args.ncu and not args.compile_only:
+        target = KB_ARCH_TO_TARGET[args.arch]
+        ncu_body = outdir / "fk_ncu_body.py"
+        ncu_body.write_text(NCU_SCRIPT, encoding="utf-8")
+        # Each entry prices one axis: the pipeline entry moves the stage count, the policy entry
+        # moves the warp split, the copy entry moves the shared layout. Sweeping the cross
+        # product would cost a dozen full NCU runs to answer three questions.
+        readings: dict[str, dict] = {}
+        for key, argv in NCU_CONFIGS:
+            print(f"  ncu {key} ...", file=sys.stderr)
+            readings[key] = run_ncu(ncu_body, argv, key, target, outdir, args.budget)
+            print(f"    -> {'ok' if readings[key].get('available') else readings[key].get('reason')}",
+                  file=sys.stderr)
+        failed = [r for r in readings.values() if not r.get("available")]
+        ncu = ({"available": True, "readings": readings} if not failed
+               else {"available": False, "reason": failed[0].get("reason"),
+                     "partial": readings})
+
+    report = render(args.arch, version, results, args.compile_only, ncu)
     if args.out:
         Path(args.out).write_text(report, encoding="utf-8")
         print(f"\nwrote {args.out}", file=sys.stderr)

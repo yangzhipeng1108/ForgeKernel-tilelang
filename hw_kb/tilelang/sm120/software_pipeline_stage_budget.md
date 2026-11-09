@@ -1,9 +1,8 @@
 # Software pipeline on sm120: `num_stages`, the producer warpgroup, and the `a`-suffix gate
 
-> Status: **measured on hardware.** The `## Measured on` block below is a real reading from an
-> RTX 6000D; the numbers are not placeholders. What is still open is the NCU axis (see the
-> last line of that block): a lower-level count certifies that the pipeline *exists*, not that
-> it *helped*.
+> Status: **measured on hardware, NCU axis included.** Every number below is a real reading
+> from an RTX 6000D — lower-level counts from the emitted source, and the stall/pipe-utilization
+> columns from Nsight Compute.
 
 ## Purpose
 
@@ -34,10 +33,38 @@ Executed (L3), 4096³ f16, `num_stages=3`:
 | latency | ≈ 1.03 ms |
 | throughput | ≈ 133 TFLOP/s |
 
-- Certification: the readings above are from a real run, but the **NCU axis is not yet taken**
-  (`smem_dynamic`, `stall_long_sb`, `dram_pct` before → after). Until it is, this entry
-  establishes that the pipeline is emitted and executes; it does not establish that raising the
-  stage count is a win.
+Executed (L3) under `ncu`, same 4096³ f16 problem, tile `(128,128,32)`, one row per stage count:
+
+| `num_stages` | `smem_dynamic` | regs/thread | `stall_long_sb` | `dram_pct` | `tensor_pct` | kernel time |
+|---|---|---|---|---|---|---|
+| 0 | 16.4 KiB | 198 | **9.38** | 11.17 % | 62.76 % | 606 µs |
+| 2 | 32.8 KiB | 240 | **1.47** | 12.74 % | **71.98 %** | 530 µs |
+| 3 | 49.2 KiB | 240 | **1.16** | 12.55 % | 71.10 % | 538 µs |
+| 4 | 65.5 KiB | 240 | 1.50 | 12.93 % | 72.78 % | 523 µs |
+
+- Certification: ✅ **NCU axis taken** (`scripts/measure_kb_entries.py --arch sm120 --ncu`,
+  Nsight Compute 2026.3.0, 6 configs, all parsed against the `k_kernel` launch). The pipeline
+  does what it claims: `stall_long_sb` collapses from 9.38 to 1.16 and the tensor pipe goes
+  from 62.8 % to 71.1 %. **But see the plateau below — reads of "more stages is better" on this
+  arch are wrong.** The `kernel time` column is `gpu__time_active.sum` under the profiler;
+  compare it across rows only, and use the wall-clock figure above for absolute latency.
+
+### The stage count plateaus at 2, and the KB must say so
+
+`num_stages=2` already recovers almost the whole gain. Going 2 → 4 costs **+32.8 KiB of shared
+memory per block** and buys **+0.8 points of `tensor_pct`**, with `stall_long_sb` *rising* from
+1.16 (at 3) to 1.50 (at 4). The win is between **0 and 2**, not between 2 and 4.
+
+The mechanism is visible in the shared-memory store counters: at `num_stages=0`,
+`smem_wavefronts_st = 1.83e7` and `bankconf_st = 1.53e6` — the copies are scalar-ish shared
+stores with real bank conflicts. From stage 2 onward both collapse to **0**, because the copies
+become `tma` (`tma=4` at every stage count ≥ 2). Once the feed is a TMA bulk transfer it never
+touches the shared-memory store path again, so there is nothing left for a fourth buffer to
+overlap.
+
+**Practical reading: budget `num_stages=2` on sm120 and spend the saved shared memory on a
+larger tile.** On a card whose `shared_memory_per_block_optin` is 99 KiB, an extra 33 KiB of
+pipeline depth is the most expensive way to buy 0.8 %.
 
 ## The target is `sm_120a`, and getting this wrong is the first failure on this arch
 
@@ -55,9 +82,12 @@ only present on `a`-suffixed targets.
 ## When needed (trigger)
 
 - The feed is serialized against the math: NCU shows the memory pipe idle while the math pipe
-  runs, or the reverse.
+  runs, or the reverse. On this arch that reads as **`stall_long_sb` above ~5 with
+  `tensor_pct` in the low 60s** — the `num_stages=0` row above is the canonical example.
 - A stage-count sweep that shows no movement. Check `num_stages` is not 0 first, and check the
   target carries the `a` suffix second.
+- Conversely, **`stall_long_sb` around 1 means the pipeline is done and adding stages is waste.**
+  Do not sweep past 2 on this arch without first enlarging the tile.
 
 ## Minimal runnable example
 

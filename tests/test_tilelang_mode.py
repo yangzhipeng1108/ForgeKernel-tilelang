@@ -604,6 +604,54 @@ def test_the_kb_measurement_script_asks_for_metrics_the_parser_knows():
     assert set(mod.NCU_SHORT.values()) <= set(ncu.KEY_METRICS.values())
 
 
+def test_the_ncu_parser_reads_only_the_kernel_under_test():
+    """An ncu CSV holds every launch in the process: torch's randn, the reference matmul, the
+    abs/max reductions. Taking the last row, or the first, attaches another kernel's counters to
+    the entry — a wrong number is worse than a missing one, because nothing downstream can tell.
+
+    The rows below are trimmed from a real RTX 6000D CSV: one torch launch, one TileLang
+    `k_kernel`. Only the TileLang row may survive."""
+    mod = _measure_script()
+    header = ('"ID","Process ID","Kernel Name","Metric Name","Metric Unit",'
+              '"Metric Value"')
+    rows = [
+        header,
+        '"0","1","normal_kernel","launch__shared_mem_per_block_dynamic","byte/block","0"',
+        '"0","1","normal_kernel","sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",'
+        '"%","0"',
+        '"2","1","k_kernel","launch__shared_mem_per_block_dynamic","byte/block","49,152"',
+        '"2","1","k_kernel","sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",'
+        '"%","71.1"',
+        '"3","1","at::vectorized_elementwise_kernel","launch__shared_mem_per_block_dynamic",'
+        '"byte/block","0"',
+    ]
+    got = mod._parse_ncu_csv("\n".join(rows))
+    assert set(got) == {"smem_dynamic", "tensor_pct"}, got
+    assert got["smem_dynamic"][0] == 49152.0
+    assert got["tensor_pct"][0] == 71.1
+
+
+def test_the_ncu_parser_reports_nothing_rather_than_the_wrong_kernel():
+    """When the kernel is absent the result has to be empty, not the first torch row that
+    happens to carry a metric name. An empty dict makes the report say "no row for the kernel";
+    a populated one would silently certify the wrong launch."""
+    mod = _measure_script()
+    text = ('"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+            '"0","normal_kernel","launch__shared_mem_per_block_dynamic","byte/block","0"\n')
+    assert mod._parse_ncu_csv(text) == {}
+
+
+def test_every_ncu_config_the_report_prints_is_one_the_collector_runs():
+    """The render step and the collection step keep their own lists of labels. If they drift,
+    the report prints "no row for the kernel" for a configuration nobody ever asked ncu for, and
+    that reads like a collection failure rather than a typo."""
+    mod = _measure_script()
+    for entry, labels in mod.NCU_ENTRY_LABELS.items():
+        assert labels, entry
+        for label in labels:
+            assert "@" in label or label.startswith("copy-"), label
+
+
 def test_the_kb_measurement_script_maps_directory_names_to_real_cuda_targets():
     """`sm90` is a directory; tilelang refuses it as a target ("Target {...} is not supported").
     The map has to name the accelerated variant, and it has to cover every KB tree so a new

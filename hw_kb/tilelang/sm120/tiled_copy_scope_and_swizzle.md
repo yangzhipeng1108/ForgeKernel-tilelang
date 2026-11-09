@@ -1,6 +1,7 @@
 # `T.copy` across scopes on sm120, and the 99 KiB shared-memory ceiling
 
-> Status: **measured on hardware.** Numbers from an RTX 6000D; the NCU axis is still open.
+> Status: **measured on hardware, NCU axis included.** Numbers from an RTX 6000D, with the
+> counter columns read from Nsight Compute.
 
 ## Purpose
 
@@ -34,8 +35,40 @@ Copy throughput, 4096² f32, executed and timed:
 | shared tile `(128,64)` | 32 KiB | 0 | 0.0793 ms | 1693.3 GB/s |
 | shared tile `(128,128)` | 64 KiB | 0 | 0.0859 ms | 1562.5 GB/s |
 
-- Certification: executed on hardware; **the NCU axis (`smem_wavefronts_st/ld`, `bankconf_st/ld`)
-  is not yet taken**. The bandwidth numbers are wall-clock and not yet attributed to a counter.
+- Certification: ✅ **NCU axis taken** (`scripts/measure_kb_entries.py --arch sm120 --ncu`).
+  The bandwidth column is wall-clock; the layout comparison below is the counter reading.
+
+### Swizzling a copy kernel on this arch buys nothing — it is DRAM bound
+
+A 4096² f32 shared-tile copy (`BLK=64`, `threads=256`), default layout vs
+`T.annotate_layout({s: make_swizzled_layout(s)})`:
+
+| layout | `dram_pct` | `stall_long_sb` | `smem_wavefronts_st` | `bankconf_st` | time |
+|---|---|---|---|---|---|
+| default | 93.36 % | 177.8 | 5.384e5 | 1.410e4 | 62.7 µs |
+| swizzled | 93.36 % | 178.8 | 5.383e5 | 1.404e4 | 62.9 µs |
+
+The two rows are the same measurement. Bank conflicts are **2.6 % of shared-store wavefronts**
+and the kernel spends its time with `stall_long_sb ≈ 178` — it is waiting on DRAM, not on the
+shared-memory port. `dram_pct = 93.4 %` says the copy is already at the memory-system ceiling;
+no layout can move a number that is set by the outer bandwidth, and both rows land within 1 %.
+
+**Practical reading: do not spend a task on swizzling a pure copy on sm120.** Swizzle pays when
+the shared read is on the critical path — which is the
+[GEMM entry](gemm_operand_layout_and_policy.md), where `smem_wavefronts_ld` actually
+distinguishes the policies — not here, where the kernel never waits on shared memory. This
+entry's `Measured on` bandwidth table is therefore a *bandwidth* result; its layout axis is
+closed, with "no effect" as the finding.
+
+**A padded tile does not work here at all**, which is worth knowing before trying the obvious
+alternative (`alloc_shared((BLK, BLK+4))`): the copy lowers as a TMA bulk transfer and fails with
+
+```
+tvm::tl::cuda::Copy::LowerBulk ... src/cuda/op/copy.cc
+```
+
+because `LowerBulk` requires the shared tile's row stride to equal its extent. On this arch the
+layout knob is `annotate_layout`, not padding.
 
 ## The 99 KiB ceiling is the constraint that will bite first
 

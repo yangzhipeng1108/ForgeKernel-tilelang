@@ -1,7 +1,7 @@
 # `T.gemm` on sm120: `mma.sync`, and a warp policy that actually changes something
 
-> Status: **measured on hardware.** Every number below is from an RTX 6000D, not a plan.
-> The NCU axis is still open; see the last line of `## Measured on`.
+> Status: **measured on hardware, NCU axis included.** Every number below is from an RTX 6000D,
+> and the counter columns come from Nsight Compute rather than being inferred from wall clock.
 
 ## Purpose
 
@@ -26,8 +26,37 @@ All three are numerically identical (same fp16 accumulate noise) and **~4% apart
 The emitted source differs between them (4865–4944 chars), so this is a real scheduling
 difference, not noise in the measurement.
 
-- Certification: executed on hardware; **the NCU axis (`tensor_pct`) is not yet taken**, so the
-  4% spread is a wall-clock reading and not yet attributed to a counter.
+Under `ncu`, the same three configurations, which attributes the spread to a counter:
+
+| policy | `tensor_pct` | `smem_wavefronts_ld` | `stall_long_sb` | `dram_pct` | kernel time |
+|---|---|---|---|---|---|
+| `Square` | 71.10 % | **3.36e7** | 1.16 | 12.55 % | 538 µs |
+| `FullRow` | 70.81 % | **4.19e7** | 1.13 | 12.48 % | 540 µs |
+| `FullCol` | 70.99 % | **4.19e7** | 1.17 | 12.58 % | 536 µs |
+
+- Certification: ✅ **NCU axis taken** (`scripts/measure_kb_entries.py --arch sm120 --ncu`).
+  `emitted launch_bounds = (256, 1)` and profiling confirms a `block=(256,1,1)` launch — the
+  producer warpgroup is real, not a source-level artifact. Note the `kernel time` column is
+  from `gpu__time_active.sum` under the profiler and is not comparable to the wall-clock table
+  above it: NCU serializes and replays, so use it for the *column-to-column* comparison inside
+  the table and the wall-clock table for absolute latency.
+
+### The 4 % is a shared-memory read-amplification difference, not a math difference
+
+`tensor_pct` is effectively flat across the three policies (70.8–71.1 %) and `stall_long_sb` is
+flat too (1.13–1.17). What moves is **`smem_wavefronts_ld`: 3.36e7 for `Square` versus 4.19e7
+for both row and column splits — 25 % more shared-load wavefronts for the same math.** The MMA
+issue rate is unchanged; `FullRow`/`FullCol` simply have to read the operands out of shared
+memory more times to feed a differently-shaped warp ownership.
+
+The wall-clock spread (~4 %) is smaller than the wavefront spread (25 %) because the kernel is
+not shared-read bound — `stall_long_sb ≈ 1.2` says it is waiting on almost nothing. That is the
+useful lesson: **on a well-pipelined kernel a 25 % increase in one counter class can cost only
+4 % of time, so a counter delta is not a performance delta.** Attribute, then measure.
+
+Practical: prefer `Square` here, but do not expect the policy knob to be worth more than a few
+percent while the pipeline is doing its job. The table above is a `num_stages=3` table; with
+the pipeline off the balance shifts, so re-measure rather than reusing this ranking.
 
 ## The MMA path on this arch is neither of the two you would guess
 
