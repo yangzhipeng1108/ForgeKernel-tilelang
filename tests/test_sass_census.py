@@ -22,6 +22,19 @@ NCU_STYLE = """\
 0x7fc07f7a1820           HGMMA.64x64x16.F32 R80, R12, gdesc[UR6]
 """
 
+# sm120 (Blackwell workstation) emits warp-level `HMMA`, not the Hopper `HGMMA`
+# spelling. This is the EXACT form an RTX 6000D produces from a TileLang pipeline
+# GEMM (`cuobjdump -sass`), with the A operand a register. Before `HMMA` was a
+# known family this census returned mma_total=0 and rendered SASS-OPERANDS-FAIL on
+# a kernel running at 133 TFLOP/s -- "no MMA seen" for a healthy tensor kernel.
+SM120_HMMA_STYLE = """\
+        Function : k_kernel
+/*1eb0*/                   HMMA.16816.F32 R144, R56, R52, R144 ;   /* 0x000000343890723c */
+/*1ec0*/                   HMMA.16816.F32 R32, R56, R54, R32 ;     /* 0x000000363820723c */
+/*1ed0*/                   HMMA.16816.F32 R36, R56, R48, R36 ;     /* 0x000000303824723c */
+/*1ee0*/                   HMMA.16816.F32 R40, R56, R50, R40 ;     /* 0x000000323828723c */
+"""
+
 
 def test_census_counts_both_forms_and_styles():
     c = census_from_text(CUOBJDUMP_STYLE)
@@ -33,6 +46,27 @@ def test_census_counts_both_forms_and_styles():
 def test_non_mma_instructions_do_not_count():
     c = census_from_text("/*0000*/  UTMALDG.2D [UR4], [R2] ;\n/*0010*/  BAR.SYNC 0x0 ;\n")
     assert c["mma_total"] == 0
+
+
+def test_sm120_warp_mma_hmma_is_counted_with_a_register_source():
+    # sm120's only MMA family is HMMA; a census blind to it fails a working GEMM.
+    c = census_from_text(SM120_HMMA_STYLE)
+    assert c == {"mma_total": 4, "mma_a_reg": 4, "mma_a_desc": 0, "mma_a_other": 0}
+    line = render_census_line(c, "k_kernel")
+    assert line.startswith("SASS-OPERANDS ")
+    assert "kernel=k_kernel" in line and "mma_total=4" in line and "a_reg=4" in line
+
+
+def test_a_register_with_a_reuse_hint_is_still_a_register():
+    # ptxas tags a re-read operand `R60.reuse`; sm120 GEMMs emit exactly this form
+    # for the A operand. Classifying it as `other` understated a_reg on a fully
+    # register-fed kernel (measured a_reg=8 / a_other=56 before this was fixed).
+    dump = (
+        "/*1d00*/  HMMA.16816.F32 R128, R60.reuse, R172, R128 ;\n"
+        "/*1d90*/  HMMA.16816.F32 R100, R60, R6, R100 ;\n"
+    )
+    c = census_from_text(dump)
+    assert c == {"mma_total": 2, "mma_a_reg": 2, "mma_a_desc": 0, "mma_a_other": 0}
 
 
 def test_render_and_parse_roundtrip():

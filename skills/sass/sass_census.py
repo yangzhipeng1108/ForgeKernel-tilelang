@@ -42,15 +42,28 @@ try:  # vendored alongside this file in a job tree ("import sass_tools" via sys.
 except ImportError:  # harness-side import path
     from forgekernel.skills import sass_tools
 
-# Families whose instructions carry MMA operand lists worth classifying. Mirrors
-# sass_tools.SM90_TENSOR_FAMILIES's MMA subset — TMA/…GMMA-adjacent movement ops
-# have no A/B operand semantics.
-MMA_FAMILIES = ("HGMMA", "QGMMA", "IGMMA", "BGMMA")
+# Families whose instructions carry MMA operand lists worth classifying. TMA/…GMMA-
+# adjacent movement ops have no A/B operand semantics.
+#
+# "HMMA" is first because it is the *warp-level* `mma.sync` spelling, and on sm120
+# (Blackwell workstation) it is the ONLY MMA family ptxas emits — there is no
+# warpgroup MMA (WGMMA/UMMA/"HGMMA") and no tcgen05 on that target. A census that
+# only knew the Hopper spellings returned mma_total=0 on a kernel that runs at
+# 133 TFLOP/s and rendered SASS-OPERANDS-FAIL, i.e. it called a healthy GEMM "not a
+# tensor kernel". Measured: sm120 emits `HMMA.16816.F32` with a register A operand.
+# The Hopper/datacenter spellings stay for their trees; `HMMA` is the sm120 one.
+MMA_FAMILIES = ("HMMA", "HGMMA", "QGMMA", "IGMMA", "BGMMA")
 
 # Operand forms. A register operand is "R<n>" (WGMMA register fragments are named
 # by their first register); a shared-memory operand is a matrix descriptor,
 # spelled desc[...] / gdesc[...] across dump styles.
-_REG = re.compile(r"^-?R\d+$")
+#
+# ptxas appends a reuse hint to an operand it is about to read again before the
+# register is overwritten — sm120 emits `HMMA.16816.F32 R128, R60.reuse, R172, R128`,
+# i.e. the A operand is `R60.reuse`. A regex that only accepted bare `R<n>` classified
+# those as `other`, so a fully register-fed GEMM read a_reg=8 a_other=56. Accept the
+# optional `.reuse` hint (and nothing else — a real descriptor still has no `R`).
+_REG = re.compile(r"^-?R\d+(?:\.reuse)?$")
 _DESC = re.compile(r"\bg?desc\s*\[")
 
 _CENSUS_LINE = re.compile(

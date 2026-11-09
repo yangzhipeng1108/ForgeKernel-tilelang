@@ -39,11 +39,16 @@ from typing import Iterable, List, NamedTuple, Optional, Sequence, Tuple
 # probe2 mistook for one had 400. The floor sits between those clusters.
 MIN_INSTRUCTIONS = 500
 
-# Families whose presence separates a Hopper tensor kernel from bystanders. BAR is
+# Families whose presence separates a tensor kernel from bystanders. BAR is
 # deliberately absent: every kernel has BAR.SYNC (the RNG kernel had exactly one),
 # so it identifies nothing.
+#
+# "HMMA" is the warp-level `mma.sync` spelling and is the ONLY tensor family that
+# sm120 (Blackwell workstation) emits — a set that knew only the Hopper warpgroup
+# spellings ("HGMMA"…) identified a 133-TFLOP/s sm120 GEMM as a bystander. Kept
+# alongside the Hopper spellings, which stay correct on their own trees.
 SM90_TENSOR_FAMILIES = (
-    "HGMMA", "QGMMA", "IGMMA", "BGMMA",
+    "HMMA", "HGMMA", "QGMMA", "IGMMA", "BGMMA",
     "UTMALDG", "UTMASTG", "UTMACCTL",
     "USETMAXREG", "WARPGROUP",
 )

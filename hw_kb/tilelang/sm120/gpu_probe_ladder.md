@@ -41,6 +41,43 @@ Verified on an RTX 6000D with a 2048³ f16 matmul where the CSV carried four row
 `distribution_elementwise_...` and two for `k_kernel`: the runner printed
 `matched kernel.cubin by symbol k_kernel` and censused 616 instructions.
 
+### What the census found on sm120: two blind spots, both fixed
+
+The operand-source census (`sass_census.py`, the `[VERIFY: sass-derived]` channel) was written
+for Hopper and returned `SASS-OPERANDS-FAIL ... no-mma-instructions-parsed` on every sm120 GEMM.
+Two independent reasons, both measured on this box and both now fixed:
+
+1. **The MMA family was wrong for this arch.** The census only knew the warpgroup spellings
+   (`HGMMA`/`QGMMA`/`IGMMA`/`BGMMA`). sm120 emits the *warp-level* `HMMA` and nothing else — 0
+   warpgroup MMAs on a kernel running at 133 TFLOP/s. A census that cannot see `HMMA` calls a
+   healthy GEMM "not a tensor kernel". `HMMA` is now the first family in both
+   `sass_census.MMA_FAMILIES` and `sass_tools.SM90_TENSOR_FAMILIES`.
+2. **ptxas tags the re-read A operand `R60.reuse`.** The register pattern matched only bare
+   `R<n>`, so a fully register-fed kernel read `a_reg=8 a_other=56`. Accepting the optional
+   `.reuse` hint takes it to `a_reg=64 a_other=0` (see the T9 reading below).
+
+The lesson generalizes past these two bugs: **a SASS-reading instrument carries the arch it was
+written for.** Run it on a new `sm_` target and sanity-check that it sees the MMA family that
+target actually emits before trusting a zero.
+
+### T9 / T15 from the dump: the operand is a register, the wait is an mbarrier
+
+Two rows of the milestone skeleton (§3.1) are marked `[VERIFY: sass-derived]`. Reading them off the
+sm120 cubin of a 4096³ f16 GEMM (`num_stages=3`, `policy=Square`):
+
+| axis | reading | meaning |
+|---|---|---|
+| **T9** `mma_a_reg` | `64/64` over 6 cubins, `a_other=0` after the `.reuse` fix | the A operand is fed **from registers** (RS), not through a shared-memory descriptor. The consume path is a fragment, as `T.alloc_fragment` asks. Evidence that "reserved the register budget" and "built the register path" agree here. |
+| **T15** `commit` groups | `[]` (empty) | **no DEPBAR/commit groups at all.** The wait-depth reading a Hopper learner expects does not exist on this arch. |
+| **T15** wait mechanism | 21 mbarrier sites (`INIT`/`EXCH`), 1 named barrier, `SYNCS.PHASECHK.TRANS64.TRYWAIT` ×5 | the pipeline's synchronization is **mbarrier phase-check + trywait**, not `WARPGROUP.DEPBAR.LE gsb0`. `wgmma_serialization_from_text` correctly prints `WGMMA-SERIAL-SKIP ... no-wgmma-instructions`. |
+
+So on sm120 the T9 row is **live and readably positive** (`a_reg` full), while the T15 row is the
+"expressible but the instrument cannot read it" case: there is no `commit` to count because the
+warpgroup-MMA serialization it measures does not exist here. **A milestone that keeps a T15
+`[VERIFY: sass-derived] commit` line on sm120 is asking for a number this arch never produces** —
+downgrade it to a description or re-anchor it to the mbarrier phase-check count, which the census
+does report.
+
 ### The three instruments, and the one reading each one lies about
 
 All three of ForgeKernel's measurement paths work on a TileLang kernel with **no change to the
