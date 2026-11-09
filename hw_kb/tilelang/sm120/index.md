@@ -51,7 +51,7 @@ are the kind of thing only a counter can settle:
 | `T.Pipelined(num_stages=)`, the producer warpgroup, the `sm_120a` target gate | `software_pipeline_stage_budget.md` | ✅ NCU census, plateau at 2 |
 | `T.gemm` → `mma.sync` on this arch; `GemmWarpPolicy` sweep | `gemm_operand_layout_and_policy.md` | ✅ NCU census, `Square` reads shared 25 % less |
 | `T.copy` across scopes; the 99 KiB shared-memory ceiling | `tiled_copy_scope_and_swizzle.md` | ✅ NCU census, swizzle inert on a DRAM-bound copy |
-| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS readable via `orch_census_run.py --kernel` |
+| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS via `orch_census_run.py --kernel`; timing + precision + timeline all verified on hardware |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 
@@ -63,5 +63,6 @@ are the kind of thing only a counter can settle:
 | **MMA path is neither `wgmma` nor `tcgen05`** | On sm120 both counters are 0 in the emitted source — the opcode is `HMMA` and the copy is `UTMALDG.2D`. Do not infer "the matrix path is broken" from that; read the compiled cubin (`orch_census_run.py --kernel <x>_tl.py`) and check `SASS-PRECISION-JSON` before writing an entry about it. |
 | **Kernel hangs / never returns after launch** | One rung per process, each with its own budget in seconds; a bare timed run only burns the whole clock and tells you nothing. |
 | **Writing a multi-contract GPU probe**; or a round comes back all FAIL with only one fact | One contract per rung, self-contained digest per rung, verdicts and facts on separate channels. |
+| **`host_bound_ratio` over 0.5 on a TileLang kernel** | Almost always the kernel is small, not the harness: Python→FFI→launch costs ~6 µs, so a 6 µs kernel reads ~1.0 and a 1 ms kernel reads ~0.005. Check `graph_status` — a `1.0x` or higher graph reading means the graph cannot help either. See `gpu_probe_ladder.md`. |
 | **smem traffic over the line** (`smem_wavefronts_st/ld` above the reference) | Wavefronts × bankconf four quadrants, to separate conflict-type from volume-type before touching the swizzle — **but check `dram_pct` first.** If it is above ~90 % the kernel is bandwidth bound and the smem counters are not on the critical path; `tiled_copy_scope_and_swizzle.md` measured a 2.6 % conflict rate against 93 % DRAM utilization and found swizzle worth nothing. |
 | **A layout I annotated is ignored — or my padded tile will not lower** | Prove the emitted layout on a probe: `T.annotate_layout` applies only to the buffers it names. Padding a shared tile (`alloc_shared((BLK, BLK+4))`) is *not* an alternative here: the copy lowers as a TMA bulk transfer and `LowerBulk` rejects a stride that differs from the extent. Use `make_swizzled_layout`. |

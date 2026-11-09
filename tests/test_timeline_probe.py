@@ -1,5 +1,7 @@
 """The timeline probe: markers -> stamps (source rewrite), slab -> per-role
 segment account (reduction), machine lines -> dict (parse)."""
+import pytest
+
 from forgekernel.skills.timeline_probe import (
     NROW, NSITE, NSLOT, NWARP, SPAN_BAND, coverage_class, coverage_span, markers,
     parse_timeline, print_account, reduce_slab, split_runs, stamp_source, uneven_spans,
@@ -928,3 +930,76 @@ def test_a_two_kernel_forward_reads_both_kernels_from_the_campaign_launch(tmp_pa
                             "from eval/ncu_run.py (workload campaign), dropped 12 stale stamp(s)")
                for w in tl["warn"])
     assert (tmp_path / "kernel.py").read_text(encoding="utf-8") == TOY_TWO_KERNELS
+
+# ---- TileLang: the same markers, a macro instead of a @dsl_user_op --------------------
+
+TL_TOY = '''"""toy tilelang kernel"""
+import tilelang
+import tilelang.language as T
+
+
+def _seg(site, row=0):
+    """timeline marker: no-op here"""
+    return None
+
+
+@T.prim_func
+def kern(x: T.Tensor((M, N), "float32")):
+    with T.Kernel(1, threads=128) as bx:
+        _seg("aux.entry")
+        for ci in range(8):
+            _seg("state.C.wait_kk.begin", ci)
+            _seg("state.C.wait_kk.end", ci)
+'''
+
+
+def test_a_tilelang_kernel_is_stamped_the_same_way_but_with_a_macro():
+    """The marker convention must not change with the language: a student writes the same
+    `def _seg(site, row=0)` no-op and the same `_seg("role.seg.event", i)` call. What
+    differs is what the definition becomes -- a TileLang kernel body cannot hold a DSL
+    user-op, so it becomes a @macro that emits the same PTX through T.call_extern."""
+    from forgekernel.skills.timeline_probe import stamp_tilelang_source
+
+    assert markers(TL_TOY) == ["aux.entry", "state.C.wait_kk.begin", "state.C.wait_kk.end"]
+    stamped, sites = stamp_tilelang_source(TL_TOY)
+    assert sites == markers(TL_TOY)
+    assert "timeline marker: no-op here" not in stamped
+    assert "@_tl_T.macro" in stamped and "import_source" in stamped
+    assert '_seg(1, ci)' in stamped and '_seg(2, ci)' in stamped and "_seg(0, 0)" in stamped
+    assert "%clock64" in stamped             # import_source pastes verbatim: no % format step
+    assert "@NSLOT@" not in stamped and "@BASE@" not in stamped and "@SRC@" not in stamped
+    compile(stamped, "stamped_tl", "exec")   # the stamped file has to parse
+
+
+def test_the_tilelang_stamp_takes_the_slab_address_as_an_argument():
+    """The slab is allocated when the stamped module is imported, long after the source was
+    written, so its address cannot be baked into the C++ the way a constant would be. It
+    goes in as the call's first argument; a source that named it textually would fail in
+    nvcc with `identifier "_TL_BASE" is undefined`."""
+    from forgekernel.skills.timeline_probe import stamp_tilelang_source
+
+    stamped, _ = stamp_tilelang_source(TL_TOY)
+    assert "fk_tl_seg_impl" in stamped
+    assert "unsigned long long base, int site, long long row" in stamped
+    assert 'call_extern("void", "fk_tl_seg_impl", _TL_BASE, site, row)' in stamped
+    assert "addr = base +" in stamped
+
+
+def test_a_tilelang_kernel_without_a_marker_definition_is_refused_by_name():
+    from forgekernel.skills.timeline_probe import stamp_tilelang_source
+
+    with pytest.raises(ValueError, match="def _seg"):
+        stamp_tilelang_source("@T.prim_func\ndef k():\n    pass\n")
+
+
+def test_the_tilelang_and_cuda_suffixes_do_not_collide():
+    """Both spell their suffix in halves so this file can be seeded into notes/ without
+    naming a source suffix the closed-source guard refuses. They must still be distinct:
+    a `_tl.py` routed to the CUDA stamper would be read as a missing `#define FK_SEG`."""
+    from forgekernel.skills.timeline_probe import (
+        is_cuda_kernel, is_tilelang_kernel, CUDA_SUFFIX, TILELANG_SUFFIX,
+    )
+
+    assert CUDA_SUFFIX != TILELANG_SUFFIX
+    assert is_tilelang_kernel("kernel_tl.py") and not is_cuda_kernel("kernel_tl.py")
+    assert is_cuda_kernel("kernel" + CUDA_SUFFIX) and not is_tilelang_kernel("kernel" + CUDA_SUFFIX)

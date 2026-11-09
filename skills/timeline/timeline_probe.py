@@ -311,6 +311,119 @@ def is_cuda_kernel(kernel: str) -> bool:
     return str(kernel).endswith(CUDA_SUFFIX)
 
 
+# ---------------------------------------------------------------- TileLang kernels
+# A TileLang-mode student marks its timeline with the SAME `def _seg(site, row=0)`
+# no-op the DSL path uses, so the marker convention and the site-name rules do not
+# change with the language. What changes is the stamp's foot-hold: a TileLang kernel
+# body cannot hold `@dsl_user_op`, and the DSL preamble's `cute.arch.*` calls do not
+# exist here. Two findings from an RTX 6000D make this workable:
+#
+#   * `T.import_source(text)` (called INSIDE the Kernel block) pastes `text` into the
+#     generated .cu verbatim -- no format step, so a literal `%clock64` survives;
+#   * a module-level `@T.macro` named `_seg` is callable from a prim_func body and its
+#     `T.call_extern` becomes a plain C call to whatever the imported source defined.
+#
+# So the stamp is the DSL's PTX, unchanged, in a `__device__` function the imported
+# source defines; `_seg` becomes a macro that calls it. The slab address is baked into
+# that source at stamping, exactly as the DSL bakes it -- but the value comes from a
+# tensor this process allocates, so the nonce rule still applies: a source-keyed JIT
+# cache must not hand this process another process's cubin.
+TILELANG_SUFFIX = "_tl" + ".py"
+
+
+def is_tilelang_kernel(kernel: str) -> bool:
+    return str(kernel).endswith(TILELANG_SUFFIX)
+
+
+def tilelang_preamble(stride: int = 1) -> str:
+    """The `__device__` stamp function, as a Python expression the macro evaluates.
+
+    Two constraints shape this:
+
+    - it is handed to `T.import_source`, which pastes it into the generated .cu
+      verbatim (no format step), so a literal `%clock64` survives;
+    - the slab address is only known once the process has allocated the tensor, which
+      happens when the kernel module is imported, so the address cannot be baked into the
+      source at stamping time. It is passed as the stamp call's first argument instead
+      (`T.call_extern(..., _TL_BASE, site, row)`), which keeps the source a constant.
+    """
+    src = r'''
+// ---- timeline probe (driver-injected into the stamped build only) ------------
+// [slot][warp][row][site] <- %gridid << 48 | low 48 bits of %clock64, lane 0 of every
+// warp of the first NSLOT x STRIDE CTAs (every STRIDE-th, linear CTA order
+// x + gx * (y + gy * z)); rows >= NROW are not stored. One predicated st.global.u64.
+__device__ __forceinline__ void fk_tl_seg_impl(unsigned long long base, int site, long long row) {
+    const long long cta = (long long)blockIdx.x + (long long)gridDim.x
+        * ((long long)blockIdx.y + (long long)gridDim.y * (long long)blockIdx.z);
+    const long long slot = cta / @STRIDE@LL;
+    const unsigned tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    const unsigned warp = tid / 32u;
+    const int gate = (int)((cta % @STRIDE@LL) != 0) | (int)((tid & 31u) != 0u)
+        | (int)(slot >= @NSLOT@) | (int)(row < 0 || row >= @NROW@)
+        | (int)(warp >= @NWARP@);
+    const long long idx = gate ? 0LL
+        : ((((long long)slot * @NWARP@ + warp) * @NROW@ + row) * @NSITE@ + site);
+    const unsigned long long addr = base + (unsigned long long)idx * 8ULL;
+    asm volatile("{\n\t.reg .pred ptl;\n\t.reg .b64 ttl, tgl;\n\tsetp.eq.b32 ptl, %0, 0;\n\t"
+                 "mov.u64 ttl, %clock64;\n\tmov.u64 tgl, %gridid;\n\t"
+                 "and.b64 ttl, ttl, 0xFFFFFFFFFFFF;\n\tshl.b64 tgl, tgl, 48;\n\tor.b64 ttl, ttl, tgl;\n\t"
+                 "@ptl st.global.u64 [%1], ttl;\n}" :: "r"(gate), "l"(addr));
+}
+// ---- end timeline probe ------------------------------------------------------
+'''
+    return (src.replace("@STRIDE@", str(max(1, int(stride))))
+            .replace("@NSLOT@", str(NSLOT)).replace("@NWARP@", str(NWARP))
+            .replace("@NROW@", str(NROW)).replace("@NSITE@", str(NSITE)))
+
+
+# The block that replaces the student's `def _seg(...)` no-op. `T.import_source` must be
+# called from inside the Kernel block, and the only place guaranteed to be there is the
+# macro's body -- which every `_seg` call reaches from inside that block. The slab is
+# allocated here, at import time, because the address has to be a number before the
+# source can name it (the DSL path has the same constraint and solves it the same way).
+_TILELANG_SEG_BLOCK = '''
+import os as _tl_os
+import atexit as _tl_atexit
+import torch as _tl_torch
+import tilelang.language as _tl_T
+
+_TL_NSLOT, _TL_NWARP, _TL_NROW, _TL_NSITE = @NSLOT@, @NWARP@, @NROW@, @NSITE@
+_TL_STRIDE = int(_tl_os.getenv("TL_STRIDE", "@STRIDE@"))   # getenv: the card fences os.environ
+_TL_SLAB = _tl_torch.zeros((_TL_NSLOT * _TL_NWARP * _TL_NROW * _TL_NSITE,),
+                           dtype=_tl_torch.int64, device="cuda")
+_TL_BASE = int(_TL_SLAB.data_ptr())
+_TL_SEG_SRC = @SRC@
+
+
+def _tl_dump():
+    out = _tl_os.getenv("TL_SLAB_OUT")
+    if out:
+        import numpy as _np
+        _tl_torch.cuda.synchronize()
+        _np.save(out, _TL_SLAB.cpu().numpy())
+
+
+_tl_atexit.register(_tl_dump)
+
+
+@_tl_T.macro
+def _seg(site, row=0):
+    _tl_T.import_source(_TL_SEG_SRC)
+    _tl_T.call_extern("void", "fk_tl_seg_impl", _TL_BASE, site, row)
+
+
+# ---- end timeline probe ------------------------------------------------------
+'''
+
+
+def tilelang_seg_block(stride: int = 1) -> str:
+    return (_TILELANG_SEG_BLOCK
+            .replace("@NSLOT@", str(NSLOT)).replace("@NWARP@", str(NWARP))
+            .replace("@NROW@", str(NROW)).replace("@NSITE@", str(NSITE))
+            .replace("@STRIDE@", str(max(1, int(stride))))
+            .replace("@SRC@", repr(tilelang_preamble(stride))))
+
+
 def _cu_def_span(src: str):
     """(start, end) of the `#define FK_SEG ...` line (with its `\\` continuations)."""
     m = CU_MARKER_DEF_RE.search(src)
@@ -345,6 +458,45 @@ def cuda_preamble(stride: int = 1) -> str:
     return (CUDA_PREAMBLE.replace("@NSLOT@", str(NSLOT)).replace("@NWARP@", str(NWARP))
             .replace("@NROW@", str(NROW)).replace("@NSITE@", str(NSITE))
             .replace("@STRIDE@", str(max(1, int(stride)))))
+
+
+def stamp_tilelang_source(src: str, mode: str = "all", stride: int = 1):
+    """(stamped source, site names by id) -- ``stamp_source`` for a TileLang kernel.
+
+    The marker convention is the DSL's (`def _seg(site, row=0)` / `_seg("role.seg.event", i)`),
+    and so are the site-name rules and the slab layout. What differs is what the
+    definition becomes: a module-level `@tilelang.macro` that emits a C call to the stamp
+    function the macro's own `T.import_source` injects (see `tilelang_seg_block`).
+
+    Raises ValueError like the other two paths; SiteCapExceeded likewise."""
+    if _marker_def_span(src) is None:
+        raise ValueError("kernel carries no `def _seg(` marker definition")
+    names = markers(src)
+    if not names:
+        raise ValueError('kernel carries no `_seg("...")` marker call')
+    keep = names if mode == "all" else [n for n in names if _is_wait_site(n, names)]
+    if not keep:
+        raise ValueError("no wait site to keep in mode=waits")
+    if len(keep) > NSITE:
+        raise SiteCapExceeded(f"{len(keep)} marker sites > {NSITE} in mode={mode}")
+    ids = {n: i for i, n in enumerate(keep)}
+
+    def rewrite(m):
+        name, row = m.group(2), (m.group(3) or "0").strip()
+        if name not in ids:
+            return "None"
+        return f"_seg({ids[name]}, {row})"
+
+    body = ANY_CALL_RE.sub(
+        lambda m: m.group(0) if MARKER_CALL_RE.fullmatch(m.group(0)) else "None", src)
+    body = MARKER_CALL_RE.sub(rewrite, body)
+    if (left := [" ".join(m.group(0).split()) for m in RESIDUAL_CALL_RE.finditer(body)]):
+        raise ValueError("marker call(s) the probe could not read or neutralise: "
+                         + "; ".join(left[:4]))
+    # The def block moves after the rewrite: recompute its span on the rewritten text.
+    span = _marker_def_span(body)
+    stamped = body[:span[0]] + tilelang_seg_block(stride).lstrip("\n") + body[span[1]:]
+    return stamped, keep
 
 
 def stamp_cuda_source(src: str, mode: str = "all", stride: int = 1):
@@ -1488,11 +1640,16 @@ def main(argv=None) -> int:
         print(f"TIMELINE-FAIL reason=kernel-unreadable ({kernel}: {e})", flush=True)
         return 0
     cuda = is_cuda_kernel(kernel)
+    tilelang = is_tilelang_kernel(kernel)
     stride = os.environ.get("TL_STRIDE", "1")
 
     def _stamp(m):
         # a CUDA C++ kernel bakes the stride in (its source may not read the environment)
-        return stamp_cuda_source(src, m, int(stride)) if cuda else stamp_source(src, m)
+        if cuda:
+            return stamp_cuda_source(src, m, int(stride))
+        if tilelang:
+            return stamp_tilelang_source(src, m, int(stride))
+        return stamp_source(src, m)
     try:
         stamped, sites = _stamp(mode)
     except SiteCapExceeded as e:

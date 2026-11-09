@@ -561,21 +561,28 @@ def test_the_tilelang_markers_are_read_with_the_python_spelling(tmp_path):
     assert has_def and names == ["load.begin", "load.end"]
 
 
-def test_the_tilelang_student_note_says_the_probe_cannot_stamp_not_add_markers(tmp_path):
-    """The stamped preamble imports cutlass, so asking a TileLang student to add _seg
-    calls is asking them to restructure the kernel around a probe that cannot run.
-    The note has to say that plainly — and it must not carry the CuTe DSL convention
-    line (cutlass.const_expr and friends)."""
+def test_the_tilelang_student_note_offers_the_marker_convention_not_a_dsl_spelling(tmp_path):
+    """The probe stamps a TileLang kernel now (its marker definition becomes a @macro that
+    emits the same PTX through T.import_source + T.call_extern; verified on an RTX 6000D with
+    TIMELINE-OK). So the note asks for markers like the other two modes do — and it must NOT
+    hand out the DSL spelling (import cutlass / cutlass.const_expr), which a TileLang kernel
+    cannot execute: a student who takes that advice rewrites a working kernel around a probe
+    that no longer needs it."""
     from forgekernel.loop import driver
 
     (tmp_path / "kernel_tl.py").write_text("def k():\n    pass\n", encoding="utf-8")
     ctx = _ctx("kernel_tl.py", "tilelang", tmp_path)
     ctx.timeline_probe = "on"
     note = driver._timeline_student_note(ctx)
-    assert "does not support TileLang yet" in note
-    assert "do not restructure the kernel around the probe" in note
+    assert "does not support TileLang yet" not in note
+    assert "TileLang is supported" in note
+    assert "keep `def _seg(site, row=0): return None`" in note
+    # The note may NAME the DSL spellings only to forbid them; what it must not do is hand
+    # them out as the convention (which is what the old degraded note effectively did).
     assert "cutlass.const_expr" not in note
-    assert "keep `def _seg(site, row=0): return None`" not in note
+    assert "do not add an `import cutlass`" in note
+    # no definition yet -> say what to add, rather than only what not to do
+    assert "carries no `_seg` definition yet" in note
 
 # ---------------------------------------------------------------- the KB measurement script
 # scripts/measure_kb_entries.py exists so that filling the four skeletons is a command, not a

@@ -41,6 +41,64 @@ Verified on an RTX 6000D with a 2048³ f16 matmul where the CSV carried four row
 `distribution_elementwise_...` and two for `k_kernel`: the runner printed
 `matched kernel.cubin by symbol k_kernel` and censused 616 instructions.
 
+### The three instruments, and the one reading each one lies about
+
+All three of ForgeKernel's measurement paths work on a TileLang kernel with **no change to the
+kernel or to the card** — verified on the same box:
+
+| instrument | how it reaches a TileLang kernel | the reading it can get wrong |
+|---|---|---|
+| `eval/timing.py` | `load_entry()` imports the `_tl.py` and times the callable it returns | `host_bound_ratio` on a **small** kernel |
+| `eval/precision.py` | `upcast_call` wraps the callable in a `TorchFunctionMode` and re-runs it in fp64 | nothing found; it reported `pass` at `e_cand=6.5e-7` against a `limit` of `8.1e-6` |
+| `orch_census_run.py` | reads the cubin the compile cache just wrote | which cubin (see above) |
+
+Measured, 4096³ f16 GEMM, `num_stages=3`:
+
+```
+device_median_ms      1.0437     host_enqueue_ms   0.0057
+host_bound_ratio      0.0054     (warn at 0.5 -> safe)
+graph_device_median   1.0402     (0.997x the device reading: a real capture, not an empty graph)
+TFLOP/s               131.6      max_diff          2.0e-3
+```
+
+Measured again on a 512³ GEMM — the same code, a 175x smaller kernel:
+
+```
+device_median_ms      0.00594    host_enqueue_ms   0.00590
+host_bound_ratio      0.9938     <-- over the 0.5 warn line
+graph_device_median   0.00623    (1.049x the device reading: SLOWER than not graphing)
+```
+
+**That is not a TileLang defect, it is a size threshold, and it is the thing to know before
+pricing a small kernel.** The Python → FFI → launch path costs about 6 µs. When the kernel takes
+1 ms that is 0.5 % and the device window is valid; when it takes 6 µs the host and the device are
+the same size and `host_bound_ratio` ~ 1. CUDA-graph replay does **not** rescue it here: the
+capture works and is honest, but at 512³ the replay costs slightly more than the launch it
+replaces, so the graph reading comes back *above* the device reading.
+
+Practical reading: `host_bound_ratio` above 0.5 on a TileLang kernel is a statement about the
+kernel's duration, not about the harness. Read `graph_status`; if it says `1.0x` or higher, the
+kernel is too small for the graph to help and the honest number is the device window plus a note.
+
+### Stamping a TileLang kernel for the timeline
+
+The timeline probe supports TileLang; the marker convention did not change (`def _seg(site,
+row=0): return None` + `_seg("<role>.<seg>.<event>", i)`). Two findings make it work:
+
+- `T.import_source(text)`, called **inside** the `T.Kernel` block, pastes `text` into the
+  generated `.cu` **verbatim** — no `%`-format step, so a literal `%clock64` survives a template
+  that also uses `%` for modulo;
+- a **module-level** `@T.macro` named `_seg` is callable from a `prim_func` body, and its
+  `T.call_extern` becomes a plain C call to whatever the imported source defined. A macro
+  defined *inside* `@T.prim_func` is not visible at the call site (`NameError`).
+
+The slab address cannot be baked into the source (it is allocated when the module is imported,
+after stamping), so it is passed as the stamp call's first argument. A source that named it
+textually fails in nvcc with `identifier "_TL_BASE" is undefined`.
+
+Verified: `TIMELINE-OK mode=all`, `numeric=identical`, `TIMELINE-SITES 2 0:copy.in.begin
+1:copy.in.end`.
+
 ## When needed (trigger)
 
 - **The kernel hangs**: `torch.cuda.synchronize()` never returns and the job is killed by its own

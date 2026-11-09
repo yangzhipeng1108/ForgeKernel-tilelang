@@ -6028,24 +6028,29 @@ def _timeline_student_note_tilelang(ctx: LoopContext, has_def: bool, names: list
                                     nsite: int) -> str:
     """``_timeline_student_note`` for a TileLang-mode run.
 
-    The probe's stamped preamble is CuTe DSL (``import cutlass`` / ``@dsl_user_op`` /
-    ``cute.arch.*``); injected into a ``*_tl.py`` it would fail at trace time, not
-    stamp. Until a TileLang preamble exists the honest note is that the table will
-    not arrive and markers are not the thing to fix — asking for the CuTe DSL
-    spelling here is exactly how a student ends up rewriting the kernel around a
-    probe that cannot run. Marker/staleness lines are still reported when the tree
-    happens to carry them, so an inherited ``_seg`` is not silently invisible."""
+    The probe speaks TileLang now: the marker convention is the DSL's unchanged
+    (``def _seg(site, row=0): return None`` / ``_seg("<role>.<seg>.<event>", i)``), and the
+    stamped build turns the definition into a ``@macro`` that emits the same PTX through
+    ``T.import_source`` + ``T.call_extern``. Verified end to end on an RTX 6000D:
+    ``TIMELINE-OK mode=all``, ``numeric=identical``.
+
+    What a student must NOT do is reach for the DSL spelling (``import cutlass`` /
+    ``@dsl_user_op`` / ``cute.arch.*``): a TileLang kernel cannot execute it, and rewriting
+    the kernel around a probe that does not need it costs rounds for nothing."""
     lines = ["\n## Timeline probe (enabled for this run)",
-             "- **The timeline probe does not support TileLang yet**: its stamping preamble is CuTe "
-             "DSL (`import cutlass`, `@dsl_user_op`, `cute.arch.*`), which a TileLang kernel cannot "
-             "execute. No table will arrive for this run, and `PROBE_REQUEST: timeline` will not "
-             "produce one — **do not restructure the kernel around the probe**, and do not add "
-             "`_seg` calls to satisfy it. Bash timing / `ncu` counters are the instruments that work "
-             "in this mode."]
+             "- Convention: keep `def _seg(site, row=0): return None` in the kernel — the probe "
+             "replaces it in its own stamped build only. Put `_seg(\"<role>.<segment>.stem.begin\", "
+             "i)` / `\".end\"` around every blocking wait and one marker after each chain commit.",
+             "- **TileLang is supported**: do not add an `import cutlass` / `@dsl_user_op` / "
+             "`cute.arch.*` spellings — the probe rewrites the marker definition itself. A kernel "
+             "that compiles and runs is all the probe needs; do not restructure it for the probe."]
     if has_def and names:
         lines.append(f"- Markers in the current tree ({len(names)}): " + ", ".join(
-            f"`{n}`" for n in names[:24]) + ("…" if len(names) > 24 else "")
-            + " — left in place, not measured in this mode.")
+            f"`{n}`" for n in names[:24]) + ("…" if len(names) > 24 else ""))
+    elif not has_def:
+        lines.append("- The tree carries no `_seg` definition yet: add "
+                     "`def _seg(site, row=0): return None` beside the kernel's other module-level "
+                     "helpers and mark the wait pairs.")
     stale = _timeline_probe_stale(ctx)
     if stale:
         lines.append(f"- `notes/timeline_probe.py` does not match the harness version (or is "
