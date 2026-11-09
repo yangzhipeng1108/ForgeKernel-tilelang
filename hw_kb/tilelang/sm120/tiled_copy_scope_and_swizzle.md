@@ -91,6 +91,48 @@ the buffer:
 STAGES x (BM x BK + BK x BN) x sizeof(dtype)  <=  99 KiB
 ```
 
+### Bigger tiles on this arch are SLOWER — the constraint is shared-memory bank conflicts
+
+The 66 KiB of unused shared memory at `(128,128,32)` looks like headroom for a bigger tile. It is
+not: a full tile sweep on a clock-locked RTX 6000D (SM fixed at 2000 MHz, CUDA-event timing, 4096³
+f16, `num_stages=2`) shows **`(128,128,32)` is already the optimum, and every larger BM/BN loses
+badly**:
+
+| tile `(BM,BN,BK)` | smem | TFLOP/s | shared bank conflicts |
+|---|---|---|---|
+| **(128,128,32)** | 32 KiB | **142** | **0** |
+| (128,128,64) | 64 KiB | 142 | — |
+| (128,128,96) | 96 KiB | 143 | — |
+| (128,192,64) | 80 KiB | 140 | — |
+| (128,256,32) | 48 KiB | **82** | 14 362 |
+| (256,128,32) | 48 KiB | **79** | — |
+| (128,256,64) | 96 KiB | **50** | — |
+| (256,256,32) | 64 KiB | **27** | **246 814** |
+
+The mechanism is not occupancy (every config is 240 regs/thread, block=256, `warps_active ≈ 16 %`)
+and not grid fill (at 8192³ the `(256,256)` grid grows 4× to 1024 blocks and still runs at 28
+TFLOP/s). It is **`l1tex__data_bank_conflicts_pipe_lsu_mem_shared`**: 0 at `(128,128,32)`, 1.4e4 at
+`(128,256,32)`, **2.5e5 — 17× more — at `(256,256,32)`**. A `(BK, 256)` B-tile is 512 bytes wide,
+exactly four 128-byte bank rows, so the shared loads collide. Wider BM/BN buys fewer global loads
+and loses far more to the shared port.
+
+**Manual swizzle does NOT rescue it.** Annotating `make_swizzled_layout` on both operands changes
+nothing — `(256,256,32)` goes 27.1 → 27.1 TFLOP/s, `(128,256,32)` 81.8 → 81.7 — because `T.gemm`
+**already applies its own MMA swizzle layout** to the operands it is handed; a user annotation is
+redundant. So on this arch the tile-size axis is closed in the *opposite* direction to the Hopper
+intuition: **do not enlarge the tile to use the spare shared memory; enlarge BK if anything** (BK
+32→96 is worth ~+1 %, and costs the whole budget).
+
+**The sizing recipe on this arch**: `(128,128,32)`, `num_stages=2`, stop. Bank conflicts are zero
+here; the moment BM or BN exceeds 128 the conflict count explodes and throughput collapses.
+
+> Method note: an unlocked GPU oscillates between 180 MHz and 2430 MHz, and per-launch
+> `perf_counter` timing adds Python/launch jitter on top. The first, unclocked sweep of this same
+> code reported `(128,128,64)` at 167 TFLOP/s and `(128,128,32)` at 118 — the opposite ranking and
+> ±30 % run-to-run. Both artifacts disappear once SM clocks are pinned (`nvidia-smi -lgc`) and
+> timing uses CUDA events over a block of iterations. **Lock the clock and use events before
+> trusting any tile ranking on this card.**
+
 ## Fragment vs shared: the measurement does not say what the name suggests
 
 The shared-tile kernels are **2–2.2x faster** than the fragment-staging ones (1733 vs 807 GB/s

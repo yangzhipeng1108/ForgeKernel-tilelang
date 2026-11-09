@@ -37,20 +37,23 @@ These four carry real readings from an RTX 6000D (driver 610.43.02, CUDA 13.3, T
 emitted-source facts, `max_diff` from execution, wall-clock timings, and an NCU census taken with
 `scripts/measure_kb_entries.py --arch sm120 --ncu` (Nsight Compute 2026.3.0).
 
-Two of the census results **contradict the advice a Hopper-trained reader would write**, and both
+Three of the census results **contradict the advice a Hopper-trained reader would write**, and all
 are the kind of thing only a counter can settle:
 
 - the pipeline **plateaus at `num_stages=2`** — 2 → 4 costs 33 KiB of the 99 KiB budget for
   0.8 points of `tensor_pct` (`software_pipeline_stage_budget.md`);
 - **swizzling a pure copy does nothing** — the copy is at `dram_pct = 93 %` and is not waiting on
   the shared-memory port; the layout axis is closed with "no effect"
-  (`tiled_copy_scope_and_swizzle.md`).
+  (`tiled_copy_scope_and_swizzle.md`);
+- **a bigger tile is slower** — `(128,128,32)` is already optimal; enlarging BM/BN to 256 drives
+  shared-bank conflicts from 0 to 2.5e5 and throughput from 142 to 27 TFLOP/s, and manual swizzle
+  does not help (`tiled_copy_scope_and_swizzle.md`, "Bigger tiles are slower").
 
 | Interface | Entry | Evidence |
 |---|---|---|
 | `T.Pipelined(num_stages=)`, the producer warpgroup, the `sm_120a` target gate | `software_pipeline_stage_budget.md` | ✅ NCU census, plateau at 2 |
 | `T.gemm` → `mma.sync` on this arch; `GemmWarpPolicy` sweep | `gemm_operand_layout_and_policy.md` | ✅ NCU census, `Square` reads shared 25 % less |
-| `T.copy` across scopes; the 99 KiB shared-memory ceiling | `tiled_copy_scope_and_swizzle.md` | ✅ NCU census, swizzle inert on a DRAM-bound copy |
+| `T.copy` across scopes; the 99 KiB ceiling; tile size vs bank conflicts | `tiled_copy_scope_and_swizzle.md` | ✅ NCU census, bank conflicts 0→2.5e5 as tile grows |
 | Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS via `orch_census_run.py --kernel`; timing + precision + timeline all verified on hardware |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
@@ -67,4 +70,6 @@ are the kind of thing only a counter can settle:
 | **Writing a multi-contract GPU probe**; or a round comes back all FAIL with only one fact | One contract per rung, self-contained digest per rung, verdicts and facts on separate channels. |
 | **`host_bound_ratio` over 0.5 on a TileLang kernel** | Almost always the kernel is small, not the harness: Python→FFI→launch costs ~6 µs, so a 6 µs kernel reads ~1.0 and a 1 ms kernel reads ~0.005. Check `graph_status` — a `1.0x` or higher graph reading means the graph cannot help either. See `gpu_probe_ladder.md`. |
 | **smem traffic over the line** (`smem_wavefronts_st/ld` above the reference) | Wavefronts × bankconf four quadrants, to separate conflict-type from volume-type before touching the swizzle — **but check `dram_pct` first.** If it is above ~90 % the kernel is bandwidth bound and the smem counters are not on the critical path; `tiled_copy_scope_and_swizzle.md` measured a 2.6 % conflict rate against 93 % DRAM utilization and found swizzle worth nothing. |
+| **"I have spare shared memory — I'll enlarge the tile"** | Opposite of the Hopper instinct: on sm120 `(128,128,32)` is already optimal and any bigger BM/BN collapses throughput, because a `(BK,256)` B-tile is 512 B wide and shared-bank conflicts jump from 0 to 2.5e5 (17×). Measured sweep in `tiled_copy_scope_and_swizzle.md` ("Bigger tiles are slower"). Do not enlarge BM/BN; BK 32→96 is worth ~+1 % at most. Manual swizzle does not help (`T.gemm` already swizzles). |
+| **A tile/stage sweep gives an unstable ranking** | Lock the SM clock (`sudo nvidia-smi -i 0 -lgc 2000,2000`) and time with CUDA events over a block of iterations. An unlocked RTX 6000D idles at 180–292 MHz and boosts to 2430; `perf_counter` per launch adds more. The same sweep ranked tiles oppositely and varied ±30 % before this was fixed. |
 | **A layout I annotated is ignored — or my padded tile will not lower** | Prove the emitted layout on a probe: `T.annotate_layout` applies only to the buffers it names. Padding a shared tile (`alloc_shared((BLK, BLK+4))`) is *not* an alternative here: the copy lowers as a TMA bulk transfer and `LowerBulk` rejects a stride that differs from the extent. Use `make_swizzled_layout`. |
