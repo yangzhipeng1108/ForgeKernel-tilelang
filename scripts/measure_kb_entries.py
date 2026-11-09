@@ -25,10 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -57,7 +57,13 @@ NCU_ARG = ",".join(NCU_SHORT)
 # emits Hopper code is `sm_90a` (the `a` is the architecture-accelerated variant, and `sm_90`
 # without it is refused by tilelang: "Target {'kind': 'cuda', 'arch': 'sm90'} is not supported").
 # Keeping this map here rather than deriving it means a new tree has to be added deliberately.
-KB_ARCH_TO_TARGET = {"sm90": "sm_90a", "sm100": "sm_100a"}
+#
+# sm120 is the sharpest case: `sm_120` *lowers* fine and then fails in nvcc with
+# "warpgroup_reg_dealloc requires a target with CTA register reconfiguration, such as sm_90a",
+# because the pipeline's producer warpgroup needs setmaxnreg. Only the `a` form runs. Measured
+# on an RTX 6000D (driver 610.43.02 / CUDA 13.3): sm_120a executes, sm_120 fails to compile,
+# sm_100a compiles but fails to load with CUDA_ERROR_NO_BINARY_FOR_GPU.
+KB_ARCH_TO_TARGET = {"sm90": "sm_90a", "sm100": "sm_100a", "sm120": "sm_120a"}
 
 # Rung name -> what the entry needs from it. Each maps to a function in the probe body below.
 RUNGS = {
@@ -216,13 +222,20 @@ def run_gemm_policy(arch):
 
 
 def run_probe_harness(arch):
+    """The harness's own smoke test: does a kernel compile, run and come back with the right
+    numbers on this box?
+
+    `out_idx=[1]` makes the kernel allocate and *return* `y`, so it is called with the inputs
+    only -- passing a pre-made `y` as well is an arity error (met: "Expected 2 inputs, got 3").
+    The copy kernel is the right subject because a wrong result there is unambiguous."""
     import torch
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    y = torch.zeros_like(x)
     k = _compile(copy_kernel, arch, out_idx=[1])
-    k(x, y)
+    y = k(x)
     torch.cuda.synchronize()
-    return {"verdict": "PASS", "facts": {"max_diff": float((x - y).abs().max())}}
+    max_diff = float((x - y).abs().max())
+    return {"verdict": "PASS" if max_diff == 0.0 else "FAIL",
+            "facts": {"max_diff": max_diff, "out_shape": list(y.shape)}}
 
 
 HANDLERS = {"pipeline": run_pipeline, "copy_swizzle": run_copy_swizzle,
@@ -271,15 +284,29 @@ def run_rung(body: Path, rung: str, target: str, budget: float, outdir: Path,
     out = outdir / f"rung-{rung}.json"
     if out.exists():
         out.unlink()
+    log = outdir / f"rung-{rung}.log"
     try:
-        subprocess.run([sys.executable, str(body), rung, target, str(out),
-                        "1" if compile_only else "0"],
-                       timeout=budget, check=False)
+        with open(log, "w", encoding="utf-8") as fh:
+            proc = subprocess.run([sys.executable, str(body), rung, target, str(out),
+                                   "1" if compile_only else "0"],
+                                  stdout=fh, stderr=subprocess.STDOUT,
+                                  timeout=budget, check=False)
     except subprocess.TimeoutExpired:
-        return {"verdict": "HANG", "facts": {"budget_s": budget}}
+        return {"verdict": "HANG", "facts": {"budget_s": budget, "log": str(log)}}
     if not out.exists():
-        return {"verdict": "FAIL", "facts": {"error": "rung wrote no file (crashed before verdict)"}}
-    return json.loads(out.read_text(encoding="utf-8"))
+        # A child that dies before writing its verdict used to leave nothing behind, which made
+        # "the probe crashed" indistinguishable from "the probe was never run". The tail of its
+        # own log is the only thing that says which.
+        tail = ""
+        if log.exists():
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = " | ".join(line.strip() for line in lines[-4:] if line.strip())[:400]
+        return {"verdict": "FAIL",
+                "facts": {"error": f"rung wrote no verdict (exit {proc.returncode})",
+                          "tail": tail, "log": str(log)}}
+    result = json.loads(out.read_text(encoding="utf-8"))
+    result.setdefault("facts", {})["log"] = str(log)
+    return result
 
 
 def ncu_cmd(arch_probe: str) -> str:
@@ -368,15 +395,17 @@ def render(arch: str, version: str, results: dict, compile_only: bool) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--arch", required=True, help="sm90 | sm100 — must match the KB directory")
+    ap.add_argument("--arch", required=True,
+                    help=f"{' | '.join(sorted(KB_ARCH_TO_TARGET))} — must match the KB directory")
     ap.add_argument("--budget", type=float, default=600.0, help="seconds per rung (default 600)")
     ap.add_argument("--compile-only", action="store_true",
                     help="skip the GPU rung; every other rung still runs (needs tilelang only)")
     ap.add_argument("--out", help="write the report here instead of stdout")
     args = ap.parse_args()
 
-    if args.arch not in ("sm90", "sm100"):
-        print(f"error: --arch must be sm90 or sm100, got {args.arch!r}", file=sys.stderr)
+    if args.arch not in KB_ARCH_TO_TARGET:
+        print(f"error: --arch must be one of {sorted(KB_ARCH_TO_TARGET)}, "
+              f"got {args.arch!r}", file=sys.stderr)
         return 2
     if not (KB / args.arch / "index.md").exists():
         print(f"error: no KB tree at {KB / args.arch}", file=sys.stderr)
@@ -396,7 +425,10 @@ def main() -> int:
                   f"      untrustworthy.", file=sys.stderr)
             return 2
 
-    outdir = Path(os.environ.get("TMPDIR") or os.environ.get("TEMP") or ".")
+    # `tempfile` rather than TMPDIR/TEMP: neither is set on the Linux boxes this runs on, and
+    # the old fallback of "." put the probe body in the caller's cwd -- which the child, started
+    # with a different cwd, then could not find.
+    outdir = Path(tempfile.mkdtemp(prefix="fk-kb-measure-"))
     body = outdir / "fk_tilelang_probe_body.py"
     body.write_text(PROBE_BODY, encoding="utf-8")
 

@@ -193,7 +193,7 @@ def test_the_tilelang_kb_is_its_own_lint_clean_tree():
     from forgekernel.loop.kb_lint import lint_kb_dir
 
     assert (TL_KB / "TEMPLATE.md").is_file() and (TL_KB / "README.md").is_file()
-    for arch in ("sm90", "sm100"):
+    for arch in ("sm90", "sm100", "sm120"):
         assert loop_cli._kb_arch_problem(TL_KB, arch) is None, arch
         assert lint_kb_dir(TL_KB / arch) == [], arch
 
@@ -201,8 +201,8 @@ def test_the_tilelang_kb_is_its_own_lint_clean_tree():
 def test_the_tilelang_kb_opens_only_where_it_has_a_tree():
     """exit 14 is a hard gate, not a warning: a run pointed at a tree with no index.md
     reads nothing and files its recipes where nobody indexes them."""
-    problem = loop_cli._kb_arch_problem(TL_KB, "sm120")
-    assert problem and "sm120" in problem
+    problem = loop_cli._kb_arch_problem(TL_KB, "sm150")
+    assert problem and "sm150" in problem
     assert "sm90" in problem and "sm100" in problem      # names what does exist
 
 
@@ -214,7 +214,9 @@ def test_the_tilelang_kb_is_not_prefilled_from_the_dsl_or_cuda_trees():
     its readings came from -- an entry without it is a hypothesis, not evidence."""
     dsl_spelling = re.compile(r"\bcute\.[A-Za-z_]|cutlass\.cute|CUTE_DSL|@cute|"
                               r"cutlass\._mlir|CuTe DSL|tcgen05\.mma\.|wgmma\.mma_async")
-    for arch in ("sm90", "sm100"):
+    trees = sorted(p.name for p in TL_KB.iterdir() if p.is_dir())
+    assert "sm90" in trees and "sm100" in trees and "sm120" in trees
+    for arch in trees:
         entries = sorted((TL_KB / arch).glob("*.md"))
         assert "index.md" in [p.name for p in entries], arch
         for entry in entries:
@@ -605,12 +607,17 @@ def test_the_kb_measurement_script_asks_for_metrics_the_parser_knows():
 def test_the_kb_measurement_script_maps_directory_names_to_real_cuda_targets():
     """`sm90` is a directory; tilelang refuses it as a target ("Target {...} is not supported").
     The map has to name the accelerated variant, and it has to cover every KB tree so a new
-    tree cannot silently fall through."""
+    tree cannot silently fall through.
+
+    sm120 is the case that punishes a careless map: `sm_120` lowers without complaint and then
+    fails inside nvcc with a warpgroup_reg_dealloc static assertion, so a tree mapped to the
+    plain form would look healthy right up to the first real compile."""
     mod = _measure_script()
     trees = {p.name for p in TL_KB.iterdir() if p.is_dir()}
     assert trees == set(mod.KB_ARCH_TO_TARGET)
     assert mod.KB_ARCH_TO_TARGET["sm90"] == "sm_90a"
     assert mod.KB_ARCH_TO_TARGET["sm100"] == "sm_100a"
+    assert mod.KB_ARCH_TO_TARGET["sm120"] == "sm_120a"
     for tree, target in mod.KB_ARCH_TO_TARGET.items():
         assert target.startswith("sm_") and target[len("sm_"):][-1].isalpha(), (tree, target)
 
