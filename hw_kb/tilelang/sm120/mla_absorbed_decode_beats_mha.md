@@ -74,14 +74,28 @@ pipeline stage fits. **This is the point of measuring rather than porting a reci
 definition, and a bigger query tile only costs accumulator registers (`16·Dc fp32`) without amortizing
 anything, since the KV stream dominates.
 
-## Finding 3 — the absorbed `acc (BM, Dc)` is the SMEM ceiling, not the KV tile
+## Finding 3 — the absorbed `acc (BM, Dc)` is the SMEM ceiling, not the KV tile — and `Dc=512` runs as two passes
 
 The natural DeepSeek `Dc = 512` does **not fit** this kernel as written: `acc (16·512 fp32 = 32 KiB)`
 plus `Qs (16·512·2)`, `Cs (BN·512·2)`, and `Ws (512·128·2 = 128 KiB)` blows the 99 KiB cap from the
-output-projection weight alone. The measurements above use `Dc = 128` to keep the mechanism intact; a
-production `Dc = 512` needs the output projection **split out of the attention kernel** (write the
-latent, up-project in a second pass) or an `Ws` tile loop. This is a real constraint, not a
-benchmarking choice — record it before anyone ports the `Dc = 512` shape and hits a 216 KiB request.
+output-projection weight alone. The measurements above use `Dc = 128` to keep the mechanism intact. The
+fix is to **split the output projection out**: pass 1 computes the attention in latent space and writes
+the normalized latent `L (HQ, QLEN, Dc)` to global; pass 2 up-projects `L @ W_uv` in a tiny GEMM.
+Measured on the real `Dc = 512` shape (`HQ=128, QLEN=16, KVLEN=8192`):
+
+| pass | config | time (µs) | TFLOP/s | notes |
+|---|---|---|---|---|
+| 1: latent attention | `BN 32, stages 1` | 552.2 | 62.2 | `cos = 1.00000` on `L` |
+| **1: latent attention** | **`BN 32, stages 2`** | **356.7** | **96.3** | **best — `stages=2` fits at `Dc`-only footprint** |
+| 1: latent attention | `BN 64, stages 1` | 459.8 | 74.7 | `BN 64` + `stages 2` overflows |
+| 2: up-projection | `BM 16, BN 128, BK 64` | 12.7 | — | negligible |
+| **total (two passes)** | | **369.4** | — | `cos = 1.00000`, `md = 1.0e-6` |
+
+So `Dc = 512` **does** come real as two passes, and the split is almost free (12.7 µs for the up-projection).
+Pass 1 dominates and is the same `stages=2` winner as the `Dc=128` single kernel — because once `Ws` is out
+of the kernel, the latent attention fits a second stage. `eff 96.3 TF` at `Dc=512` is higher than the
+`Dc=128` single-kernel `70.1 TF` in absolute terms (it is doing 4× the contraction work); the point is that
+the production width is reachable, not that it is cheaper than the small toy.
 
 ## When needed (trigger)
 
@@ -90,8 +104,9 @@ benchmarking choice — record it before anyone ports the `Dc = 512` shape and h
   This is the structural fix the MHA decode recipe could not find through scheduling.
 - **MLA decode wants `stages = 2` and `BM = 16`** — the opposite of MHA decode (`stages = 1`). Do not
   port the stage verdict between them; the operand footprint (`Dc` latent vs `D` K + `D` V) decides it.
-- **`Dc = 512` does not fit in one kernel** with the up-projection weight in SMEM. Split the output
-  projection into a second pass before porting the real DeepSeek shape.
+- **For the real `Dc = 512`, split the output projection into a second pass** (write the latent, then
+  `L @ W_uv`). Measured total 369 µs at `cos = 1.00000`; pass 1 runs `BN 32, stages 2` at 96.3 TF, pass 2 is
+  12.7 µs. Do not try to keep `W_uv` in the attention kernel — it alone is 128 KiB.
 
 ## Gotchas
 
@@ -99,7 +114,10 @@ benchmarking choice — record it before anyone ports the `Dc = 512` shape and h
   GEMM only supports f8f6f4`). Write the normalized latent into an **fp16 shared** buffer first
   (`Ls`), then GEMM `Ls @ Ws`.
 - **`T.gemm` needs both operands in shared**: `A: shared.dyn, B: global` is rejected. Copy `W_uv` into a
-  shared tile (which is what makes the `Dc = 512` SMEM blow up — see Finding 3).
+  shared tile (which is what makes the `Dc = 512` SMEM blow up — hence the two-pass split in Finding 3).
+- **At `Dc = 512` the attention latent tile needs `BN = 32` to fit** (`BN 64` + `stages 2` overflows); `M=16,
+  N=16` also fails the warp-partition check (`each warp must own a multiple of 16 rows and 8 cols`) — use
+  `BN ≥ 32`.
 - **The absorbed reference must be built in float32.** Construct `softmax(Qa·c^T/√Dc) @ c @ W_uv` in
   fp32; an fp16 reference chain hides the `md` and you cannot see the `5.9e-7` the kernel actually hits.
 - **`cos` alone is not enough here** — with the `0.05`-scaled random operands the values are small;

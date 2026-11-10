@@ -64,16 +64,36 @@ Everything sits at 920–950 GB/s. The wide-`N`/`BK=128` cell is marginally best
 spread is 3 %. For contrast, `torch`'s fp32 `linear` on the same shape is **1066 µs / 3.1 TF** — the
 hand-written fp16 kernel is already 4.8× faster, so there is no low-hanging fruit here either.
 
-## Finding 3 — the real lever is bytes: block-sparsity over the vocabulary
+## Finding 3 — the real lever is bytes: block-sparsity over the vocabulary (measured end to end)
 
 `BW` is at the wall (83 %) and `intensity = 15.7` FLOP/byte — the weight matrix dominates. The way to go
 faster is to **not read all of `W_vocab`**: a softmax-gated vocabulary, an `argmax`-only decode (top-k
-logits), or a candidate shortlist means only a subset of the `N` rows is ever needed. That is the
-**block-tile-skipping** mechanism from `sparse_gemm_two_mechanisms.md` applied along `N` (launch only the
-selected vocab-block tiles from a compacted list) — the same "reduce the bytes" pattern that carries
-`fp8`, `split-K` on starved grids, `2:4`, `causal tile-skip`, and `MLA`. Measured here only as the
-mechanism being available (tile-skip is linear in skipped tiles, `sparse_gemm_two_mechanisms.md`); the
-vocabulary-selection policy itself was not part of this probe.
+logits), or a candidate shortlist means only a subset of the `N` rows is ever needed. This is the
+**block-tile-skipping** mechanism from `sparse_gemm_two_mechanisms.md` applied along `N`. Measured on the
+`M16, N50257, K2048` shape (kernel launches on a compacted list of output-tile indices):
+
+| vocab fraction kept | tiles | time (µs) | vs dense | W read (MB) | BW (GB/s) |
+|---|---|---|---|---|---|
+| 1.00 (dense) | 393 | 221.4 | 1.00× | 206.0 | 930 |
+| 0.50 | 196 | 123.6 | **0.56×** | 102.8 | 831 |
+| 0.25 | 98 | 72.5 | **0.33×** | 51.4 | 709 |
+| 0.10 | 39 | 41.5 | **0.19×** | 20.4 | 492 |
+
+Time falls near-linearly with the kept fraction — **the same linear `tile-skip` behavior measured for the
+dense GEMM**, now along the vocab axis. This is the only lever that beats the bandwidth wall.
+
+**The selection cost does not eat the win.** A realistic two-stage retrieval (coarse screen `X @ G^T` over
+`nc` centroids, then skip to the surviving vocab tiles) adds a fixed cost, because the coarse matrix `G` is
+tiny:
+
+| `nc` | screen `X@G^T` (µs) | `G` bytes vs `W` | kept 0.25 (total) | kept 0.10 (total) | kept 0.05 (total) |
+|---|---|---|---|---|---|
+| 512 | 23.8 | 1.0 % | 92.3 µs (**0.42×**) | 70.5 µs (**0.32×**) | 55.7 µs (**0.25×**) |
+| 1024 | 24.9 | 2.0 % | 95.8 µs (0.43×) | 68.8 µs (0.31×) | 56.0 µs (0.25×) |
+
+End to end — screening plus the sparse GEMM — is still **2.4–4× faster than the dense head** at
+`kept ≤ 0.25`, because the screen reads only 1–2 % of the weight bytes. **Block-sparsity over the vocab is
+the closed answer for the LM head**, not split-K and not a schedule.
 
 ## When needed (trigger)
 
@@ -82,8 +102,8 @@ vocabulary-selection policy itself was not part of this probe.
 - **A `M ≤ 16` LM head is bandwidth-bound** (`~945 GB/s`, 83 % of peak); expect the tile sweep to walk up
   to the wall and stop. There is no schedule/tile win past it.
 - **If an LM head must be faster, cut the bytes** — block-sparse over `N` (skip unneeded vocab tiles),
-  exactly as `sparse_gemm_two_mechanisms.md` measured for dense tiles. That is the only lever the
-  bandwidth wall leaves.
+  measured end to end at **0.25–0.42× of dense** including the top-k screening GEMM (Finding 3). That is
+  the only lever the bandwidth wall leaves, and it is a large one.
 
 ## Gotchas
 

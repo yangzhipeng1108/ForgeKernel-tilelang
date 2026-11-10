@@ -148,12 +148,12 @@ kernels. The one-line summary of the whole map, GEMM included:
 | kernel | bottleneck | what wins | what ties |
 |---|---|---|---|
 | dense GEMM (`gemm_*`) | tensor core, `dram 13 %` | fp8 2.1×, split-K on starved grids, 2:4 sparse 1.95× | schedule / WS / cluster / CLC |
-| prefill attention, non-causal (`flash_attention_is_compute_bound_too.md`) | tensor core, `dram 8.8 %` | fp8 +14 %, small-SEQ grid shaping (1.36×) | schedule / WS / register-cut |
-| **prefill attention, causal** (`causal_attention_skips_the_masked_half.md`) | tensor core | **tile-skip 1.95×, SDPA parity** | split-K, fp8 (+1 %) |
+| prefill attention, non-causal (`flash_attention_is_compute_bound_too.md`) | tensor core, `dram 8.8 %` | fp8 QK^T 1.2–1.4×, small-SEQ grid shaping (1.36×) | schedule / WS / register-cut |
+| **prefill attention, causal** (`causal_attention_skips_the_masked_half.md`) | tensor core | **tile-skip 1.95×, SDPA parity**; **fp8 QK^T 1.2–1.4×** (`fp8_qk_ports_split_k_ties.md`) | split-K |
 | decode MHA (`decode_is_the_one_bandwidth_bound_case.md`) | **HBM 90 %** | (nothing — 880 GB/s wall) | schedule / split-KV / fp8-KV (all tie or lose) |
-| decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 5× over MHA decode** | — |
-| LM head (`lm_head_is_wide_not_starved.md`) | tensor core → HBM at `M16` | (nothing past the tile sweep) | split-K (−18 %), schedule |
-| porting levers to attention (`attention_levers_do_not_port.md`) | — | only the skip carries | split-K tie, fp8 +1 % under skip |
+| decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 5× over MHA decode**; `Dc=512` two-pass 96.3 TF | — |
+| LM head (`lm_head_is_wide_not_starved.md`) | tensor core → HBM at `M16` | **vocab block-sparse 2.4–4× end-to-end** | split-K (−18 %), schedule |
+| porting levers to attention (`fp8_qk_ports_split_k_ties.md`) | — | fp8 QK^T with native fp16 V | split-K (tie) |
 
 The single rule that survives every kernel: **a lever pays only if it reduces work/bytes on the binding
 resource, and only if nothing else already did.** Every win in the table is a work/byte reduction
