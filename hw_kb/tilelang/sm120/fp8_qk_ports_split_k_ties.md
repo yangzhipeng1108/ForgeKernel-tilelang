@@ -50,9 +50,13 @@ The correct configuration: **`Q, K` in fp8 e4m3, `V` and `P` in fp16.** Across t
 | 4096 | full | 892.3 | 639.2 | **1.40×** | 0.9992 |
 | 8192 | causal | 1929.5 | 1379.7 | **1.40×** | 0.9994 |
 | 8192 | full | 3928.1 | 2901.1 | **1.35×** | 0.9993 |
+| **16384** | causal | 7958.5 | 5962.8 | **1.33×** | 0.9994 |
+| **32768** | causal | 32382 | 24234 | **1.34×** | 0.9994 |
 
 fp8 QK^T is a win everywhere — **and notably it survives causal skipping**, which an earlier draft got
-wrong. The full breakdown of *which* operand dtypes (SEQ 4096, causal):
+wrong. It holds from `SEQ 2048` to `SEQ 32768` (1.20–1.40×, `cos ≈ 0.9994` throughout), so it is not a
+short-sequence effect: the longer the sequence the more `K` bytes there are to halve, and the gain stays
+~1.3–1.4× at the long end. The full breakdown of *which* operand dtypes (SEQ 4096, causal):
 
 | config | time (µs) | eff TF | cos |
 |---|---|---|---|

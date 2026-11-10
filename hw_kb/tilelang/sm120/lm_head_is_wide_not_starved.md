@@ -95,15 +95,47 @@ End to end — screening plus the sparse GEMM — is still **2.4–4× faster th
 `kept ≤ 0.25`, because the screen reads only 1–2 % of the weight bytes. **Block-sparsity over the vocab is
 the closed answer for the LM head**, not split-K and not a schedule.
 
+## Finding 4 — fp8 is a large, second independent win (and it stacks with sparsity)
+
+fp8 (`X, W` both e4m3) is the other lever that cuts the weight bytes, and it is bigger than expected:
+
+| shape | fp16 (µs) | fp8 (µs) | speedup | cos |
+|---|---|---|---|---|
+| `M16 N50257 K2048` (bandwidth-bound) | 221.4 | 132.5 | **1.67×** | 0.99930 |
+| `M256 N50257 K2048` (compute-bound) | 2618 | 524 | **5.0×** | 0.99930 |
+
+At `M16` fp8 halves the `W` read (the bandwidth lever: 930 → 777 GB/s effective but 1.67× less time). At
+`M256` the head is compute-bound again and fp8's doubled tensor-core rate gives **5×** — the biggest single
+LM-head win measured, and a reminder that the same kernel is bandwidth-bound at `M16` and compute-bound at
+`M256` (the `intensity` moves, the bottleneck moves with it).
+
+**fp8 and vocab-sparsity stack**, because they cut different costs (bytes/rate vs tile count):
+
+| config | time (µs) | vs fp16 dense |
+|---|---|---|
+| fp16 dense | 221.4 | 1.00× |
+| fp16 + sparse 10 % (incl. screen) | 70.5 | 0.32× |
+| fp8 dense | 131.2 | 0.59× |
+| **fp8 + sparse 10 % (incl. fp8 screen)** | **57.7** | **0.26×** |
+
+The combined path — fp8 GEMM + `kept 0.10` vocab tiles + an fp8 coarse screen (20.0 µs, `nc=512`) — is
+`0.26×` of the fp16 dense head, and beats either lever alone (fp8 alone 131 µs, sparse alone 70 µs). This
+is the fastest LM-head configuration measured, and it is **two byte/work reductions composing**, exactly
+the pattern that wins everywhere else in the map.
+
 ## When needed (trigger)
 
 - **Never split-K an LM head.** `N = vocab` gives a wide grid (2.5–6.4 waves); split-K is a −18 % loss or
   a flat tie. The starvation test is `M·N/BM/BN < 156` tiles — vocab-sized `N` never passes it.
 - **A `M ≤ 16` LM head is bandwidth-bound** (`~945 GB/s`, 83 % of peak); expect the tile sweep to walk up
   to the wall and stop. There is no schedule/tile win past it.
+- **Use fp8**: 1.67× at `M16` (bandwidth) and 5.0× at `M256` (compute), `cos ≈ 0.999`. It is the single
+  largest LM-head win and it is available at every `M`.
+- **Compose fp8 with vocab block-sparsity** for the fastest head: fp8 + `kept 0.10` + fp8 screen = `0.26×`
+  of fp16 dense (Finding 4). The two levers are independent (bytes vs tiles) and stack.
 - **If an LM head must be faster, cut the bytes** — block-sparse over `N` (skip unneeded vocab tiles),
-  measured end to end at **0.25–0.42× of dense** including the top-k screening GEMM (Finding 3). That is
-  the only lever the bandwidth wall leaves, and it is a large one.
+  measured end to end at **0.25–0.42× of dense** including the top-k screening GEMM (Finding 3). This is
+  the lever the bandwidth wall leaves, and it composes with fp8.
 
 ## Gotchas
 
@@ -114,13 +146,17 @@ the closed answer for the LM head**, not split-K and not a schedule.
   output write becomes the second-order term; cast to fp16 output if the consumer allows).
 - **"skinny" is about `M`, starvation is about `M·N`.** Do not infer split-K from `M` alone — compute
   the tile count first (the whole point of Finding 1).
+- **The same LM head changes bottleneck with `M`**: bandwidth-bound at `M16` (`945 GB/s`, fp8 gives 1.67×),
+  compute-bound at `M256` (fp8 gives 5.0×). Do not design for only one `M` — the lever (bytes vs rate) is
+  chosen by which side of the crossover the working `M` is on.
 
 ## Sources
 
-1. TileLang `0.1.15`: `T.gemm` `M % 16` gate, `T.atomic_add` for the split-K variant, the SMEM-cap
-   error for `BN 512` / `BK 128` at `BN 256`.
+1. TileLang `0.1.15`: `T.gemm` `M % 16` gate, fp8 `T.gemm`, `T.atomic_add` for the split-K variant, the
+   SMEM-cap error for `BN 512` / `BK 128` at `BN 256`.
 2. `split_k_fills_a_starved_grid.md` (the grid-fill `< 156` test this file re-applies), `sparse_gemm_two_mechanisms.md`
-   (block-tile skipping, linear in skipped tiles — the byte-reduction lever Finding 3 points at),
-   `decode_is_the_one_bandwidth_bound_case.md` (the other bandwidth-bound case, same "wall, no schedule" behavior).
+   (block-tile skipping, linear in skipped tiles — the byte-reduction lever Finding 3 measures),
+   `gemm_dtype_throughput.md` (fp8's ~2× on GEMM — consistent with the 5× compute-bound / 1.67×
+   bandwidth-bound split here), `decode_is_the_one_bandwidth_bound_case.md` (the other bandwidth-bound case).
 3. This repo's probes on an RTX 6000D, clock-locked; grid waves and peak-BW ratios computed and compared
    to measured time so the split-K verdict is attributed to grid fill and nothing else.
