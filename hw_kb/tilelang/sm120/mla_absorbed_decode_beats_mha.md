@@ -97,6 +97,11 @@ of the kernel, the latent attention fits a second stage. `eff 96.3 TF` at `Dc=51
 `Dc=128` single-kernel `70.1 TF` in absolute terms (it is doing 4× the contraction work); the point is that
 the production width is reachable, not that it is cheaper than the small toy.
 
+A full tile sweep of pass 1 (`BN ∈ {16,32,64}`, `stages ∈ {1,2,3}`, `threads ∈ {128,256}`) confirms
+**`BN 32, stages 2` is the optimum** — `stages 2` beats `stages 1` at every runnable `BN` (356.7 vs 552.2 µs
+at `BN 32`; 459.0 at `BN 64`), `BN 16` fails the warp-partition check (`M=16, N=16` not coverable), and
+`stages ≥ 3` does not fit. So the `Dc=512` operating point is settled, not left open.
+
 ## When needed (trigger)
 
 - **For decode with a bandwidth wall, absorb the KV into a latent (MLA).** It trades the `880 GB/s`

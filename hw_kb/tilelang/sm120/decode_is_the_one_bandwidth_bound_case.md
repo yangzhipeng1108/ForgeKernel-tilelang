@@ -103,6 +103,23 @@ the MMA directly*, never when it must be upcast first.
 
 (`BN = 128` fp8 does not fit `num_stages=2` — Q+K+V+P over the cap; `BN = 64` is the largest that runs.)
 
+## Finding 4 — GQA decode + fp8 QK^T is a small win (1.04×), because GQA is not bandwidth-bound
+
+GQA decode (`HQ 32 / HKV 8, G = 4, q 16, KV 8192`) with fp8 `Q, K` and native fp16 `V`:
+
+| config | time (µs) | TFLOP/s | cos | vs SDPA |
+|---|---|---|---|---|
+| fp16 | 111.8 | 19.2 | 1.00000 | 1.40× |
+| **fp8 QK, fp16 V** | **107.8** | **19.9** | 0.99922 | **1.46×** |
+| fp8 QK, fp8 V | — | — | — | rejected (mixed dtype) |
+
+Only **1.04×** — much smaller than the 1.2–1.4× fp8 gives on prefill attention. The reason is the same
+one that makes GQA the decode case to *prefer*: shared KV lifts the arithmetic intensity to ~63, so GQA is
+**not** bandwidth-bound, and halving the `K` bytes does not remove a binding cost. The kernel is limited
+by the many small per-head `q=16` GEMMs and the online softmax, not by `K` traffic — so fp8 QK (which cuts
+`K` bytes) has little to give. Consistent with everything else: **fp8 pays where `K` bytes are on the
+critical path (long prefill), and ties where they are not (GQA, where reuse already shrank the traffic).**
+
 ## What this closes
 
 - **"Bandwidth-bound ⇒ scheduling helps" is false here.** The binding constraint on whether an L2 /
@@ -119,7 +136,8 @@ the MMA directly*, never when it must be upcast first.
 - **Decode with MHA (no KV sharing, `q ≪ KV`) is HBM-bound at ~880 GB/s.** Expect scheduling, swizzle,
   persistent, and split-K to all tie; there is no occupancy or L2 knob to reach for.
 - **GQA / MQA decode is the case to prefer**: shared KV lifts intensity (63 for G = 4), the kernel is
-  no longer bandwidth-bound, and the hand-written FA already beats SDPA (1.40× measured).
+  no longer bandwidth-bound, and the hand-written FA already beats SDPA (1.40× measured). fp8 QK adds only
+  ~4 % here (Finding 4) — it is not the lever for GQA, the KV sharing already is.
 - **Do not ship an fp8 KV cache through an upcast path.** It measured 26 % *slower*. If fp8 KV is
   required, it needs a GEMM that consumes fp8 operands directly (an sm120 fp8 attention path), which
   `T.gemm` as used here does not provide.
