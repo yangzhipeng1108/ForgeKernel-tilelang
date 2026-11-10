@@ -26,6 +26,8 @@ directory; each row links to the file with the numbers.
 | 9 | thread-block clusters | ⚠️ launch free, multicast broken | cluster ties plain; `copy_cluster` 22 083 ms vs 0.348 ms | `clusters_free_multicast_broken.md` |
 | 10 | how you time it | ✅ protocol | graph replay 137 vs single-event median 122 vs NCU 265 for the same kernel | `gpu_probe_ladder.md` |
 | 11 | **Stream-K** | ❌ absent, loses to split-K | no API in 0.1.15; hand-written is 20–33 % below split-K on starved grids | `stream_k_is_absent_and_loses.md` |
+| 12 | **CLC** (Blackwell dynamic task pool) | ❌ compiles to a no-op | `static_assert(dependent_false)` fallback; 0 CLC in SASS; corrupts output if paired with a barrier | `clc_compiles_to_nothing.md` |
+| 13 | cooperative warp-group | ✅ already default | `GemmWarpPolicy.Square` is the default and reads 25 % fewer smem wavefronts | `gemm_operand_layout_and_policy.md`, `clc_compiles_to_nothing.md` |
 
 ## Decision tree
 
