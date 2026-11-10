@@ -14,7 +14,9 @@ This file is not a plan; it is the ledger of what has already been earned.
 
 > **Start here for a GEMM:** `gemm_tuning_summary.md` is the one-page map — the 10 axes tried,
 > have a verdict table, and a decision tree (only **dtype** and **split-K** pay; everything else is a
-> tie or a loss). The rows below are the per-recipe detail behind it.
+> tie or a loss). The rows below are the per-recipe detail behind it. `gemm_tuning_plan.md` is the
+> same result as a single consolidated document (all 15 axes, the four that pay, the decision tree,
+> the traps); read that if you want one file rather than the ledger.
 
 ## The one thing this arch gets wrong if you copy sm90/sm100
 
