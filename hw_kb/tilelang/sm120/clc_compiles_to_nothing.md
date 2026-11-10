@@ -55,18 +55,32 @@ TL_DEVICE void clc_try_cancel(void *result_ptr, void *mbar_ptr) {
 - compiled SASS: `cuobjdump -sass` on the CLC kernel → **0** matches for `CLC|LAUNCHCONTROL`;
 - compiled PTX/CUDA: preprocessed source → **0** `clusterlaunchcontrol`.
 
-And the macro really is off for this target:
+And the macro really is off for this target. **Root cause, pinned precisely (corrected):** the
+enable condition chain is
 
 ```
-$ nvcc -arch=sm_120a -c t.cu -I<cutlass>/include   # t.cu #errors on CLC_ON vs CLC_OFF
-error: #error CLC_OFF
+__CUDA_ARCH__ == 1200  AND  __CUDA_ARCH_FEAT_SM120_ALL
+  → CUTLASS_ARCH_MMA_SM120A_ENABLED   (cutlass/arch/config.h:160)
+  → CUTLASS_ARCH_CLC_ENABLED          (cutlass/arch/config.h:225)
+  → the asm in cluster.h runs; otherwise the #else static_assert no-op
 ```
 
-`cutlass/arch/config.h` defines `CUTLASS_ARCH_CLC_ENABLED` only when one of the
-`CUTLASS_ARCH_MMA_SM{100,101,103,110,120,121}{A,F}_ENABLED` macros is set — and on a plain
-`-arch=sm_120a` compile **none of them is**, because that header keys off TunableOp arch macros,
-not `__CUDA_ARCH__`. So on this build CLC is compiled out even though the arch list nominally
-includes SM120A.
+A device-pass probe (`#include <cutlass/arch/config.h>`, `__global__`, `-arch=sm_120a`) prints
+**`SM120A_ENABLED=1 CLC_ENABLED=1`** — so the arch *does* support CLC and the macros *do* turn on when
+config.h is evaluated inside a device TU. Yet the compiled kernel's SASS has **0**
+`clusterlaunchcontrol`. The reason: **TileLang's `src/tl_templates/cuda/cluster.h` only includes
+`common.h`, never `cutlass/arch/config.h`.** So in the actual kernel TU `CUTLASS_ARCH_CLC_ENABLED` is
+never defined, `#if defined(...)` is false, and the empty `#else` body is what compiles.
+
+So the earlier wording ("the arch macro is off because config.h keys off TunableOp macros") was
+**imprecise**: the arch is fine and the macro is reachable — TileLang simply does not include the header
+that defines it. It is a **TileLang include omission, not an arch limitation** — and therefore fixable in
+TileLang (add `#include <cutlass/arch/config.h>` to `cluster.h`), not by anything a user does at compile
+time. Try as you like with `-include`, it does not help: `-include` evaluates config.h before
+`__CUDA_ARCH__` is set (host pass), so the `__CUDA_ARCH__ == 1200` guard is false there; the header must be
+pulled in from within the device TU, which only TileLang's own source controls. Verified: forcing
+`-D__CUDA_ARCH_FEAT_SM120_ALL` and `-include config.h` both still yield **0** `clusterlaunchcontrol` in the
+tilelang-compiled cubin.
 
 **The consequence is worse than "no-op": the kernel returns wrong results.** With the CLC call in
 place the pipeline still *waits* on the barrier the CLC query was supposed to signal, the wait is
@@ -103,18 +117,20 @@ instead. Using them by hand here would be recreating a protocol the arch does no
 
 ## When needed (trigger)
 
-- **CLC: never on this build.** The API compiles and links but emits nothing, and next to a live
-  barrier it corrupts the output. If a future TileLang/CUTLASS defines `CUTLASS_ARCH_CLC_ENABLED`
-  for `sm_120a` (it is one macro away — the arch list already names SM120A), re-probe; the hardware
-  `clusterlaunchcontrol` instruction would then be emitted. Until then, treat `clc_*` as
-  unavailable.
+- **CLC: not usable on this build, but it is a TileLang include bug, not the arch.** The API compiles
+  and links but emits nothing, and next to a live barrier it corrupts the output. **The arch supports
+  CLC** (`sm_120a` → `SM120A_ENABLED=1` → `CLC_ENABLED=1` when config.h is in the device TU), but
+  `cluster.h` does not `#include <cutlass/arch/config.h>`, so the macro is never defined where it
+  matters. Fixable in TileLang (one include); a user cannot fix it with `-include`/`-D` (both verified
+  still 0). Re-probe after a TileLang bump that touches `src/tl_templates/cuda/cluster.h`.
 - **Cooperative warp-group: nothing to do.** The default `Square` partition is optimal and is
   already applied. A `policy=` sweep is a legitimate measurement, but the answer here is "keep the
   default."
 - The whole point of CLC (surviving preemption / uneven work without a manual persistent loop) has
   no measured benefit on a compute-bound GEMM anyway; and the manual persistent loop is already a
   tie (`block_scheduling_is_a_tie.md`), so even a working CLC would land inside noise for a dense
-  GEMM.
+  GEMM. So fixing the include would make CLC *correct*, not necessarily *faster* — the tie on the
+  persistent-loop analogue predicts it stays a tie.
 
 ## Minimal runnable example (showing the trap)
 
@@ -164,9 +180,11 @@ problem — that `clc_try_cancel` lowers to an empty function because the arch m
   (`cuobjdump -sass | grep -i clc`) before believing any CLC result.
 - **A dead CLC call next to a live barrier corrupts output** (`md 0.12 → 8498`). If you experiment,
   remove the barrier wait too, or the result is meaningless either way.
-- **`CUTLASS_ARCH_CLC_ENABLED` is not the same as "the arch is in the list".** `config.h` gates it
-  on the CUTLASS *TunableOp* arch macros, which `-arch=sm_120a` alone does not set. Confirm with
-  the `#error` probe above on whatever build you use.
+- **`CUTLASS_ARCH_CLC_ENABLED` must be *included* to be defined.** `config.h` sets it from
+  `SM120A_ENABLED` inside a device TU (`__CUDA_ARCH__==1200`), so it *is* on for `sm_120a` — but only if
+  that header is in the TU. `cluster.h` omits it, so the macro is undefined where `clc_try_cancel` lives.
+  Confirm with a device-side `printf` probe (not a host `#error`) — a host-side check sees `__CUDA_ARCH__`
+  undefined and wrongly reports OFF.
 - **The warp-policy default is already correct.** Do not "add cooperation"; `T.gemm` does it, and
   `Square` wins.
 

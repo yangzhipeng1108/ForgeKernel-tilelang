@@ -129,9 +129,12 @@ One kernel, three answers: single-launch event median 122, NCU `gpu__time_durati
 
 ## Version-blocked axes to re-probe after an upgrade
 
-CLC only needs `CUTLASS_ARCH_CLC_ENABLED` defined for `sm_120a` (the arch list already names
-SM120A); cluster multicast only needs a cluster-scope barrier. Both are one fix away — re-measure
-after bumping TileLang.
+CLC needs TileLang's `src/tl_templates/cuda/cluster.h` to `#include <cutlass/arch/config.h>` — on
+`sm_120a` the arch supports CLC (a device-side probe shows `CLC_ENABLED=1`), but cluster.h omits the
+header so the macro is undefined in the kernel TU. This is a TileLang include bug, not an arch limit;
+fixable by a TileLang source change (not by any user compile flag). Cluster multicast needs a
+cluster-scope barrier (`role_based_scheduler.cc:523`: "materialized barriers are CTA-local"). Both
+wait on a TileLang bump that touches those two files.
 
 **Still blocked as of this writing**: `pip index versions tilelang` on the probe box reports
 **0.1.15 as the newest release** (older: 0.1.14 … 0.1.6.post2), and the installed package *is* 0.1.15.
