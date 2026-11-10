@@ -125,19 +125,59 @@ the hand-written kernel's grid is exactly `(SEQ/BM, H)` and carries no scheduler
 **same lesson as split-K / block-tile skipping**: at small shapes, *grid shaping* beats a general
 kernel — but here it comes for free because we wrote the grid by hand, not from a scheduling knob.
 
+## Finding 5: the large-SEQ gap to SDPA is structural — neither WS nor register pressure closes it
+
+The obvious next move after Finding 1 (240 regs → 1 block/SM → 15.8 % warps active) is to add
+warps or shrink registers. Both were measured and **both fail**:
+
+**Warp specialization — a tie, not a win.** Enabling `tl.enable_auto_warp_specialization: "role_based"`
+(which *hurts* the GEMM by 2–8×, `warp_specialization_is_already_on.md`) on the attention kernel:
+
+| config | `__launch_bounds__` | `reg_dealloc` | TFLOP/s | vs SDPA |
+|---|---|---|---|---|
+| no WS, thr=128 | 256 | 1 | 285.7 | 0.82× |
+| WS, thr=128 | 256 | 2 | **286.3** | 0.83× |
+| WS, thr=256 | 384 | 2 | 261.4 | 0.75× |
+| WS, thr=256, BM128 | 384 | 2 | 155.7 | 0.45× |
+
+The `role_based` scheduler is a generic producer/consumer split; it gives the attention kernel the
+same ties-or-losses it gives the GEMM. **The "same mechanism, opposite conclusion" hypothesis is
+false** — WS is not the thing SDPA has that this kernel lacks. (SDPA's softmax specialization is a
+hand-written producer/consumer *role assignment specific to attention*, not what `role_based`
+derives.)
+
+**Register pressure — the tile needs the registers.** Forcing a smaller consumer budget:
+
+| `annotate_consumer_reg_alloc` | TFLOP/s | vs SDPA |
+|---|---|---|
+| none (natural: 240) | **285.4** | 0.82× |
+| 240 (explicit) | 286.5 | 0.83× |
+| 160 | 268.0 | 0.77× |
+| 128 | 211.1 | 0.61× |
+| 112 | 178.9 | 0.52× |
+
+Squeezing registers is strictly worse: `S (64×128 fp32)` already costs ~64 regs/thread and
+`acc (64×128 fp32)` another ~64, so below ~240 the compiler spills. **The 240 registers are the tile,
+not slack** — occupancy cannot be bought by lowering them.
+
+So the 0.82× f16 / 0.94× fp8 gap to SDPA is **structural for this tile geometry**, not a knob. It
+would need either a different softmax placement (a hand-written attention-specific role split) or a
+smaller `BM` (which the tile sweep already showed loses: `BM=32` → 0.69×). Recorded as a closed axis
+rather than a TODO.
+
 ## When needed (trigger)
 
 - **Use the hand-written FA-2 for small/medium shapes** (`SEQ ≤ ~1k`, decode, or any case where
   `(SEQ/BM)*H` is small): it beats SDPA (1.36× at SEQ=512) with no extra machinery.
-- **For large `SEQ` (2k+) SDPA wins** (0.82× f16 / 0.94× fp8 here) — its warp-specialized softmax is
-  the thing to copy next; that is the only remaining gap and it is a warp-specialization question,
-  not a scheduling or bandwidth one.
+- **For large `SEQ` (2k+), expect ~0.82× f16 / 0.94× fp8 vs SDPA and stop there.** Both levers people
+  reach for (warp specialization, register reduction) measured as a tie and a loss (Finding 5); the
+  gap is structural for this tile, not a missing knob.
 - **Do not reach for L2 scheduling / swizzle / persistent / eviction on attention** — `dram_pct` is
   8.8 %, so those stay ties exactly as in the GEMM map.
 - **fp8 QK^T is the free ~14 %** if numerics allow; keep softmax in fp32.
-- The real attention-specific lever, if pursued, is **register pressure / occupancy** (240 regs →
-  1 block/SM → 15.8 % warps active → 22 % `stall_wait`): a warp-specialized or
-  register-shielded softmax is what closes the large-SEQ gap to SDPA.
+- If closing the large-SEQ gap matters, the remaining option is a **hand-written attention-specific
+  warp role** (pin the softmax to its own warps and the two GEMMs to the tensor warps) — the generic
+  `role_based` scheduler does not do this, and neither does dropping registers.
 
 ## Gotchas
 
