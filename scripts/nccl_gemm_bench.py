@@ -105,39 +105,58 @@ def run_tp(rank, world, M, N, K):
               f"speedup {t1 / tp_ms:.2f}x | cos={cos:.6f}")
 
 
-def run_pp(rank, world, M, N, K):
-    # two-stage reference: stage0 = gemm, stage1 = gemm, activation sent between
-    half = M // 2 if M >= 2 else M
-    k0 = tilelang.compile(build_gemm(half, N, K, out_dtype="float16"),
-                          out_idx=[2], target="cuda")
-    k1 = tilelang.compile(build_gemm(half, N, N),
-                          out_idx=[2], target="cuda")
+def run_pp(rank, world, M, N, K, nlayer, mb):
+    # PP: rank 0 owns the first nlayer/world layers, rank 1 the rest; activations
+    # are sent layer-group to layer-group. The batch is split into `mb`
+    # micro-batches, which lets the two stages work on different micro-batches at
+    # once (pipeline fill) instead of strict lock-step.
+    #
+    # NOTE the measured ceiling on this box: even with micro-batching the speedup
+    # tops out near 1.69x (8 layers / 8 micro-batches). Pure-Python isend/irecv
+    # does NOT overlap the send with the next GPU compute (the kernel launch is
+    # synchronous on the default stream), so the pipeline bubble never fully
+    # closes. True overlap needs CUDA-stream + event orchestration or a framework.
+    per_stage = nlayer // world
+    mbm = M // mb
+    kmb = tilelang.compile(build_gemm(mbm, N, N, out_dtype="float16"),
+                           out_idx=[2], target="cuda")
+    kfull = tilelang.compile(build_gemm(M, N, N, out_dtype="float16"),
+                             out_idx=[2], target="cuda")
     dev = torch.device("cuda", rank)
     torch.manual_seed(0)
-    A = torch.randn(half, K, device=dev, dtype=torch.float16) * 0.1
-    B0 = torch.randn(K, N, device=dev, dtype=torch.float16) * 0.1
-    B1 = torch.randn(N, N, device=dev, dtype=torch.float16) * 0.1
+    Ws = [torch.randn(N, N, device=dev, dtype=torch.float16) * 0.1
+          for _ in range(per_stage)]
 
     def pp_step():
-        if rank == 0:
-            act = k0(A, B0)
-            dist.send(act, dst=1)
-        else:
-            act = torch.empty(half, N, device=dev, dtype=torch.float16)
-            dist.recv(act, src=0)
-            k1(act, B1)
+        for _ in range(mb):
+            x = torch.randn(mbm, N, device=dev, dtype=torch.float16) * 0.1
+            if rank == 0:
+                for w in Ws:
+                    x = kmb(x, w)
+                dist.send(x, dst=1)
+            else:
+                got = torch.empty(mbm, N, device=dev, dtype=torch.float16)
+                dist.recv(got, src=0)
+                x = got
+                for w in Ws:
+                    x = kmb(x, w)
 
-    pp_ms = _timed(pp_step)
+    pp_ms = _timed(pp_step, iters=10, warmup=3)
     if rank == 0:
-        # reference single-GPU sequential for the same two layers on full batch
-        ref0 = tilelang.compile(build_gemm(M, N, K, out_dtype="float16"),
-                                out_idx=[2], target="cuda")
-        ref1 = tilelang.compile(build_gemm(M, N, N), out_idx=[2], target="cuda")
-        A2 = torch.randn(M, K, device=dev, dtype=torch.float16) * 0.1
-        t_ref = _timed(lambda: ref1(ref0(A2, B0), B1), iters=20, warmup=5)
-        print(f"PP world={world} {M}x{N}x{K} | 1GPU 2-layer {t_ref * 1000:.1f}us "
-              f"| PP {pp_ms * 1000:.1f}us speedup {t_ref / pp_ms:.2f}x "
-              f"(no microbatch, bubble-free ideal is 2x)")
+        allW = [torch.randn(N, N, device=dev, dtype=torch.float16) * 0.1
+                for _ in range(nlayer)]
+        A = torch.randn(M, N, device=dev, dtype=torch.float16) * 0.1
+
+        def ref():
+            x = A
+            for w in allW:
+                x = kfull(x, w)
+            return x
+
+        t_ref = _timed(ref, iters=10, warmup=3)
+        print(f"PP world={world} {M}x{N} nlayer={nlayer} mb={mb} | "
+              f"1GPU all {nlayer}L {t_ref * 1000:.1f}us | PP {pp_ms * 1000:.1f}us "
+              f"speedup {t_ref / pp_ms:.2f}x")
 
 
 def main():
@@ -146,6 +165,10 @@ def main():
     ap.add_argument("--N", type=int, default=4096)
     ap.add_argument("--K", type=int, default=4096)
     ap.add_argument("--mode", choices=["tp", "pp"], default="tp")
+    ap.add_argument("--nlayer", type=int, default=8,
+                    help="PP: total layers (split evenly across ranks)")
+    ap.add_argument("--microbatch", type=int, default=8,
+                    help="PP: number of micro-batches to pipeline")
     a = ap.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -162,7 +185,7 @@ def main():
     if a.mode == "tp":
         run_tp(rank, world, a.M, a.N, a.K)
     else:
-        run_pp(rank, world, a.M, a.N, a.K)
+        run_pp(rank, world, a.M, a.N, a.K, a.nlayer, a.microbatch)
 
     dist.barrier()
     dist.destroy_process_group()
