@@ -121,7 +121,35 @@ LM-head win measured, and a reminder that the same kernel is bandwidth-bound at 
 The combined path — fp8 GEMM + `kept 0.10` vocab tiles + an fp8 coarse screen (20.0 µs, `nc=512`) — is
 `0.26×` of the fp16 dense head, and beats either lever alone (fp8 alone 131 µs, sparse alone 70 µs). This
 is the fastest LM-head configuration measured, and it is **two byte/work reductions composing**, exactly
-the pattern that wins everywhere else in the map.
+the pattern that wins everywhere else in the map — **but only if the vocab screen is valid** (Finding 5:
+it recovers the true top-k on a structured/frequency-sorted vocab, not on a random one).
+
+## Finding 5 — block-sparsity only pays if the vocabulary is *structured* (screening recall, measured)
+
+Findings 3–4 assumed you already know which vocab tiles to keep. In practice the kept set comes from a
+coarse screen (`X @ G^T`, `G` = per-tile mean of `W`), and whether it recovers the true top logits is the
+whole question. Measured recall of the true top-1 / top-10 tokens (`M=16`, `NT=392` tiles of 128):
+
+| `W` | kept | top-1 tile recall | top-10 token recall |
+|---|---|---|---|
+| **random** (no structure) | 0.25 | 8/16 | 0.41 |
+| random | 0.10 | 5/16 | **0.17** |
+| random | 0.05 | 0/16 | 0.06 |
+| **structured** (rows in a tile share a component) | 0.10 | 16/16 | **1.00** |
+| **zipf-sorted** (freq-ordered vocab, realistic) | 0.10 | 16/16 | **1.00** |
+| zipf-sorted | 0.05 | 16/16 | 1.00 |
+| no freq bias (control) | 0.10 | 2/16 | 0.16 |
+
+**On a random weight matrix the screen is useless** — `kept 0.10` recovers only 17 % of the true top-10,
+so the "0.26×" latency from Finding 4 would be *wrong output*, not a speedup. **On a structured vocabulary
+it is exact** — a frequency-sorted (Zipf) vocab keeps 100 % of the true top-10 even at `kept 0.05`.
+
+So the block-sparsity lever has a **precondition: the vocabulary must be exploitable by a cheap per-tile
+screen** — i.e. semantically/frequency-similar tokens live in the same tile (BPE vocabs trained by
+frequency are; a random permutation of the vocab rows is not). This is the same "reduce the binding
+resource, but only if the structure permits it" caveat that every approximate-sparsity method carries:
+**measure the recall of your screen before quoting the latency.** The Finding 3–4 speedups are real *given*
+a valid screen; without vocab structure there is no valid screen and no speedup.
 
 ## When needed (trigger)
 
@@ -132,10 +160,11 @@ the pattern that wins everywhere else in the map.
 - **Use fp8**: 1.67× at `M16` (bandwidth) and 5.0× at `M256` (compute), `cos ≈ 0.999`. It is the single
   largest LM-head win and it is available at every `M`.
 - **Compose fp8 with vocab block-sparsity** for the fastest head: fp8 + `kept 0.10` + fp8 screen = `0.26×`
-  of fp16 dense (Finding 4). The two levers are independent (bytes vs tiles) and stack.
-- **If an LM head must be faster, cut the bytes** — block-sparse over `N` (skip unneeded vocab tiles),
-  measured end to end at **0.25–0.42× of dense** including the top-k screening GEMM (Finding 3). This is
-  the lever the bandwidth wall leaves, and it composes with fp8.
+  of fp16 dense (Finding 4). The two levers are independent (bytes vs tiles) and stack — **but only if the
+  vocab is structured** so the screen recovers the true top-k (Finding 5).
+- **Check the screen recall before quoting a block-sparse speedup.** On a frequency-sorted / clustered
+  vocab `kept 0.05–0.10` keeps 100 % of the true top-10 (measured); on a random vocab it keeps 17 % and the
+  speedup is fake. The lever is conditional on an exploitable vocabulary structure.
 
 ## Gotchas
 
@@ -149,6 +178,9 @@ the pattern that wins everywhere else in the map.
 - **The same LM head changes bottleneck with `M`**: bandwidth-bound at `M16` (`945 GB/s`, fp8 gives 1.67×),
   compute-bound at `M256` (fp8 gives 5.0×). Do not design for only one `M` — the lever (bytes vs rate) is
   chosen by which side of the crossover the working `M` is on.
+- **Block-sparsity is not unconditional.** On a random/permuted vocab the per-tile screen recovers only
+  17 % of the true top-10 (Finding 5) — the latency win is real but the output is wrong. Real BPE vocabs
+  (frequency-trained, so similar tokens cluster) are the case where it works; verify recall first.
 
 ## Sources
 
