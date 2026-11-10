@@ -69,6 +69,24 @@ At BK=256 fp8 hits `Failed to set the allowed dynamic shared memory size to 1310
 128 KiB, over the 99 KiB `shared_memory_per_block_optin` ceiling. See
 `tiled_copy_scope_and_swizzle.md` for the ceiling; the same opt-in rule applies here.
 
+### fp8 does not reopen the tile-size axis
+
+Halving the operand bytes frees shared memory, so the obvious next question is whether fp8 lets a
+wider BM/BN succeed where f16 failed. It does not — the same wall holds:
+
+| fp8 tile `(BM,BN,BK)` | TFLOP/s | vs `(128,128,128)` |
+|---|---|---|
+| **(128,128,128)** | **291** | 1.00× |
+| (128,192,128) | 283 | 0.97× |
+| (192,128,128) | 259 | 0.89× |
+| (128,256,64) | 133 | 0.46× |
+| (128,256,128) | 98 | 0.34× |
+| (256,256,64) | 47 | 0.16× |
+
+BM/BN > 128 collapses throughput exactly as it does for f16, so the tile-size ceiling is a property
+of the shared-memory bank geometry, not of the element width — switching to fp8 buys **BK**
+(twice the depth) but **not** a wider tile. `(128,128,128)` fp8 remains the best point.
+
 ## When needed (trigger)
 
 - A milestone is priced around "fp8" or "bf16" and you need the actual throughput delta on this

@@ -117,6 +117,36 @@ Practical reading: `host_bound_ratio` above 0.5 on a TileLang kernel is a statem
 kernel's duration, not about the harness. Read `graph_status`; if it says `1.0x` or higher, the
 kernel is too small for the graph to help and the honest number is the device window plus a note.
 
+### Timing a 4k GEMM on this card: three methods, a 2× spread, and which one to trust
+
+Asking "how fast is this kernel" on the RTX 6000D gave three different answers for the *same*
+`(128,128,32)` f16 GEMM, and the spread is large enough to flip a tuning decision:
+
+| method | reading | TFLOP/s | what it measures |
+|---|---|---|---|
+| single-launch `event.record(); ker(); event.record()`, 200 samples | min 0.61 ms / median 1.11 ms / max 1.75 ms | 224 / 122 / 78 | **bimodal** — the same kernel lands in a fast or slow band per launch |
+| NCU `gpu__time_duration.sum` | 527 µs | 265 | L2 fully warm (profiler replays the same buffers); the *ideal* single run |
+| **CUDA-graph replay, 20 kernels/launch, best of 10** | 1.00 ms | **137** | **sustained steady state** — what a real pipeline sees |
+| `perf_counter` per launch, min of 80 | ~0.97 ms | 141 | same as graph within noise, but noisier |
+
+Two lessons, both written down because each cost a wrong conclusion first:
+
+- **An unlocked card hides the problem behind an even bigger one.** Before the SM clock is pinned,
+  the card idles at 180–292 MHz and boosts to 2430, and a tile sweep ranks the tiles *backwards*
+  and varies ±30 % (see `tiled_copy_scope_and_swizzle.md`). Pin the clock first
+  (`sudo nvidia-smi -i 0 -lgc 2000,2000`).
+- **Even clock-locked, single-launch event timing is bimodal** (0.61 vs 1.11 ms, 2×), because
+  back-to-back single launches leave the L2 in different states and the event window catches
+  host scheduling gaps. Flushing L2 between launches (a 256 MB `zero_()`) moves the median but
+  not the spread. **Do not tune on single-launch medians.**
+
+**Use CUDA-graph replay for any tuning decision.** It removes host jitter, keeps the GPU saturated,
+and its steady-state number (137 TFLOP/s) agrees with a large back-to-back batch (~136). Do **not**
+compare against the NCU `gpu__time_duration` figure for tuning: at 265 TFLOP/s it is ~2× the
+sustained throughput because the profiler keeps the operands warm in L2, and it will make every
+kernel look faster and flatter than it runs in a pipeline. NCU is for *why* (counters, occupancy,
+conflicts) — not for ranking tile choices.
+
 ### Stamping a TileLang kernel for the timeline
 
 The timeline probe supports TileLang; the marker convention did not change (`def _seg(site,
