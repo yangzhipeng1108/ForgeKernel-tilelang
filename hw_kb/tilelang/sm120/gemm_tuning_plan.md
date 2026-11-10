@@ -151,7 +151,8 @@ kernels. The one-line summary of the whole map, GEMM included:
 | prefill attention, non-causal (`flash_attention_is_compute_bound_too.md`) | tensor core, `dram 8.8 %` | fp8 QK^T 1.2–1.4×, small-SEQ grid shaping (1.36×) | schedule / WS / register-cut |
 | **prefill attention, causal** (`causal_attention_skips_the_masked_half.md`) | tensor core | **tile-skip 1.95×, SDPA parity**; **fp8 QK^T 1.2–1.4×** (`fp8_qk_ports_split_k_ties.md`) | split-K |
 | decode MHA (`decode_is_the_one_bandwidth_bound_case.md`) | **HBM 90 %** | (nothing — 880 GB/s wall) | schedule / split-KV / fp8-KV (all tie or lose) |
-| decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 5× over MHA decode**; `Dc=512` two-pass 96.3 TF | — |
+| decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 3.8× over same-shape MHA / 1.16× over GQA/MQA**; `Dc=512` two-pass 96.3 TF | — |
+| decode GQA/MQA vs MLA (`mla_absorbed_decode_beats_mha.md`, `decode_is_the_one_bandwidth_bound_case.md`) | tensor core / HBM | GQA/MQA sharing (1.40× vs SDPA); MLA only when MHA & high `HQ` | fp8 QK (+4%) |
 | LM head (`lm_head_is_wide_not_starved.md`) | tensor core → HBM at `M16` | **vocab block-sparse 2.4–4× end-to-end** | split-K (−18 %), schedule |
 | porting levers to attention (`fp8_qk_ports_split_k_ties.md`) | — | fp8 QK^T with native fp16 V | split-K (tie) |
 

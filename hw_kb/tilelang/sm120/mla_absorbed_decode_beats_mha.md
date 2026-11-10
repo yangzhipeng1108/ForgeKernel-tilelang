@@ -1,4 +1,4 @@
-# MLA (absorbed) decode: 200× less KV traffic, 5× faster than MHA decode, and back on the tensor cores
+# MLA (absorbed) decode: 256× less KV traffic, 3.8× faster than MHA (1.16× over GQA/MQA), back on the tensor cores
 
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` on every cell.
 > Correctness `cos = 1.00000` (`md = 5.9e-7`) against a float32 absorbed-attention reference.
@@ -13,11 +13,13 @@ query and the output so the decode reads the latent once, for all heads.
 
 The question: does absorption actually move the bottleneck, and what does it cost in return?
 
-Short answer: **yes, and it costs matrix work.** The latent cache is **200× smaller** than the
-equivalent 128-head MHA cache (2.6 MB vs 537 MB), decode bandwidth collapses from `880 GB/s` to
-`13–21 GB/s`, the kernel is squarely compute-bound again (`intensity ≈ 3300` FLOP/byte), and it runs
-**5× faster** than the MHA decode of the same shape (70 vs 14 TF). The trade is that the absorbed
-`P @ c_KV` GEMM and the output up-projection add FLOPs that the MHA decode never had.
+Short answer: **yes, and it costs matrix work — but the win is over un-shared MHA, not over GQA/MQA.**
+The latent cache is **256× smaller** than the equivalent 128-head MHA cache (2.1 MB vs 537 MB), decode
+bandwidth collapses from `880 GB/s` to `13–21 GB/s`, the kernel is squarely compute-bound again
+(`intensity ≈ 3300` FLOP/byte), and at `HQ=128` it runs **3.8× faster than same-shape MHA** (465 → 123 µs)
+and **1.16× faster than GQA/MQA** (143 → 123 µs). The trade is that the absorbed `P @ c_KV` GEMM and the
+output up-projection add FLOPs the MHA decode never had. **At low `HQ` (32) the ordering reverses**: MQA
+(94 µs) beats MLA (121 µs), because GQA/MQA already removed the KV traffic MLA would cut. See Finding 1.
 
 ## Measured on
 
@@ -39,18 +41,51 @@ out = acc @ W_uv                  # single up-projection at the end, (Dc -> DV)
 The whole point is that `c` is read **once per k-block for every head** (`T.Kernel(HQ)` shares the
 latent load), so the KV traffic is `KVLEN·Dc` bytes total, not `HQ·KVLEN·(2·D)`.
 
-## Finding 1 — the latent cache removes the bandwidth wall, and the kernel is 5× faster
+## Finding 1 — the latent cache removes the bandwidth wall; it beats MHA 3.8× but only edges GQA/MQA
 
-| | latent/cache bytes | `dram` | time (µs) | TFLOP/s | intensity |
-|---|---|---|---|---|---|
-| MHA decode (`HQ 32`) | 134 MB | 90 % | 152.6 | 14.1 | 16 |
-| **MLA absorbed (`HQ 128`)** | **2.6 MB** | ~0 % (`BW 21 GB/s`) | **123.5** | **70.1** | **3302** |
+The honest same-shape comparison (`HQ=128, QLEN=16, KVLEN=8192, D=128`, all clock-locked):
 
-The latent is **200× smaller** than the 128-head MHA cache it replaces (2.6 vs 537 MB), so the kernel
-is no longer bandwidth-bound at all — it is back to tensor-core territory, exactly where every other
-kernel in this map lives. **The MLA speedup is a bandwidth story, not a scheduling one**: it wins by
-not moving the bytes, which is the same rule the whole map keeps landing on (fp8, split-K, 2:4 sparse,
-causal tile-skip all win by reducing work/traffic; no re-schedule axis ever has).
+| method | cache bytes | time (µs) | vs MLA |
+|---|---|---|---|
+| MHA decode (`HKV 128`, no sharing) | 537 MB | 465.5 | 3.8× slower |
+| GQA (`HKV 16`, G = 8) | 67 MB | 143.0 | 1.16× slower |
+| MQA (`HKV 1`, G = 128) | 4 MB | 142.5 | 1.16× slower |
+| **MLA absorbed** (`Dc 128`, single latent) | **2.1 MB** | **123.3** | — |
+
+So MLA absorbed **is** the fastest decode at `HQ=128`: **3.8× over MHA** (537 → 2.1 MB cache) and a
+smaller **1.16× over GQA/MQA**. The big win is specifically **against the un-shared MHA cache**, which at
+`HQ=128` is 537 MB and hopelessly bandwidth-starved. But **GQA/MQA already recover most of that** by
+sharing KV heads, so once a model already shares KV, MLA's extra absorption buys only ~16 %.
+
+**The advantage is `HQ`-dependent, and it reverses at low `HQ`** — the crossover this file used to hide:
+
+| `HQ` | GQA (best `HKV`) | GQA cache | MLA absorbed | winner |
+|---|---|---|---|---|
+| 32 | 94.3 µs (`HKV 1`, MQA) | 4 MB | 121.5 µs | **GQA/MQA** (MLA 1.29× slower) |
+| 128 | 142.5 µs (`HKV 1`) | 67–143 MB* | 123.3 µs | **MLA** (1.16× faster) |
+
+*at `HQ=128` GQA/MQA sit at 142–143 µs (a 4 MB MQA cache is not slower than a 67 MB GQA one — they are
+compute-bound at that point), while at `HQ=32` MQA is 94 µs because there are only 32 head-blocks reading
+the tiny cache.
+
+The rule: **MLA absorption pays when the per-head traffic multiplies a lot (`HQ` high) and no KV sharing is
+assumed; once GQA/MQA already shares KV, MLA's marginal gain shrinks to ~16 % at high `HQ` and goes
+negative at low `HQ`** (where GQA/MQA is compute-bound at a lower per-block cost and MLA's fixed per-head
+latent+up-projection work is pure overhead). This is the same "reduce the binding resource, and only if
+nothing else already did" rule: GQA/MQA already removed the KV traffic, so MLA's byte cut has little left
+to remove. **Choose MLA over GQA/MQA only for high-`HQ` MHA-style decode; if the model can share KV heads
+(GQA/MQA), that is cheaper than absorbing.**
+
+An earlier draft of this file reported "5× faster (70 vs 14 TF)" by comparing `HQ=128` MLA against `HQ=32`
+MHA — a cross-shape TF ratio, not a wall-clock speedup. The fair same-shape number is **3.8×** (465 vs
+123 µs at `HQ=128`), and against GQA/MQA it is **1.16×**, not 5×. The bandwidth story is real; the
+multiplier was overstated by the mismatched baseline.
+
+The latent is **256× smaller** than the 128-head MHA cache it replaces (2.1 vs 537 MB), so against MHA the
+kernel is no longer bandwidth-bound at all — it is back to tensor-core territory. **The MLA speedup is a
+bandwidth story, not a scheduling one**: it wins by not moving the bytes, which is the same rule the whole
+map keeps landing on (fp8, split-K, 2:4 sparse, causal tile-skip all win by reducing work/traffic; no
+re-schedule axis ever has).
 
 ## Finding 2 — the absorbed GEMMs flip the stage/tile preference back
 
@@ -104,9 +139,11 @@ at `BN 32`; 459.0 at `BN 64`), `BN 16` fails the warp-partition check (`M=16, N=
 
 ## When needed (trigger)
 
-- **For decode with a bandwidth wall, absorb the KV into a latent (MLA).** It trades the `880 GB/s`
-  HBM wall for matrix work and measured **5× faster** (70 vs 14 TF) on this shape, `cos = 1.0`.
-  This is the structural fix the MHA decode recipe could not find through scheduling.
+- **MLA absorption beats un-shared MHA decode 3.8× at `HQ=128`** (465 → 123 µs, 537 → 2.1 MB cache), and
+  edges GQA/MQA by 1.16×. Use it when the baseline is MHA (`HKV = HQ`) at high `HQ`.
+- **Do not assume MLA beats GQA/MQA.** At `HQ=32` MQA (94 µs) is *faster* than MLA (121 µs); at `HQ=128`
+  MLA wins by only 16 %. If the model can share KV heads (GQA/MQA), that is cheaper than absorbing —
+  choose MLA only when sharing is not an option (true MHA) and `HQ` is high (the per-head traffic is large).
 - **MLA decode wants `stages = 2` and `BM = 16`** — the opposite of MHA decode (`stages = 1`). Do not
   port the stage verdict between them; the operand footprint (`Dc` latent vs `D` K + `D` V) decides it.
 - **For the real `Dc = 512`, split the output projection into a second pass** (write the latent, then
