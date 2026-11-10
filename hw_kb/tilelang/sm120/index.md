@@ -12,6 +12,10 @@ other trees accept:
 
 This file is not a plan; it is the ledger of what has already been earned.
 
+> **Start here for a GEMM:** `gemm_tuning_summary.md` is the one-page map — the 10 axes tried,
+> have a verdict table, and a decision tree (only **dtype** and **split-K** pay; everything else is a
+> tie or a loss). The rows below are the per-recipe detail behind it.
+
 ## The one thing this arch gets wrong if you copy sm90/sm100
 
 **`sm_120` is not the same target as `sm_120a`, and only one of them runs.** Measured on this
@@ -58,6 +62,7 @@ are the kind of thing only a counter can settle:
 | Warp specialization — `T.Pipelined`'s producer warpgroup vs `tl.enable_auto_warp_specialization` | `warp_specialization_is_already_on.md` | ✅ clock-locked sweep, explicit schedule 2–8× slower in every cell |
 | Block scheduling — `T.use_swizzle` (L2 panel) and `T.PersistentTileScheduler` (resident blocks) vs raster | `block_scheduling_is_a_tie.md` | ✅ clock-locked, 24 cells, all within ±2 % (compute-bound) |
 | Split-K — hand-written K-axis split + `T.atomic_add`, for a tile-starved grid | `split_k_fills_a_starved_grid.md` | ✅ clock-locked, 4.0× on 10 %-fill shape, a loss above one wave |
+| Thread-block clusters — `T.ClusterKernel` launch vs `T.copy_cluster` TMA multicast | `clusters_free_multicast_broken.md` | ✅ clock-locked, cluster ties plain, multicast ~6×10⁴ slower (correct) |
 | Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS via `orch_census_run.py --kernel`; timing + precision + timeline all verified on hardware |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
@@ -78,6 +83,7 @@ are the kind of thing only a counter can settle:
 | **"Let's turn on warp specialization for the GEMM"** | It is already on: `T.Pipelined` appends a producer warpgroup (`threads=256` launches with `__launch_bounds__(384)` and emits `warpgroup_reg_dealloc`). Adding `tl.enable_auto_warp_specialization: "role_based"` stacks a second role split and is **2–8× slower in every measured cell** (fp8 381→170, f16 157→20 TFLOP/s). The extra split removes warps from the `HMMA` issue path. See `warp_specialization_is_already_on.md`; do not treat WS as an optimization axis here. |
 | **"Add `T.use_swizzle` / a persistent schedule like FlashAttention does"** | Both are a **tie** on a compute-bound GEMM here: 24 clock-locked cells (raster vs L2 swizzle 4/8 vs persistent swizzle 1/8 col/row) land within ±2 % on every shape, because `dram_pct ≈ 13 %` — L2 order cannot reach the critical path. The schedules *are* different in the emitted code (swizzle remaps `blockIdx` via `rasterization2DRow<8>` with the grid unchanged; persistent collapses 1024 blocks onto 156 workers with a `for w` loop) — they just measure the same. Only try scheduling when a counter shows DRAM/L2 bound. See `block_scheduling_is_a_tie.md`. |
 | **A skinny GEMM (small M/N, large K) leaves the machine half idle** | The grid `(N/BN)×(M/BM)` is smaller than 156 SMs — tile-starved, and **no block scheduler fixes that** (raster/swizzle/persistent are a tie, they only reorder the same blocks). Split the K axis: `SK ≈ ceil(156 / tiles)`, `T.atomic_add` the fp32 partials. Measured **46 → 183 TFLOP/s (4×)** on 512²×16384 at SK=8 (10 %→82 % fill); split-K is a *loss* once the grid is already full (4096³: 372→144). Watch the trap: `out_idx` zeroes C only once, so an `atomic_add` kernel is wrong after its first call — zero C yourself. See `split_k_fills_a_starved_grid.md`. |
+| **"Use a thread-block cluster / TMA multicast to cut operand traffic"** | The cluster *launch* is free (`T.ClusterKernel` ties plain, 372–375 TFLOP/s) but **TMA multicast is unusable**: `T.copy_cluster(..., cluster_mask=3)` returns the correct matrix (`md` identical to plain) and takes **22 083 ms vs 0.348 ms** per launch — ~6×10⁴ slower. Not a deadlock, not WS (WS-off 22 173 ms, stages=0 24 895 ms). Cause is in TileLang's own source: multicast completes against a `shared::cluster` barrier, but the pipeline materializes a **CTA-local** mbarrier (`role_based_scheduler.cc`: "cluster-wide multicast backpressure cannot be expressed yet"). Re-probe after a version bump. See `clusters_free_multicast_broken.md`. |
 | **A tile/stage sweep gives an unstable ranking** | Lock the SM clock (`sudo nvidia-smi -i 0 -lgc 2000,2000`) and time with CUDA events over a block of iterations. An unlocked RTX 6000D idles at 180–292 MHz and boosts to 2430; `perf_counter` per launch adds more. The same sweep ranked tiles oppositely and varied ±30 % before this was fixed. |
 | **Three timing methods give three answers for the same kernel** | On this card the same 4096³ f16 GEMM reads 224/122 TFLOP/s (single-launch event min/median), 265 (NCU `gpu__time_duration`, L2 warm), and **137 (CUDA-graph replay, sustained)**. Tune on graph replay; use NCU only for *why*. See `gpu_probe_ladder.md` ("Timing a 4k GEMM"). |
 | **"switch to bf16 for throughput" or "fp8 is 2× faster"** | bf16 = f16 within 2 % here (both 2-byte, same tensor path) — a numerics choice, not a speed one. fp8 is genuinely ~2.1× (141 → 297 TFLOP/s) and wants a bigger BK. Read `gemm_dtype_throughput.md`; and check fp8 accuracy with cosine on real activations, not `max_diff` on `randn`. |
