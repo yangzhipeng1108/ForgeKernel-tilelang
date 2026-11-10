@@ -157,6 +157,7 @@ kernels. The one-line summary of the whole map, GEMM included:
 | decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 3.8× over same-shape MHA / 1.16× over GQA/MQA**; `Dc=512` two-pass 96.3 TF | — |
 | decode GQA/MQA vs MLA (`mla_absorbed_decode_beats_mha.md`, `decode_is_the_one_bandwidth_bound_case.md`) | tensor core / HBM | GQA/MQA sharing (1.40× vs SDPA); MLA only when MHA & high `HQ` | fp8 QK (+4%) |
 | LM head (`lm_head_is_wide_not_starved.md`) | tensor core → HBM at `M16` | **vocab block-sparse 2.4–4× end-to-end** | split-K (−18 %), schedule |
+| memory-bound elementwise: RMSNorm/RoPE (memory_bound_elementwise_saturates_hbm.md) | **HBM-saturated (1331/1286 GB/s)** | **fusion (10× eager torch), small tile BM1–4** | schedule (swizzle ±0.8 %) |
 | porting levers to attention (`fp8_qk_ports_split_k_ties.md`) | — | fp8 QK^T with native fp16 V | split-K (tie) |
 
 The single rule that survives every kernel: **a lever pays only if it reduces work/bytes on the binding
