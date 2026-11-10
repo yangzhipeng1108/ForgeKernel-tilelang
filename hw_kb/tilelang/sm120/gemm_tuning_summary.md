@@ -28,6 +28,8 @@ directory; each row links to the file with the numbers.
 | 11 | **Stream-K** | ❌ absent, loses to split-K | no API in 0.1.15; hand-written is 20–33 % below split-K on starved grids | `stream_k_is_absent_and_loses.md` |
 | 12 | **CLC** (Blackwell dynamic task pool) | ❌ compiles to a no-op | `static_assert(dependent_false)` fallback; 0 CLC in SASS; corrupts output if paired with a barrier | `clc_compiles_to_nothing.md` |
 | 13 | cooperative warp-group | ✅ already default | `GemmWarpPolicy.Square` is the default and reads 25 % fewer smem wavefronts | `gemm_operand_layout_and_policy.md`, `clc_compiles_to_nothing.md` |
+| 14 | **2:4 sparsity (fine)** | ✅ **~1.95×** on genuinely sparse data | `T.gemm_sp` → Ampere `mma.sp`; 4096³ 262 vs 134 TF; BK=64 (E buffer caps smem) | `sparse_gemm_two_mechanisms.md` |
+| 15 | **block-tile skipping (coarse)** | ✅ **~linear** time saving | launch only nonzero tiles; 25/50/75 % → 0.28/0.54/0.70× time, tile-exact | `sparse_gemm_two_mechanisms.md` |
 
 ## Decision tree
 
