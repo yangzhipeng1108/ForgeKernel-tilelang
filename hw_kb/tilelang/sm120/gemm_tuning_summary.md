@@ -16,7 +16,7 @@ directory; each row links to the file with the numbers.
 | # | Axis | Verdict | Best / worst reading | Recipe |
 |---|---|---|---|---|
 | 1 | **dtype** | ✅ **2.4×** | f16 141 → fp8 e4m3 297 TFLOP/s (BK 32→128) | `gemm_dtype_throughput.md` |
-| 2 | **split-K** | ✅ **4.0×** (starved grids only) | 512²×16k: 46.4 → 183.5 TFLOP/s at SK=8 | `split_k_fills_a_starved_grid.md` |
+| 2 | **split-K** | ✅ **up to 5.6×** (starved grids only) | 512²×16k: 49.1 → 277.4 TFLOP/s at SK=8 (fp32 C, locked) | `split_k_fills_a_starved_grid.md`, `stream_k_is_absent_and_loses.md` |
 | 3 | tile size (BM/BN) | ❌ wall | `(128,128)` optimal; `(256,256)` → 27 (−17×, 2.5e5 bank conflicts) | `tiled_copy_scope_and_swizzle.md` |
 | 4 | `num_stages` | ❌ plateau | 2 → 4 costs 33 KiB smem for +0.8 pts `tensor_pct` | `software_pipeline_stage_budget.md` |
 | 5 | warp specialization | ❌ already on | explicit `role_based` 2–8× **slower** (fp8 381→170, f16 157→20) | `warp_specialization_is_already_on.md` |
@@ -25,6 +25,7 @@ directory; each row links to the file with the numbers.
 | 8 | shared layout swizzle | ❌ no effect | `T.gemm` already swizzles; manual adds nothing | `tiled_copy_scope_and_swizzle.md` |
 | 9 | thread-block clusters | ⚠️ launch free, multicast broken | cluster ties plain; `copy_cluster` 22 083 ms vs 0.348 ms | `clusters_free_multicast_broken.md` |
 | 10 | how you time it | ✅ protocol | graph replay 137 vs single-event median 122 vs NCU 265 for the same kernel | `gpu_probe_ladder.md` |
+| 11 | **Stream-K** | ❌ absent, loses to split-K | no API in 0.1.15; hand-written is 20–33 % below split-K on starved grids | `stream_k_is_absent_and_loses.md` |
 
 ## Decision tree
 
@@ -38,10 +39,13 @@ Is the GEMM's tile grid (M/BM)*(N/BN) >= num_sms (156)?
 │
 └─ NO (tile-starved, e.g. 512²×16k = 10 % fill, 1024²×8k = 41 % fill)
       → split-K is the fix.  SK ≈ ceil(156 / num_tiles), land near ~100 % fill.
-        512²×16k  → SK=8 : 46 → 183 TFLOP/s (4.0x)
-        1024²×8k  → SK=2 : 172 → 247 TFLOP/s
+        512²×16k  → SK=8 : 49 → 277 TFLOP/s (5.6x)
+        768²×8k   → SK=4 : 107 → 293 TFLOP/s
+        1024²×8k  → SK=2 : 190 → 323 TFLOP/s
       → do NOT over-split: past ~one wave it reverses (SK=16 drops).
       → dtype still applies (fp8), and split-K + fp8 combine.
+      → NOT Stream-K: same idea, but it flushes per tile so it lands 20–33 % under
+        split-K (222 vs 277, 232 vs 293, 267 vs 323). Skip it.
 ```
 
 ## The three traps that produced wrong answers first
