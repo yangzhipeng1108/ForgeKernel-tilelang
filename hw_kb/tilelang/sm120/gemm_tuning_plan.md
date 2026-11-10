@@ -133,8 +133,37 @@ CLC only needs `CUTLASS_ARCH_CLC_ENABLED` defined for `sm_120a` (the arch list a
 SM120A); cluster multicast only needs a cluster-scope barrier. Both are one fix away — re-measure
 after bumping TileLang.
 
+**Still blocked as of this writing**: `pip index versions tilelang` on the probe box reports
+**0.1.15 as the newest release** (older: 0.1.14 … 0.1.6.post2), and the installed package *is* 0.1.15.
+So there is **nothing to upgrade to yet** — the CLC no-op and the 6×10⁴-slower multicast stand until a
+future release ships the `sm_120a` CLC define / a cluster-scope multicast barrier. Do not spend a probe
+cycle re-testing them on 0.1.15; re-check `pip index versions tilelang` first, and only re-run the two
+recipes (`clc_compiles_to_nothing.md`, `clusters_free_multicast_broken.md`) when the version moves.
+
+## Attention, decode and LM head (added after the GEMM map)
+
+The 15-axis GEMM map above is the core, but the same measurement discipline was extended to the other
+kernels. The one-line summary of the whole map, GEMM included:
+
+| kernel | bottleneck | what wins | what ties |
+|---|---|---|---|
+| dense GEMM (`gemm_*`) | tensor core, `dram 13 %` | fp8 2.1×, split-K on starved grids, 2:4 sparse 1.95× | schedule / WS / cluster / CLC |
+| prefill attention, non-causal (`flash_attention_is_compute_bound_too.md`) | tensor core, `dram 8.8 %` | fp8 +14 %, small-SEQ grid shaping (1.36×) | schedule / WS / register-cut |
+| **prefill attention, causal** (`causal_attention_skips_the_masked_half.md`) | tensor core | **tile-skip 1.95×, SDPA parity** | split-K, fp8 (+1 %) |
+| decode MHA (`decode_is_the_one_bandwidth_bound_case.md`) | **HBM 90 %** | (nothing — 880 GB/s wall) | schedule / split-KV / fp8-KV (all tie or lose) |
+| decode MLA (`mla_absorbed_decode_beats_mha.md`) | tensor core (after absorb) | **latent cache, 5× over MHA decode** | — |
+| LM head (`lm_head_is_wide_not_starved.md`) | tensor core → HBM at `M16` | (nothing past the tile sweep) | split-K (−18 %), schedule |
+| porting levers to attention (`attention_levers_do_not_port.md`) | — | only the skip carries | split-K tie, fp8 +1 % under skip |
+
+The single rule that survives every kernel: **a lever pays only if it reduces work/bytes on the binding
+resource, and only if nothing else already did.** Every win in the table is a work/byte reduction
+(fp8, split-K-on-starved-grid, 2:4, causal skip, MLA absorb); **no re-schedule axis — swizzle,
+persistent, warp specialization, cluster, CLC, L2, eviction — has ever paid, in any kernel, at either
+bottleneck.**
+
 ## Sources
 
-1. The 15 recipe files in this directory; every number is a hardware reading.
-2. TileLang 0.1.15 installed package (the pass source cited in each file).
+1. The 21 recipe files in this directory; every number is a hardware reading.
+2. TileLang 0.1.15 installed package (the pass source cited in each file); `pip index versions tilelang`
+   confirms 0.1.15 is newest, so the CLC/cluster axes stay blocked.
 3. `gpu_probe_ladder.md` for the measurement protocol.
