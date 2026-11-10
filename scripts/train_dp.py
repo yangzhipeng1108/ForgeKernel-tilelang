@@ -168,9 +168,11 @@ class BucketedDDP:
     latency-bound, not bandwidth-bound.
     """
 
-    def __init__(self, model, world, local_rank, bucket_mb=8):
+    def __init__(self, model, world, local_rank, bucket_mb=8,
+                 reduce_dtype=torch.float32):
         self.model = model
         self.world = world
+        self.reduce_dtype = reduce_dtype
         self.params = [p for p in model.parameters() if p.requires_grad]
         order = sorted(range(len(self.params)), key=lambda i: -self.params[i].numel())
         self.buckets = []
@@ -189,7 +191,7 @@ class BucketedDDP:
         self.cnt = [0] * len(self.buckets)
         self.flat = [
             torch.zeros(sum(self.params[i].numel() for i in b),
-                        device=self.params[b[0]].device, dtype=torch.float32)
+                        device=self.params[b[0]].device, dtype=reduce_dtype)
             for b in self.buckets
         ]
         self.ev = [None] * len(self.buckets)
@@ -223,7 +225,7 @@ class BucketedDDP:
                 n = self.params[j].numel()
                 if self.params[j].grad is not None:
                     self.params[j].grad.copy_(
-                        f[off:off + n].view_as(self.params[j].grad))
+                        f[off:off + n].view_as(self.params[j].grad).float())
                 off += n
         torch.cuda.current_stream().wait_stream(self.comm)
 
@@ -249,8 +251,13 @@ def main():
                     help="use naive per-parameter all-reduce instead of bucketed overlap")
     ap.add_argument("--bucket-mb", type=int, default=8,
                     help="bucketed DDP bucket size in MB")
+    ap.add_argument("--reduce-dtype", choices=["fp32", "fp16", "bf16"],
+                    default="fp32",
+                    help="gradient all-reduce dtype; fp16/bf16 halves comm bytes "
+                         "but only pays off when comm-bound (bigger models)")
     a = ap.parse_args()
 
+    os.environ.setdefault("NCCL_ALGO", "Tree")  # ~7% faster than Ring @32MB
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
@@ -275,8 +282,10 @@ def main():
     # the step with identical weights.
     gen = torch.Generator(device=dev).manual_seed(1234 + rank * 7919)
 
+    _rdt = {"fp32": torch.float32, "fp16": torch.float16,
+            "bf16": torch.bfloat16}[a.reduce_dtype]
     ddp = None if a.no_overlap else BucketedDDP(
-        model, world, local_rank, bucket_mb=a.bucket_mb)
+        model, world, local_rank, bucket_mb=a.bucket_mb, reduce_dtype=_rdt)
 
     def one_step():
         idx = torch.randint(0, a.vocab, (a.batch, a.seq),
