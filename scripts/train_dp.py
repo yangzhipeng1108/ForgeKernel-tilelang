@@ -161,13 +161,20 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
     loss_fn = nn.CrossEntropyLoss()
 
+    # True data parallelism: each rank draws DIFFERENT samples. We emulate a
+    # DistributedSampler by seeding a per-rank generator, so rank r never sees
+    # the same batch as rank r'. Gradients are all-reduced so every rank ends
+    # the step with identical weights.
+    gen = torch.Generator(device=dev).manual_seed(1234 + rank * 7919)
+
     def one_step():
-        idx = torch.randint(0, a.vocab, (a.batch, a.seq), device=dev)
+        idx = torch.randint(0, a.vocab, (a.batch, a.seq),
+                            device=dev, generator=gen)
         logits = model(idx)
         loss = loss_fn(logits[:, :-1].reshape(-1, a.vocab), idx[:, 1:].reshape(-1))
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        # DDP gradient all-reduce (sum then average)
+        # DDP gradient all-reduce (sum then average across ranks)
         for p in model.parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -194,20 +201,34 @@ def main():
     step_ms = start.elapsed_time(end) / a.steps
     samples = a.batch * world
     thr = samples / (step_ms * 1e-3)
-    # every rank shares the same averaged weights, so a single loss is valid
+
+    # DDP invariant: after N all-reduced steps every rank must hold identical
+    # weights. Compare rank 0's weights against rank 1's.
+    flat = torch.cat([p.detach().flatten().float()
+                      for p in model.parameters()])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    n = flat.numel()
+    my = torch.cat([p.detach().flatten().float() for p in model.parameters()])
+    drift = (my - flat / world).abs().max().item()
+
+    # each rank sees different data so loss values differ; report rank 0's
     if rank == 0:
         tag = "tilelang" if gemm else "torch"
         print(f"DP-train world={world} gemm={tag} d={a.d} L={a.nlayer} "
               f"bs={a.batch}x{world} seq={a.seq} | {step_ms:.1f} ms/step | "
-              f"{thr:.0f} samples/s | loss {losses[0]:.3f}->{losses[-1]:.3f}")
+              f"{thr:.0f} samples/s | loss(r0) {losses[0]:.3f}->{losses[-1]:.3f} "
+              f"| weight drift max={drift:.2e} (0 => DDP synced)")
 
     # single-GPU reference step time (rank 0, no all-reduce)
     if a.check and rank == 0:
         model_s = MiniGPT(a.vocab, a.d, a.h, a.nlayer, a.nhead, a.seq, gemm).to(dev)
         opt_s = torch.optim.AdamW(model_s.parameters(), lr=a.lr)
 
+        gs = torch.Generator(device=dev).manual_seed(4321)
+
         def step_single():
-            idx = torch.randint(0, a.vocab, (a.batch, a.seq), device=dev)
+            idx = torch.randint(0, a.vocab, (a.batch, a.seq),
+                                device=dev, generator=gs)
             logits = model_s(idx)
             loss = loss_fn(logits[:, :-1].reshape(-1, a.vocab), idx[:, 1:].reshape(-1))
             opt_s.zero_grad(set_to_none=True)
