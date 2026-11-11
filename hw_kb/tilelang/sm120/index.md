@@ -77,6 +77,8 @@ are the kind of thing only a counter can settle:
 | Memory-bound elementwise (RMSNorm/RoPE) — the one regime that saturates HBM; small tile wins, scheduling still ties | memory_bound_elementwise_saturates_hbm.md | ✅ clock-locked: RMSNorm 1331 GB/s (10× torch), RoPE 1286 GB/s; BM 1–4 beats BM 32 by 2.7×; swizzle ties ±0.8 % |
 | Thread-block clusters — `T.ClusterKernel` launch vs `T.copy_cluster` TMA multicast | `clusters_free_multicast_broken.md` | ✅ clock-locked, cluster ties plain, multicast ~6×10⁴ slower (correct) |
 | Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | harness ran ✓ 4/4 PASS; SASS via `orch_census_run.py --kernel`; timing + precision + timeline all verified on hardware |
+| **Re-running the archived probes** — one entry point, hardware readings appended per run | `_probes/revalidate_probes.py` | harness ✅ a probe runs in a subprocess under a timeout; sk / sk_fixed / ca2 / mla5 / g1(BN64) re-ran, all `cos=1.00000`; caught a real bug in the archived `sk.py` |
+| **The four winning probes as importable modules** — verdict baked into the API | `kernels/sm120_README.md` | ✅ all 4 re-ran on the 6000D: gemm SK8 182.8 TF / causal 145 TF / gqa 228 GB/s / mla 69.7 TF, `md=0` or `cos=1.00000` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 

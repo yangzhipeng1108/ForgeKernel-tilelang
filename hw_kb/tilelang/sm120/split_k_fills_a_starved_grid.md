@@ -76,6 +76,34 @@ but the elementwise form is what the tile-region call here emits). C must be **f
 
 With C zeroed each call, all rows above are `cos = 1.000000`, `md ≤ 1e-3`.
 
+### Revalidation: the archived probe had this bug, and `zero_()` alone does not fix it
+
+`_probes/fk_probes_20261111_0247/sk.py` called `C.zero_()` before each launch and still
+produced `md=455` / `md=1.49e5`. The reason is sharper than "forgot to zero": with
+`out_idx=[2]` the kernel **returns a fresh buffer** and never writes the `C` the caller
+zeroed, so `C.zero_()` resets an object the kernel does not read. The fix is to compile
+**without** `out_idx` and pass `C` as an explicit in/out argument:
+
+```python
+k = tilelang.compile(builder, target="cuda")     # no out_idx
+C = torch.zeros(M, N, device="cuda", dtype=torch.float32)
+def run():
+    C.zero_()                                    # now this is the buffer the kernel accumulates into
+    k(A, B, C)
+```
+
+`_probes/fk_probes_20261111_0247/sk_fixed.py` is that fix, and its readings on the RTX 6000D
+(tilelang 0.1.15) agree with the table above:
+
+| shape | plain | SK=2 | SK=4 | SK=8 |
+|---|---|---|---|---|
+| 512²×16384 | — | 84.4 TF | 133.6 TF | **187.5 TF** |
+| 1024²×8192 | 170.4 TF | **247.3 TF** | 215.7 TF | 204.7 TF |
+| 4096³ | **375.3 TF** | 310.6 TF | 277.0 TF | 208.4 TF |
+
+Every row `md ≤ 2.8e-4`. The shape of the result is the entry's claim: split-K wins on the
+starved `512²×16384` (10 % fill) and loses once the grid is full (4096³).
+
 ## When needed (trigger)
 
 - **Tile grid under ~100 % of the SMs** (`(M/BM)×(N/BN) < num_sms`) **and K large enough to slice**
