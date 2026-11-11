@@ -1,0 +1,11 @@
+==PROF== Connected to process 113757 (/usr/bin/python3.14)
+2026-11-10 02:11:18  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `main` with `out_idx=[3]`
+2026-11-10 02:11:20  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `main`
+READY
+==PROF== Disconnected from process 113757
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
+"0","113757","python3.14","127.0.0.1","main_kernel","1","7","(256, 1, 1)","(32, 1, 1)","0","12.0","Command line profiler metrics","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","90.66"
+"0","113757","python3.14","127.0.0.1","main_kernel","1","7","(256, 1, 1)","(32, 1, 1)","0","12.0","Command line profiler metrics","gpu__time_duration.sum","ns","109,632"
+"0","113757","python3.14","127.0.0.1","main_kernel","1","7","(256, 1, 1)","(32, 1, 1)","0","12.0","Command line profiler metrics","launch__waves_per_multiprocessor","","0.21"
+"0","113757","python3.14","127.0.0.1","main_kernel","1","7","(256, 1, 1)","(32, 1, 1)","0","12.0","Command line profiler metrics","sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active","%","28.04"
+"0","113757","python3.14","127.0.0.1","main_kernel","1","7","(256, 1, 1)","(32, 1, 1)","0","12.0","Command line profiler metrics","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","5.26"

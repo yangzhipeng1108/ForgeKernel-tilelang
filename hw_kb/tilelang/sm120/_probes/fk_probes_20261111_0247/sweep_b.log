@@ -1,0 +1,10 @@
+### CASE TR64 page=64 track=64 start 08:21:29
+  HEALTHY 205s
+  [C=8] 
+httpcore.ConnectError: [Errno 101] Network is unreachable
+httpx.ConnectError: [Errno 101] Network is unreachable
+  [C=16] 
+httpcore.ConnectError: [Errno 101] Network is unreachable
+httpx.ConnectError: [Errno 101] Network is unreachable
+### END TR64
+### CASE TR256 page=64 track=256 start 08:31:26

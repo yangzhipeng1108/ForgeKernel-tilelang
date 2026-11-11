@@ -1,0 +1,28 @@
+START 2026-11-11T02:39:06+00:00
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.3
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+  running rung pipeline (software_pipeline_stage_budget.md: num_stages sweep, smem_dynamic per stage) ...
+    -> PASS
+  running rung copy_swizzle (tiled_copy_scope_and_swizzle.md: smem wavefronts with/without annotate_layout) ...
+    -> PASS
+  running rung gemm_policy (gemm_operand_layout_and_policy.md: tensor_pct under each GemmWarpPolicy) ...
+    -> PASS
+  running rung probe_harness (gpu_probe_ladder.md: the harness itself returns a verdict) ...
+    -> PASS
+
+wrote /FK/hw_kb/tilelang/sm120/_measure_run.txt
+RC=0
+DONE 2026-11-11T02:39:40+00:00

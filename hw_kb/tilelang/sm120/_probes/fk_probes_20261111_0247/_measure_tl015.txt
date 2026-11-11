@@ -1,0 +1,53 @@
+# hw_kb/tilelang measurements — sm120
+
+- TileLang: `0.1.15`
+- arch: `sm120`
+- mode: GPU (L1+L3)
+
+Paste the block under each entry's `## Measured on`. The `ncu` line is what
+turns a lower fact into a certification; without it the entry stays pending.
+
+## software_pipeline_stage_budget.md
+
+```
+- TileLang version: `0.1.15`
+- arch: `sm120`
+- num_stages=0: lowered, 4422 chars, launch_bounds(128, 1), tma=0, mbarrier=0, wgmma=0
+- num_stages=2: lowered, 4894 chars, launch_bounds(256, 1), tma=4, mbarrier=14, wgmma=0
+- num_stages=3: lowered, 4944 chars, launch_bounds(256, 1), tma=4, mbarrier=16, wgmma=0
+- num_stages=4: lowered, 4998 chars, launch_bounds(256, 1), tma=4, mbarrier=18, wgmma=0
+- pipeline on/off is visible without a GPU: stages=0 has tma=0/mbarrier=0, stages=2 has tma=4/mbarrier=14
+- NCU: not collected (not requested (pass --ncu))
+- Certification: [fill with the PROBE PASS job id or the before → after above]
+```
+
+## tiled_copy_scope_and_swizzle.md
+
+```
+- TileLang version: `0.1.15`
+- arch: `sm120`
+- baseline lowered: True (1441 chars), tma=no
+- NCU: not collected (not requested (pass --ncu))
+- Certification: [fill]
+```
+
+## gemm_operand_layout_and_policy.md
+
+```
+- TileLang version: `0.1.15`
+- arch: `sm120`
+- policy Square: lowered, 4944 chars, launch_bounds(256, 1), same_as_Square=True
+- policy FullRow: lowered, 4887 chars, launch_bounds(256, 1), same_as_Square=False
+- policy FullCol: lowered, 4865 chars, launch_bounds(256, 1), same_as_Square=False
+- NCU: not collected (not requested (pass --ncu))
+- Certification: [fill]
+```
+
+## gpu_probe_ladder.md
+
+```
+- TileLang version: `0.1.15`
+- arch: `sm120`
+- harness verdict: PASS, max_diff=0
+- Certification: [fill]
+```

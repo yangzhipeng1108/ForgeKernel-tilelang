@@ -1,0 +1,21 @@
+### TR64 page=64 track=64 start 08:37:41
+  HEALTHY 205s
+  [C=8] Output token throughput (tok/s): 329.69 ;Peak output token throughput (tok/s): 288.00 ;Mean TTFT (ms): 8087.13 ;Mean TPOT (ms): 13.60 ;
+  [C=16] Output token throughput (tok/s): 720.65 ;Peak output token throughput (tok/s): 432.00 ;Mean TTFT (ms): 6420.89 ;Mean TPOT (ms): 17.27 ;
+### END TR64
+### TR256 page=64 track=256 start 08:43:23
+  HEALTHY 205s
+  [C=8] Output token throughput (tok/s): 340.53 ;Peak output token throughput (tok/s): 288.00 ;Mean TTFT (ms): 8041.66 ;Mean TPOT (ms): 13.88 ;
+  [C=16] Output token throughput (tok/s): 634.01 ;Peak output token throughput (tok/s): 448.00 ;Mean TTFT (ms): 6359.19 ;Mean TPOT (ms): 16.85 ;
+### END TR256
+### PG128 page=128 track=128 start 08:49:09
+  HEALTHY 205s
+  [C=8] Output token throughput (tok/s): 441.03 ;Peak output token throughput (tok/s): 289.00 ;Mean TTFT (ms): 8050.92 ;Mean TPOT (ms): 12.30 ;
+  [C=16] Output token throughput (tok/s): 685.16 ;Peak output token throughput (tok/s): 448.00 ;Mean TTFT (ms): 6389.52 ;Mean TPOT (ms): 16.53 ;
+### END PG128
+### PG32 page=32 track=128 start 08:54:41
+  HEALTHY 205s
+  [C=8] Output token throughput (tok/s): 448.41 ;Peak output token throughput (tok/s): 288.00 ;Mean TTFT (ms): 7939.28 ;Mean TPOT (ms): 11.90 ;
+  [C=16] Output token throughput (tok/s): 730.45 ;Peak output token throughput (tok/s): 432.00 ;Mean TTFT (ms): 6377.36 ;Mean TPOT (ms): 16.60 ;
+### END PG32
+SWEEP_C DONE 09:00:09

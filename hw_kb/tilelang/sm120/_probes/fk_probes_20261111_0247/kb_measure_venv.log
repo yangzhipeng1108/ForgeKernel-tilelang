@@ -1,0 +1,13 @@
+START 2026-11-11T02:42:48+00:00
+  running rung pipeline (software_pipeline_stage_budget.md: num_stages sweep, smem_dynamic per stage) ...
+    -> PASS
+  running rung copy_swizzle (tiled_copy_scope_and_swizzle.md: smem wavefronts with/without annotate_layout) ...
+    -> PASS
+  running rung gemm_policy (gemm_operand_layout_and_policy.md: tensor_pct under each GemmWarpPolicy) ...
+    -> PASS
+  running rung probe_harness (gpu_probe_ladder.md: the harness itself returns a verdict) ...
+    -> PASS
+
+wrote /home/nvidia/FK/hw_kb/tilelang/sm120/_measure_tl015.txt
+RC=0
+DONE 2026-11-11T02:42:55+00:00
