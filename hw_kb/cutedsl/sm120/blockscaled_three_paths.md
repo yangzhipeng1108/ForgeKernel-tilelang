@@ -63,6 +63,22 @@ of Float16 or BFloat16`. So the *example* covers no fp8 at all — see
 fp8, but only the block-scaled MXFP8 variant, with UE8M0 scales. There is no plain
 per-tensor-scaled fp8 GEMM in this image's sm120 path.
 
+## Small M is a separate configuration, not a smaller version of the same one
+
+`DenseGemmKernel` assumes at least one full 128-row M tile. Measured on this card, same tile
+(128,128), correct from M = 128 up, but broken below it:
+
+| M | result |
+|---|---|
+| 1 | `CUDA_ERROR_ILLEGAL_INSTRUCTION` (poisons the context) |
+| 16 / 32 / 64 | runs, but `max abs diff ≈ 1100` against an fp32 reference — silently wrong |
+| 128 and up | correct (`cos 0.999997`) |
+
+Real decode (few tokens) therefore needs the constructor's `use_m1_non_tma_a`, `use_m1_non_tma_c`,
+`use_m1_non_tma_sfa` and `direct_one_m_tile_scheduler` flags, which switch in the M=1 nibble paths
+the default config never builds. Do not assume the default kernel handles a small batch — it does
+not, and it fails silently above M = 1.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB, no NVLink
