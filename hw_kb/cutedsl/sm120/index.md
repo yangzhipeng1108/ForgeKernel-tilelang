@@ -31,6 +31,7 @@ here name mechanisms that exist only, or differently, on sm120.
 
 | What you see / what you are about to do | Look first at |
 |---|---|
+| **Want a correct NVFP4 GEMM right now**, or your own fp4 kernel compiles and runs but every number is NaN / the CuTeDSL compiler core-dumps with no Python traceback | [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md): the shipped kernel that is exact on this card, the rank-3 SF tensor requirement that causes the `(128,128) vs (2,1,3)` error, and the five silent-corruption traps (thread-count tiler core-dump, `Field.SFA` rejection, rank mismatch in list operands, sub-byte store, swizzled smem vs universal copy) |
 | **About to run NVFP4 (`e2m1` x `ue4m3` scale) on the 6000D**; or a kernel that should be fp4 compiles but the numbers are garbage with no hang; or you want to know why TileLang's `T.gemm_blockscaled` gives a wrong answer here; or `tcgen05.MmaMXF4NVF4Op` refuses sm120 and you do not know what to use instead | [`nvfp4_warp_mma_works`](nvfp4_warp_mma_works.md): the instruction `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X`; `MmaMXF4NVF4Op` constructs on sm_120a with shape `(16,8,64)`, sf_vec 16; **the SF is a pointer set on the trait (`Field.SFA/SFB`), never a `cute.gemm` argument** — that is the exact difference from the broken TileLang path; the closed-form acceptance probe (A=B=1.0, SF=2.0, K=256 -> 1024) |
 
 ## Status of the known sm120 interfaces
@@ -38,6 +39,7 @@ here name mechanisms that exist only, or differently, on sm120.
 | Interface | State on this card | Where |
 |---|---|---|
 | `cute.nvgpu.warp.MmaMXF4NVF4Op` (NVFP4) | **op verified**, full GEMM not yet gated | [`nvfp4_warp_mma_works`](nvfp4_warp_mma_works.md) |
+| NVFP4 GEMM, end to end | **verified exact on this card**: `md=0`, `cos=1.0` across 128..256 x 128..256 x 128..1024, closed-form and random; use the shipped sm120 kernel rather than hand-building the smem plumbing | [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md) |
 | `cute.nvgpu.warp.MmaMXF8Op` (fp8, `(16,8,32)`, UE8M0 scale) | op constructs (verified alongside the fp4 one) | same entry, "also tried" |
 | `cute.nvgpu.warp.MmaF16BF16Op` / `MmaFP8Op` / `MmaTF32Op` | used by the shipped GeForce example; fp16 run **PASS** on this card | not yet written up |
 | `cutlass.utils.blockscaled_layout.sm120_make_smem_layout_sfa/sfb` | exist; the pair to use on sm120 (the `*_tmem_*` ones are sm100) | [`nvfp4_warp_mma_works`](nvfp4_warp_mma_works.md) |
@@ -54,7 +56,7 @@ The CUTLASS DSL examples split by target and pick the wrong one silently looks l
 | `CuTeDSL/blackwell/sm103_dense_blockscaled_gemm_persistent.py` | sm103 | **no** |
 | `CuTeDSL/blackwell_geforce/dense_gemm.py` | sm120 | **yes** — fp16 verified PASS here; but **fp16/fp8 only**, its `_setup_attributes` hardcodes `MmaF16BF16Op` and rejects any `a_dtype.width` outside {16, 8} |
 
-So there is **no shipped fp4 example for this card**. An NVFP4 kernel has to be written.
+So there is **no shipped fp4 *example* for this card** — but the image does ship a working fp4\n*kernel*: `flashinfer.gemm.kernels.sm12x_raw.Sm120BlockScaledGemmKernel`, verified exact here.\nSee [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md).
 
 ## What is deliberately absent
 
