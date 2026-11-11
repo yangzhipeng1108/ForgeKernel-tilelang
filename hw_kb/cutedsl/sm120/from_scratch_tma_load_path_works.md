@@ -135,30 +135,70 @@ Swizzling does not shrink the byte count; a real pipelined mainloop must shrink 
 per stage (or split M). This is why the reference's `ab_stage` tops out at 4 with
 its `tile_k`-class tiles.
 
-## What is still NOT done: the MMA half of a full GEMM
+## The MMA half: the compute path is now verified
 
-The load side is proven end to end for plain dtypes. Wiring it to tensor-core
-`cute.gemm` is **not** finished. Attempts so far:
+The register-side plumbing that returned inf/nan is fixed. A hand-written
+single-CTA fp16 GEMM computes a full 128×128 over K=64 with **rel error 2.3e-7,
+every element correct** (`_probes/probe_sm120_wmma_gemm_computes.py`). Three
+things had to be right:
 
-- `MmaF16BF16Op` + `make_tiled_mma(op, layout((2,2,1)))` (the GeForce example's
-  exact `atom_layout` and 4-MMA-warp split) **compiles** and `cute.gemm` verifies
-  its shape checks — so the tiled-MMA construction and the WMMA layout are right.
-- The assembled kernel then runs but returns `inf` / `nan`: the accumulator is
-  polluted. The shipped `blackwell_geforce/dense_gemm.py` runs **PASS** on this
-  card at `--tile_shape_mnk 128,128,64`, so the gap is in the hand-rolled
-  accumulator init / fragment wiring, not in the hardware or the MMA op.
+### Fix A — ldmatrix is mandatory, not optional
 
-So the honest state: **TMA load = solved and bit-exact; MMA = constructs and
-verifies but the register-side plumbing is unfinished.** The next step is to copy
-`dense_gemm.py`'s `accumulators = cute.make_rmem_tensor(acc_shape, acc_dtype)` +
-`accumulators.fill(0.0)` + epilogue retile verbatim rather than reconstruct them.
+`make_fragment_A/B` only *allocates* the register tile. The data has to be copied
+smem → register before `cute.gemm`:
+
+```python
+lldm = cute.make_tiled_copy_A(
+    cute.make_copy_atom(cute.nvgpu.warp.LdMatrix8x8x16bOp(True, 4), DT), tiled_mma)
+thr_c = ldm.get_slice(tidx)              # tidx, not tidx % 128
+tCs_v = thr_c.partition_S(sA)
+tCr_v = thr_c.retile(tCrA)
+cute.copy(ldm, tCs_v[None, None, kb], tCr_v[None, None, kb])
+cute.gemm(tiled_mma, acc, tCrA[None, None, kb], tCrB[None, None, kb], acc)
+```
+
+Skipping the `cute.copy` leaves `acc` at all-zeros and the kernel **runs without
+error, returning a zero matrix** — the accumulator is allocated but never fed. The
+earlier `inf` was a different symptom of the same missing step (uninitialised
+registers read as garbage).
+
+### Fix B — `acc_shape = tCc.shape[:3]`, not `tCc.shape`
+
+The C partition carries a 4th pipelined-accumulator mode. `make_rmem_tensor` must
+see only the first three, or the register tile is the wrong size.
+
+### Fix C — `get_slice(tidx)` on the reg-copy atoms
+
+The tiled-MMA slice wants `tidx`; the ldmatrix tiled-copy slice also wants `tidx`,
+not `tidx % 128`. Using the modulo silently gives the wrong warp's data.
+
+With `atom_layout=(2,2,1)` (4 MMA warps = 128 threads) and the GeForce example's
+`MmaF16BF16Op(DT, ACC, (16,8,16))`, the whole chain is correct.
+
+## Still open: joining the two halves
+
+The TMA load path needs a **swizzled** smem layout (`sm90_utils.make_smem_layout_a`
+/ `_b`), because TMA descriptors expect the swizzle. The ldmatrix atom rejects that
+layout at IR verify:
+
+```
+error: 'cute.copy' op src ptr alignment (16 bits) does not meet requirement
+       (128 bits) of atom 'ldsm<val_type = f16, num_matrices = 4, t>'
+```
+
+The non-swizzled probe above ldmatrixes fine, so this is purely the swizzled-smem
+hand-off — the `partition_S` of a composed (swizzled) tensor loses the 128-bit
+alignment fact the ldsm atom needs. The official `dense_gemm.py` does both in one
+kernel and PASSes, so the recipe exists; the missing piece is how it threads the
+swizzled `tCsA_view[(None,None,None,stage)]` into `smem_tiled_copy_A` without the
+alignment being lost. That is the next thing to copy verbatim rather than derive.
 
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
 - `lmsysorg/sglang:dev` container: cutlass-dsl **4.8.0**, torch 2.14.1+cu130, CUDA 13.0.3
-- probes `_probes/probe_sm120_tma_pipeline_smoke.py` (single stage) and
-  `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles) — both
-  PASS, `maxdiff 0.0`
+- probes `_probes/probe_sm120_tma_pipeline_smoke.py` (single stage load),
+  `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles), and
+  `_probes/probe_sm120_wmma_gemm_computes.py` (fp16 GEMM rel 2.3e-7) — all PASS
 - official `dense_gemm.py --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,64` —
   PASS, 125 µs
