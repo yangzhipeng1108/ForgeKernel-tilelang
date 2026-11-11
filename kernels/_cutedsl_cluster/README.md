@@ -20,6 +20,7 @@
 | `tma_multicast_gemm.py` | ⚠️ 构建可跑，**多播行为**只在真 cluster 生效时才有意义 |
 | `cta_pair_bulk_load.py` | ⚠️ 同上，构造可见；实际 pair 需要 cluster 双 CTA |
 | `tcgen05_2cta_mma.py` | ❌ **不能**，脚本内 `assert_eligible` 会直接拒绝 sm120 |
+| `multimem_tp_allreduce.py` | ❌ **不能**，本机无 NVLink，无 multicast memory 对象 |
 
 ## 怎么跑
 
@@ -33,7 +34,7 @@ python3 kernels/_cutedsl_cluster/cta_pair_bulk_load.py
 python3 kernels/_cutedsl_cluster/tcgen05_2cta_mma.py      # 在 sm120 上会被 gate 拒绝
 ```
 
-## 三个文件各自暴露的核心陷阱
+## 四个文件各自暴露的核心陷阱
 
 ### 1. `tma_multicast_gemm.py` — 多播要两个旋钮同时动
 - `cluster=[N,1,1]` **和** atom 的 `num_multicast` 必须相等，缺一则**静默无效**
@@ -52,13 +53,22 @@ python3 kernels/_cutedsl_cluster/tcgen05_2cta_mma.py      # 在 sm120 上会被 
 - **缺 teardown → 同一 entry 第二次启动永不返回**（`tail()` + `tmem.free`）
 - 手写 pair commit 必须 `tcgen05.commit(mbar_ptr, mask_self | mask_peer, CtaGroup.TWO)`
 
+### 4. `multimem_tp_allreduce.py` — 真正跨 GPU 的 kernel 内归约（需 NVLink）
+- `cutlass.utils.distributed` 提供 15 个 `multimem.ld_reduce` + 3 个 `multimem.st`，**全在 kernel 内**
+- 这意味着「GEMM epilogue 直接完成跨卡 all-reduce」，无需 NCCL kernel、无 HBM 中转
+- **只有 add**：本模块没有 min/max/mul 的 multicast reduce
+- **无架构守卫**：扫不到任何 `arch/capability` 判断，无 NVLink 时不会提前报错
+- 前提是多播内存对象（host 侧注册），普通 cudaMalloc 指针不是
+
 ## 诚实说明
 
-1. 这三份是**骨架**：构建 atom / 断言陷阱的部分可直接跑，**MMA 主循环留白**，
+1. 这四份是**骨架**：构建 atom / 断言陷阱的部分可直接跑，**MMA 主循环留白**，
    因为原 recipe 明确只覆盖 mechanism，不含完整 operator。
 2. 真正要在 6000D 上要收益的路径不是这些（6000D 无 tcgen05、TileLang 的
    cluster multicast 是坏的）；这些骨架的价值在 **sm100 数据中心卡**上。
 3. 每个文件末尾的 `todo:` 行就是按 recipe 顺序排好的填空步骤。
+4. `multimem_tp_allreduce.py` 只验证了 **API 表面**（26 个符号全部存在、只有 add、
+   无架构守卫），**机制未在硬件上验证**。
 
 ## 对应 recipe
 
@@ -67,3 +77,4 @@ python3 kernels/_cutedsl_cluster/tcgen05_2cta_mma.py      # 在 sm120 上会被 
 | `tma_multicast_gemm.py` | `hw_kb/cutedsl/sm90/tma_multicast_cluster.md` |
 | `cta_pair_bulk_load.py` | `hw_kb/cutedsl/sm100/cta_pair_bulk_load_cta_group2.md` |
 | `tcgen05_2cta_mma.py` | `hw_kb/cutedsl/sm100/tcgen05_umma_issue_cta_pair.md` |
+| `multimem_tp_allreduce.py` | `hw_kb/cutedsl/sm100/multimem_ld_reduce_and_store.md` |
