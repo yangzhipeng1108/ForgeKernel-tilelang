@@ -330,6 +330,32 @@ wrapper's own host code does not reproduce that order for this probe's tensor. T
 fix is to derive the permutation from `tile_atom_to_shape_SF(a.shape, 16)` directly
 rather than from the wrapper's pre-permuted NHWC-style input.
 
+### Third follow-up: the SF permutation is now derived exactly, numbers still wrong
+
+The guesswork is gone. `tile_atom_to_shape_SF((M,K,1), 16)` prints its own layout
+(checked inside `@cute.jit` — calling it from plain Python raises `CALL_OUTSIDE_JIT`):
+
+```
+layout (((32,4),1),((16,4),4),(1,1))
+stride (((16,4),0),((0,1),512),(0,0))   cosize 2048
+```
+
+Read that as: `m = 32*m1 + m0` contributes `16*m0 + 4*m1`; `k = 16*k0 + k1 + 64*k2`
+contributes `k1 + 512*k2`, and **`k0` has stride 0** because the atom stores one
+scale per 16 K-elements — that is the scale-vector packing, not a bug. Scattering a
+plain `(M, SFK)` tensor through that map is a verified bijection (2048/2048 distinct
+offsets), so the byte order is now solved rather than guessed.
+
+Even with the exact permutation the closed-form gate is still wrong (~1.2e6 for
+A=B=1, SF=1, K=256 where 256 is expected). Two negative results narrow it further:
+a `TK = 256` (one k_tile) configuration hangs, and running the kernel twice from the
+same host loop hangs — so the remaining fault is not the SF ordering and not the
+MMA, and reproducing it needs one configuration per process. The honest state is:
+**pipeline solved, SF byte order solved, numerics still unexplained; hand-built
+NVFP4 does not yet compute correctly.** The verified numbers for NVFP4 on this card
+all come from the shipped kernel (`nvfp4_gemm_computes_correctly`), and the shipped
+wrapper `kernels/gemm/nvfp4_gemm/sm120/kernel.py` is still the thing to use.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB

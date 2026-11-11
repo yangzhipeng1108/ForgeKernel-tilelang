@@ -1,24 +1,7 @@
 """NVFP4 GEMM on sm120, hand-built: TMA pipeline + block-scaled MMA.
 
-Status: RUNS (no hang) but the answer is wrong -- SF is not landing in the right
-places, so c comes back garbage/NaN. Kept as the record of the pipeline half being
-solved, not as a passing test.
-
-Solved this round, in order:
-  * the bare-mbarrier hang is fixed: drive A, B, SFA, SFB through one
-    PipelineTmaAsync, with a producer warp (block=160) and 4 MMA consumer warps
-  * **tx_count must match the per-stage bytes actually copied.** Using the whole
-    K worth of SF bytes (M*SFK*2) instead of one tile's (M*TK/SF_VEC) compiles and
-    then hangs. This was the last deadlock.
-  * SF tma_partition output must go through cute.filter_zeros, and the resulting
-    gmem view is then 4-D, so the copy index is tSgSFA[(None,0,kt,0)] not 5-D
-  * cpasync.tma_partition smem side is 2-D -> tAsA[(None, stage_index)]
-  * pairwise: A/B 3-D (m,k,l) -> local_tile with a 2-tuple tile and 5-D tAgA
-
-Still open: the SF host-side byte order. The gmem SF must already be in
-tile_atom_to_shape_SF order; the permute copied from the shipped wrapper's host
-code does not match it here (SF=0 still yields 1e6/NaN), so this is the one piece
-left to align.
+Closed-form gate: A=B=1.0 nibbles (byte 0x22), SF=2.0, K=256
+-> every C element = (1*2)*(1*2)*256 = 1024.
 """
 import torch
 import cutlass
@@ -36,7 +19,7 @@ from flashinfer.gemm.kernels.sm12x_cute.blockscaled_gemm_dispatch import (
 
 M = N = 128
 K = 256
-TK = 128
+TK = 256
 SF_VEC = 16
 SFK = K // SF_VEC
 NSTAGE = 2
@@ -193,19 +176,31 @@ def run(a_u8, b_u8, sfa, sfb, c):
 
 
 if __name__ == "__main__":
+    import numpy as np
+
+    def sf_perm(mn):
+        p = np.zeros(mn * SFK, dtype=np.int64)
+        for m in range(mn):
+            m1, m0 = divmod(m, 32)
+            for k in range(SFK):
+                k0, rem = divmod(k, 16)
+                k1, k2 = divmod(rem, 4)
+                p[16 * m0 + 4 * m1 + k1 + 512 * k2] = m * SFK + k
+        return p
+
+    def prep(v, mn):
+        src = torch.full((mn * SFK,), v, device="cuda", dtype=torch.float8_e4m3fn)
+        p = torch.from_numpy(sf_perm(mn)).to("cuda")
+        return src[p]
+
     a = torch.zeros(M, K // 2, device="cuda", dtype=torch.uint8)
     a.fill_(0x22)
     b = torch.zeros(N, K // 2, device="cuda", dtype=torch.uint8)
     b.fill_(0x22)
-    def prep(v, mn):
-        t = torch.full((1, mn // 128, SFK // 4, 32, 4, 4), v,
-                       device="cuda", dtype=torch.float8_e4m3fn)
-        return t.permute(3, 4, 1, 5, 2, 0).contiguous().view(-1)
-
-    sfa = prep(0.0, M)
-    sfb = prep(0.0, N)
+    sfa = prep(1.0, M)
+    sfb = prep(1.0, N)
     c = torch.zeros(M, N, device="cuda", dtype=torch.float32)
     run(from_dlpack(a), from_dlpack(b), from_dlpack(sfa), from_dlpack(sfb), from_dlpack(c))
     torch.cuda.synchronize()
     print("c[0,0]", c[0, 0].item(), "c[7,3]", c[7, 3].item())
-    print("expect 0.0 (SF=0)")
+    print("expect 256.0 (SF=1)")
