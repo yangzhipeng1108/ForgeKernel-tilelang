@@ -92,32 +92,73 @@ static. This is how the reference's host `__call__` receives its arguments too.
   parameters; a kernel defined inside `@cute.jit` returns `None` and cannot be
   launched. `@cute.jit` may not receive a `torch.cuda.Stream`.
 
-## Multi-stage is a budget problem, not a correctness one
+## Multi-stage works with a small K tile
 
-Each fp16 128×128 stage is 32768 B per operand, so `NSTAGE * 2 operands * 32768`
-bytes. The sm_120 cap is 101376 B:
+The single-stage pass above used a full 128×128 K tile. The pipelined version
+also lands exact — 4 stages, 16 K-tiles — but only once the K tile shrinks to 32:
 
-| NSTAGE | smem | result |
-|---|---|---|
-| 1 | 65792 B | runs, maxdiff 0.0 |
-| 2 | 131200 B | `CUDA_LAUNCH_INVALID_CONFIG` |
-| 4 | 262272 B | `CUDA_LAUNCH_INVALID_CONFIG` |
+`_probes/probe_sm120_tma_pipeline_multistage.py` — `M=128, K=512, TK=32`, 4-stage
+ring, each stage loads a different K block, all 16 samples exact (`maxdiff 0.0`).
 
-Swizzling does not shrink the byte count. A real pipelined mainloop must either
-shrink the K tile (e.g. `128x32` per stage) or split M, which is exactly why the
-reference's `ab_stage` tops out at 4 with `tile_k=128`-class tiles. The pipeline
-logic itself is proven by the single-stage pass.
+Two things that trip the multi-K version specifically:
 
-## What is still NOT done
+### The TMA tensor needs `local_tile` to gain its loop modes
 
-This proves the **load** path for plain dtypes. It does not by itself run an
-NVFP4 or mixed-precision mainloop: those still need the block-scaled TMA for the
-scale factors (`internal_type=cutlass.Int16`, `tile_atom_to_shape_SF`) and the
-`MmaMXF8F6F4Op` mainloop, both of which were already shown to *construct* on
-sm_120a. The remaining work is wiring, not discovery.
+A 2-D `(M, K)` tensor handed straight to `make_tiled_tma_atom` produces a TMA
+tensor whose first mode is the *whole* K extent, so `tma_partition` sees
+`gmemShape ((128,512))` against `smemShape ((128,32),4)` and refuses. Run the
+partitioned tensor through `local_tile` first, exactly like the reference:
+
+```python
+gA_mkl = cute.local_tile(tma_a, (M, TK), (None, None))   # (bM,bK,loopM,loopK)
+tAsA, tAgA = cpasync.tma_partition(atom_a, 0, cute.make_layout((1,)),
+                                   cute.group_modes(sA, 0, 2),
+                                   cute.group_modes(gA_mkl, 0, 2))
+cute.copy(atom_a, tAgA[(None, 0, kt)], tAsA[(None, pp.index)], tma_bar_ptr=bp)
+```
+
+Note the index is `tAgA[(None, 0, kt)]` — loopM=0, loopK=kt.
+
+### The stage count is a byte budget, not a correctness knob
+
+Each fp16 128×TK stage is `128 * TK * 2` bytes per operand. The sm_120 cap is
+101376 B, so with two operands:
+
+| K tile | NSTAGE | smem (A+B) | result |
+|---|---|---|---|
+| 128 | 1 | 65792 B | single-stage PASS |
+| 128 | 2 | 131200 B | `CUDA_LAUNCH_INVALID_CONFIG` |
+| 128 | 4 | 262272 B | `CUDA_LAUNCH_INVALID_CONFIG` |
+| **32** | **4** | **32768 B** | **multi-stage PASS, md 0.0** |
+
+Swizzling does not shrink the byte count; a real pipelined mainloop must shrink K
+per stage (or split M). This is why the reference's `ab_stage` tops out at 4 with
+its `tile_k`-class tiles.
+
+## What is still NOT done: the MMA half of a full GEMM
+
+The load side is proven end to end for plain dtypes. Wiring it to tensor-core
+`cute.gemm` is **not** finished. Attempts so far:
+
+- `MmaF16BF16Op` + `make_tiled_mma(op, layout((2,2,1)))` (the GeForce example's
+  exact `atom_layout` and 4-MMA-warp split) **compiles** and `cute.gemm` verifies
+  its shape checks — so the tiled-MMA construction and the WMMA layout are right.
+- The assembled kernel then runs but returns `inf` / `nan`: the accumulator is
+  polluted. The shipped `blackwell_geforce/dense_gemm.py` runs **PASS** on this
+  card at `--tile_shape_mnk 128,128,64`, so the gap is in the hand-rolled
+  accumulator init / fragment wiring, not in the hardware or the MMA op.
+
+So the honest state: **TMA load = solved and bit-exact; MMA = constructs and
+verifies but the register-side plumbing is unfinished.** The next step is to copy
+`dense_gemm.py`'s `accumulators = cute.make_rmem_tensor(acc_shape, acc_dtype)` +
+`accumulators.fill(0.0)` + epilogue retile verbatim rather than reconstruct them.
 
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
 - `lmsysorg/sglang:dev` container: cutlass-dsl **4.8.0**, torch 2.14.1+cu130, CUDA 13.0.3
-- probe `_probes/probe_sm120_tma_pipeline_smoke.py` — PASS, maxdiff 0.0
+- probes `_probes/probe_sm120_tma_pipeline_smoke.py` (single stage) and
+  `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles) — both
+  PASS, `maxdiff 0.0`
+- official `dense_gemm.py --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,64` —
+  PASS, 125 µs
