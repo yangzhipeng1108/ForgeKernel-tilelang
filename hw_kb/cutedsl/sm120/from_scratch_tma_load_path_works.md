@@ -296,6 +296,40 @@ re-derivation — but it was not completed in this round, so the entry stays hon
 **fp16 hand-built is solved end to end; NVFP4 hand-built now builds every piece and
 fails only at the un-pipelined TMA.**
 
+### Second follow-up: the pipeline is solved; the SF byte order is not
+
+That `PipelineTmaAsync` step was then done. **The kernel now runs to completion
+instead of hanging** — the deadlock is gone. It still computes the wrong answer,
+and the remaining cause is isolated to one thing: the host-side SF byte order.
+
+What made the pipeline work, in the order the bugs surfaced:
+
+1. **Producer/consumer split.** FP4 needs all four warps for the MMA, so the
+   producer gets its own warp: `block=[160]`, warp 4 drives TMA, warps 0–3 run
+   `cute.gemm`. Mirrors the fp16 probe.
+2. **`tAsA[(None, stage)]`, not `[(None, 0, stage)]`.** The smem side of
+   `cpasync.tma_partition` is 2-D `(tile, stage)`.
+3. **`tx_count` must equal the bytes one stage actually copies.** This was the
+   last deadlock. Writing the whole K worth of SF (`M * SFK * 2`) instead of one
+   tile's (`M * TK / SF_VEC`) **compiles and then hangs** — the barrier waits for
+   bytes no copy will ever deliver. Per stage the count is
+   `M*TK/2 + N*TK/2 + M*TK/SF_VEC + N*TK/SF_VEC`.
+4. **SF partitions need `cute.filter_zeros`**, on both the smem and gmem views.
+   Afterwards the gmem view is **4-D**, so the copy index is
+   `tSgSFA[(None, 0, kt, 0)]` — carrying the 5-D `(None,0,0,kt,0)` raises
+   `expects coord and shape of view to be weakly congruent`.
+
+With all four in place the kernel runs and returns numbers — but wrong ones
+(`SF=0` gives ~1e6 or NaN instead of 0). Since the MMA itself is the same verified
+instruction and A/B load through the same path as the working fp16 probe, the
+fault is that **the SF gmem buffer is not in `tile_atom_to_shape_SF` order**. The
+shipped wrapper builds that layout with
+`tile_atom_to_shape_SF(a.shape, sf_vec_size)` and expects the *host* to have
+pre-shuffled the scales into it; the `(3,4,1,5,2,0)` permute copied from the
+wrapper's own host code does not reproduce that order for this probe's tensor. The
+fix is to derive the permutation from `tile_atom_to_shape_SF(a.shape, 16)` directly
+rather than from the wrapper's pre-permuted NHWC-style input.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB

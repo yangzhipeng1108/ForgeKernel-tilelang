@@ -1,25 +1,31 @@
-"""NVFP4 GEMM on sm120, hand-built: how far the port gets.
+"""NVFP4 GEMM on sm120, hand-built: TMA pipeline + block-scaled MMA.
 
-Status: every type/layout/shape step is solved and the kernel compiles; it stops
-at the TMA barrier (a bare mbarrier compiles then hangs -- A/B/SF must go through
-one PipelineTmaAsync). This probe is kept as the record of the solved half, not as
-a passing test. Expect it to hang; run it under a timeout.
+Status: RUNS (no hang) but the answer is wrong -- SF is not landing in the right
+places, so c comes back garbage/NaN. Kept as the record of the pipeline half being
+solved, not as a passing test.
 
-Solved here, each of which cost a round to find:
-  * staged fp4 smem -> partition_A gives tCsA a real K-block mode ((8,2,2),4,2)
-    -> pass the staged tensor to make_fragment_A whole (not [None,None,None,0])
-  * recast_ptr(.., dtype=F4) must use the keyword; positional raises AttributeError
-  * A/B need a 3-D (m,k,l) layout, so local_tile takes 3 coords and tAgA is 5-D
-    -> copy index is tAgA[(None,0,0,kt,0)]
-  * SF tensor must be tile_atom_to_shape_SF((m,k,1), 16); its TMA tile spans the
-    FULL tile_k and uses internal_type=cutlass.Int16
-  * fp4 cannot be written element-wise; packed Uint8 (0x22 = two 1.0 nibbles) only
+Solved this round, in order:
+  * the bare-mbarrier hang is fixed: drive A, B, SFA, SFB through one
+    PipelineTmaAsync, with a producer warp (block=160) and 4 MMA consumer warps
+  * **tx_count must match the per-stage bytes actually copied.** Using the whole
+    K worth of SF bytes (M*SFK*2) instead of one tile's (M*TK/SF_VEC) compiles and
+    then hangs. This was the last deadlock.
+  * SF tma_partition output must go through cute.filter_zeros, and the resulting
+    gmem view is then 4-D, so the copy index is tSgSFA[(None,0,kt,0)] not 5-D
+  * cpasync.tma_partition smem side is 2-D -> tAsA[(None, stage_index)]
+  * pairwise: A/B 3-D (m,k,l) -> local_tile with a 2-tuple tile and 5-D tAgA
+
+Still open: the SF host-side byte order. The gmem SF must already be in
+tile_atom_to_shape_SF order; the permute copied from the shipped wrapper's host
+code does not match it here (SF=0 still yields 1e6/NaN), so this is the one piece
+left to align.
 """
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.nvgpu import cpasync
+from cutlass import pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blockscaled_layout as bs_utils
@@ -33,6 +39,8 @@ K = 256
 TK = 128
 SF_VEC = 16
 SFK = K // SF_VEC
+NSTAGE = 2
+NKT = K // TK
 F4 = cutlass.Float4E2M1FN
 E4M3 = cutlass.Float8E4M3FN
 F32 = cutlass.Float32
@@ -42,18 +50,19 @@ ATOM = (2, 2, 1)
 
 @cute.struct
 class Storage:
-    bar: cute.struct.MemRange[cutlass.Int64, 2]
-    sA: cute.struct.Align[cute.struct.MemRange[F4, M * TK], 1024]
-    sB: cute.struct.Align[cute.struct.MemRange[F4, N * TK], 1024]
-    sSFA: cute.struct.Align[cute.struct.MemRange[E4M3, 8192], 1024]
-    sSFB: cute.struct.Align[cute.struct.MemRange[E4M3, 8192], 1024]
+    bars: cute.struct.MemRange[cutlass.Int64, 2 * NSTAGE]
+    sA: cute.struct.Align[cute.struct.MemRange[F4, NSTAGE * M * TK], 1024]
+    sB: cute.struct.Align[cute.struct.MemRange[F4, NSTAGE * N * TK], 1024]
+    sSFA: cute.struct.Align[cute.struct.MemRange[E4M3, NSTAGE * M * SFK], 1024]
+    sSFB: cute.struct.Align[cute.struct.MemRange[E4M3, NSTAGE * N * SFK], 1024]
 
 
 @cute.kernel
-def _body(tiled_mma, atom_a, tma_a, atom_b, tma_b, c,
-          a_smem_staged, b_smem_staged, sfa_staged, sfb_staged):
+def _body(tiled_mma, atom_a, tma_a, atom_b, tma_b, atom_sfa, tma_sfa,
+          atom_sfb, tma_sfb, c, a_smem_staged, b_smem_staged,
+          sfa_staged, sfb_staged):
     tidx, _, _ = cute.arch.thread_idx()
-    thr_mma = tiled_mma.get_slice(tidx)
+    widx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     smem = cutlass.utils.SmemAllocator()
     st = smem.allocate(Storage)
@@ -62,50 +71,77 @@ def _body(tiled_mma, atom_a, tma_a, atom_b, tma_b, c,
     sSFA = st.sSFA.get_tensor(sfa_staged)
     sSFB = st.sSFB.get_tensor(sfb_staged)
 
-    gA = cute.local_tile(tma_a, (M, TK, 1), (None, None, None))
-    gB = cute.local_tile(tma_b, (N, TK, 1), (None, None, None))
+    gA = cute.local_tile(tma_a, (M, TK), (None, None, None))
+    gB = cute.local_tile(tma_b, (N, TK), (None, None, None))
+    gSFA = cute.local_tile(tma_sfa, (M, TK), (None, None, None))
+    gSFB = cute.local_tile(tma_sfb, (N, TK), (None, None, None))
     cta = cute.make_layout((1,))
     tAsA, tAgA = cpasync.tma_partition(
         atom_a, 0, cta, cute.group_modes(sA, 0, 2), cute.group_modes(gA, 0, 2))
     tBsB, tBgB = cpasync.tma_partition(
         atom_b, 0, cta, cute.group_modes(sB, 0, 2), cute.group_modes(gB, 0, 2))
+    tSsSFA, tSgSFA = cpasync.tma_partition(
+        atom_sfa, 0, cta, cute.group_modes(sSFA, 0, 2), cute.group_modes(gSFA, 0, 2))
+    tSsSFB, tSgSFB = cpasync.tma_partition(
+        atom_sfb, 0, cta, cute.group_modes(sSFB, 0, 2), cute.group_modes(gSFB, 0, 2))
+    tSsSFA = cute.filter_zeros(tSsSFA)
+    tSgSFA = cute.filter_zeros(tSgSFA)
+    tSsSFB = cute.filter_zeros(tSsSFB)
+    tSgSFB = cute.filter_zeros(tSgSFB)
 
-    tCsA = thr_mma.partition_A(sA[None, None, 0])
-    tCsB = thr_mma.partition_B(sB[None, None, 0])
-    tCrA = tiled_mma.make_fragment_A(tCsA)
-    tCrB = tiled_mma.make_fragment_B(tCsB)
-    tCrSFA = sm120_utils.partition_fragment_SFA(sSFA[None, None, 0], thr_mma, tidx)
-    tCrSFB = sm120_utils.partition_fragment_SFB(sSFB[None, None, 0], thr_mma, tidx)
+    producer = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+    consumer = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+    tx = (M * TK // 2) + (N * TK // 2) + (M * TK // SF_VEC) + (N * TK // SF_VEC)
+    pipe = pipeline.PipelineTmaAsync.create(
+        num_stages=NSTAGE, producer_group=producer, consumer_group=consumer,
+        tx_count=tx, barrier_storage=st.bars.data_ptr())
+    cute.arch.mbarrier_init_fence()
 
-    tCc = thr_mma.partition_C(c)
-    acc = cute.make_rmem_tensor(tCc.shape[:3], F32)
-    acc.fill(0.0)
+    if widx == 4:
+        pp = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NSTAGE)
+        pp.reset_count()
+        for kt in range(NKT):
+            pipe.producer_acquire(pp)
+            bp = pipe.producer_get_barrier(pp)
+            cute.copy(atom_a, tAgA[(None, 0, kt, 0)],
+                      tAsA[(None, pp.index)], tma_bar_ptr=bp)
+            cute.copy(atom_b, tBgB[(None, 0, kt, 0)],
+                      tBsB[(None, pp.index)], tma_bar_ptr=bp)
+            cute.copy(atom_sfa, tSgSFA[(None, 0, kt, 0)],
+                      tSsSFA[(None, pp.index)], tma_bar_ptr=bp)
+            cute.copy(atom_sfb, tSgSFB[(None, 0, kt, 0)],
+                      tSsSFB[(None, pp.index)], tma_bar_ptr=bp)
+            pipe.producer_commit(pp)
+            pp.advance()
+        pipe.producer_tail(pp)
+    elif widx < 4:
+        thr = tiled_mma.get_slice(tidx % 128)
+        tCsA = thr.partition_A(sA[None, None, 0])
+        tCsB = thr.partition_B(sB[None, None, 0])
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrB = tiled_mma.make_fragment_B(tCsB)
+        tCrSFA = sm120_utils.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
+        tCrSFB = sm120_utils.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
 
-    if tidx == 0:
-        cute.arch.mbarrier_init(st.bar.data_ptr(), 1)
-    cute.arch.sync_threads()
+        tCc = thr.partition_C(c)
+        acc = cute.make_rmem_tensor(tCc.shape[:3], F32)
+        acc.fill(0.0)
 
-    ntile = K // TK
-    for kt in range(ntile):
-        if tidx == 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                st.bar.data_ptr(), (M * TK // 2 + N * TK // 2))
-            cute.copy(atom_a, tAgA[(None, 0, 0, kt, 0)], tAsA[(None, 0)],
-                      tma_bar_ptr=st.bar.data_ptr())
-            cute.copy(atom_b, tBgB[(None, 0, 0, kt, 0)], tBsB[(None, 0)],
-                      tma_bar_ptr=st.bar.data_ptr())
-            cute.arch.mbarrier_wait(st.bar.data_ptr(), kt % 2)
-        cute.arch.sync_threads()
         nkb = cute.size(tCrA, mode=[2])
-        for kb in range(nkb):
-            cute.gemm(tiled_mma, acc,
-                      [tCrA[None, None, kb], tCrSFA[None, None, kb]],
-                      [tCrB[None, None, kb], tCrSFB[None, None, kb]],
-                      acc)
-        cute.arch.sync_threads()
+        cs = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, NSTAGE)
+        cs.reset_count()
+        for kt in range(NKT):
+            pipe.consumer_wait(cs)
+            for kb in range(nkb):
+                cute.gemm(tiled_mma, acc,
+                          [tCrA[None, None, kb], tCrSFA[None, None, kb]],
+                          [tCrB[None, None, kb], tCrSFB[None, None, kb]],
+                          acc)
+            pipe.consumer_release(cs)
+            cs.advance()
 
-    for i in range(cute.size(acc)):
-        tCc[i] = acc[i]
+        for i in range(cute.size(acc)):
+            tCc[i] = acc[i]
 
 
 @cute.jit
@@ -124,22 +160,24 @@ def run(a_u8, b_u8, sfa, sfb, c):
     lb = utils.LayoutEnum.from_tensor(b)
     a_smem = cute.tile_to_shape(
         cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(la, F4, TK), F4), (M, TK, 1), order=(0, 1, 2))
+            sm90_utils.get_smem_layout_atom(la, F4, TK), F4),
+        (M, TK, NSTAGE), order=(0, 1, 2))
     b_smem = cute.tile_to_shape(
         cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(lb, F4, TK), F4), (N, TK, 1), order=(0, 1, 2))
-    sfa_staged = bs_utils.sm120_make_smem_layout_sfa(tiled_mma, TILE, SF_VEC, 1)
-    sfb_staged = bs_utils.sm120_make_smem_layout_sfb(tiled_mma, TILE, SF_VEC, 1)
+            sm90_utils.get_smem_layout_atom(lb, F4, TK), F4),
+        (N, TK, NSTAGE), order=(0, 1, 2))
+    sfa_staged = bs_utils.sm120_make_smem_layout_sfa(tiled_mma, TILE, SF_VEC, NSTAGE)
+    sfb_staged = bs_utils.sm120_make_smem_layout_sfb(tiled_mma, TILE, SF_VEC, NSTAGE)
 
     sfa_t = cute.make_tensor(sfa.iterator, bs_utils.tile_atom_to_shape_SF((M, K, 1), SF_VEC))
     sfb_t = cute.make_tensor(sfb.iterator, bs_utils.tile_atom_to_shape_SF((N, K, 1), SF_VEC))
 
-    smem_a = cute.slice_(a_smem, (None, None, 0))
-    smem_b = cute.slice_(b_smem, (None, None, 0))
     atom_a, tma_a = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), a, smem_a, (M, TK))
+        cpasync.CopyBulkTensorTileG2SOp(), a,
+        cute.slice_(a_smem, (None, None, 0)), (M, TK))
     atom_b, tma_b = cpasync.make_tiled_tma_atom(
-        cpasync.CopyBulkTensorTileG2SOp(), b, smem_b, (N, TK))
+        cpasync.CopyBulkTensorTileG2SOp(), b,
+        cute.slice_(b_smem, (None, None, 0)), (N, TK))
     atom_sfa, tma_sfa = cpasync.make_tiled_tma_atom(
         cpasync.CopyBulkTensorTileG2SOp(), sfa_t,
         cute.slice_(sfa_staged, (None, None, 0)), (M, TK),
@@ -149,9 +187,9 @@ def run(a_u8, b_u8, sfa, sfb, c):
         cute.slice_(sfb_staged, (None, None, 0)), (N, TK),
         internal_type=cutlass.Int16)
 
-    _body(tiled_mma, atom_a, tma_a, atom_b, tma_b, c,
-          a_smem, b_smem, sfa_staged, sfb_staged).launch(
-        grid=[1, 1, 1], block=[128, 1, 1])
+    _body(tiled_mma, atom_a, tma_a, atom_b, tma_b, atom_sfa, tma_sfa,
+          atom_sfb, tma_sfb, c, a_smem, b_smem, sfa_staged, sfb_staged).launch(
+        grid=[1, 1, 1], block=[160, 1, 1])
 
 
 if __name__ == "__main__":
@@ -159,10 +197,15 @@ if __name__ == "__main__":
     a.fill_(0x22)
     b = torch.zeros(N, K // 2, device="cuda", dtype=torch.uint8)
     b.fill_(0x22)
-    sfa = torch.full((M, SFK), 2.0, device="cuda", dtype=torch.float8_e4m3fn)
-    sfb = torch.full((N, SFK), 2.0, device="cuda", dtype=torch.float8_e4m3fn)
+    def prep(v, mn):
+        t = torch.full((1, mn // 128, SFK // 4, 32, 4, 4), v,
+                       device="cuda", dtype=torch.float8_e4m3fn)
+        return t.permute(3, 4, 1, 5, 2, 0).contiguous().view(-1)
+
+    sfa = prep(0.0, M)
+    sfb = prep(0.0, N)
     c = torch.zeros(M, N, device="cuda", dtype=torch.float32)
     run(from_dlpack(a), from_dlpack(b), from_dlpack(sfa), from_dlpack(sfb), from_dlpack(c))
     torch.cuda.synchronize()
     print("c[0,0]", c[0, 0].item(), "c[7,3]", c[7, 3].item())
-    print("expect 1024.0")
+    print("expect 0.0 (SF=0)")
