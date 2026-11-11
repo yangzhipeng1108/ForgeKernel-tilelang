@@ -9,7 +9,7 @@ This authors its own tiled MMA, smem layouts, SF fragments, ldmatrix reads and
 epilogue for a single 128x128x128 tile -- no DenseGemmKernel, no
 Sm120BlockScaledGemmKernel. It compiles end to end. It does not produce numbers,
 because the gmem->smem half is blocked on this card; see
-`../from_scratch_load_path_is_the_wall.md` for the four traps and why.
+`../from_scratch_tma_load_path_works.md` for the four traps and why.
 
 Kept as a probe because the working half is the useful artifact: the exact
 `MmaMXF4NVF4Op` + `get_permutation_mnk` + SF-fragment + list-operand `cute.gemm`

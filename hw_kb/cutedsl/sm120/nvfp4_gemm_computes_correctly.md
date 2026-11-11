@@ -102,7 +102,7 @@ grid under-filled — the same "wide, not starved" effect the TileLang lm_head e
 
 The from-scratch path was pursued further after this entry was written: the MMA half (tiled MMA,
 permutation, SF partition, list-operand `cute.gemm`) does compile from primitives, and the load
-half is where it stops. That result is [`from_scratch_load_path_is_the_wall`](from_scratch_load_path_is_the_wall.md).
+half is where it stops. That result is [`from_scratch_tma_load_path_works`](from_scratch_tma_load_path_works.md).
 
 ## Measured on
 

@@ -51,7 +51,7 @@ fp4 x e5m2 vec32: tiled_mma OK  sfa=512 sfb=512
 But `DenseGemmKernel` cannot execute it: it asserts A and B share a dtype and fails at
 compile with `Type mismatch: Float4E2M1FN != Float8E4M3FN`. There is no shipped sm120
 kernel for mixed operands, so running it means hand-writing the mainloop — i.e. the
-load-path work that [`from_scratch_load_path_is_the_wall`](from_scratch_load_path_is_the_wall.md)
+load-path work that [`from_scratch_tma_load_path_works`](from_scratch_tma_load_path_works.md)
 records as blocked.
 
 **Verdict: mixed precision is architecturally supported and reachable from the DSL,
