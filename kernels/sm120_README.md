@@ -8,6 +8,12 @@ the Qwen3.8 serving path on this card.
 Every file was run on the actual RTX 6000D (tilelang 0.1.15, torch 2.15.0+cu132) and
 reproduced its recipe's numbers with `cos ~ 1.0` against a torch reference.
 
+These are **TileLang** modules, so each file is `kernel_tl.py`, not `kernel.py`. That suffix is
+the repo's language signal (`taskcard.KERNEL_FILE["tilelang"] = "kernel_tl.py"`,
+`lang_mode.TILELANG_KERNEL_SUFFIXES = ("_tl.py",)`): a `kernel.py` reads as CuTe DSL, and a
+TileLang implementation under that name is mislabelled even though the top-level `kernels/`
+README uses `kernel.py` for the paper's CuTe DSL kernels.
+
 | kernel | recipe | what it wins |
 |---|---|---|
 | `gemm/gemm_splitk/sm120` | `split_k_fills_a_starved_grid.md` | fp8 split-K when the grid is starved; `pick_splitk()` refuses to split a full grid |
@@ -19,6 +25,21 @@ reproduced its recipe's numbers with `cos ~ 1.0` against a torch reference.
 | `attention/gqa_paged_decode/sm120` | `decode_is_the_one_bandwidth_bound_case.md` | fp16 KV decode at dram ~90 %; fp8 KV is a loss |
 | `attention/mla_paged_decode/sm120` | `mla_absorbed_decode_beats_mha.md` | one shared latent instead of per-head KV; 256x smaller cache |
 | `linear_attention/rmsnorm/sm120` | `memory_bound_elementwise_saturates_hbm.md` | the one HBM-saturating regime; small tile (BM=2) wins |
+
+## One CuTe DSL kernel: NVFP4 GEMM
+
+The nine above are TileLang. NVFP4 has **no** working TileLang kernel on this card
+(`T.gemm_blockscaled` is silently wrong here), so its entry is CuTe DSL and lives at
+`gemm/nvfp4_gemm/sm120/kernel.py` (`.py` = CuTe DSL). It wraps the verified container kernel
+`flashinfer...DenseGemmKernel` — it is not hand-written from scratch — and adds the fp4 operand
+encoding, the SF MMA-atom layout, and a cached `cute.compile` launch. Measured here:
+
+    NVFP4  2048x4096x4096  0.0804 ms  855 TFLOP/s  md=2  cos=0.999999
+    NVFP4  4096x4096x4096  0.2721 ms  505 TFLOP/s  md=2  cos=0.999999
+
+For reference it is 2.3x the TileLang fp8 375 TF number at the serving dtype (fp4 peak is ~2x
+fp8 peak, so that is cross-dtype); the same-dtype fp16 comparison is CuTe DSL 208 vs TileLang
+158.8 TF (1.31x). Details: `hw_kb/cutedsl/sm120/nvfp4_gemm_computes_correctly.md`.
 
 ## Readings on this box
 

@@ -49,6 +49,7 @@ here name mechanisms that exist only, or differently, on sm120.
 |---|---|---|
 | `cute.nvgpu.warp.MmaMXF4NVF4Op` (NVFP4) | **op verified**, full GEMM not yet gated | [`nvfp4_warp_mma_works`](nvfp4_warp_mma_works.md) |
 | NVFP4 GEMM, end to end | **verified exact on this card**: `md=0`, `cos=1.0` across 128..256 x 128..256 x 128..1024, closed-form and random; use the shipped sm120 kernel rather than hand-building the smem plumbing | [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md) |
+| NVFP4 GEMM, as a shippable module | `kernels/gemm/nvfp4_gemm/sm120/kernel.py` (CuTe DSL, `.py`) wraps the verified kernel; **855 TF/s** at 2048×4096×4096, **505** at 4096³, md=2; beats TileLang fp8 375 / f16 158.8 | [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md) |
 | `cute.nvgpu.warp.MmaMXF8Op` (fp8, `(16,8,32)`, UE8M0 scale) | **MXFP8 GEMM verified**: `md=1.85e-3`, `cos=1.0` | [`blockscaled_three_paths`](blockscaled_three_paths.md) |
 | `cute.nvgpu.warp.MmaMXF4Op` (fp4, `(16,8,64)`, UE8M0 scale) | **MXFP4 GEMM verified exact**: `md=0` | [`blockscaled_three_paths`](blockscaled_three_paths.md) |
 | `cute.nvgpu.warp.MmaF16BF16Op` (fp16 / bf16) | **verified PASS** at 512³, 2048³, 8192³ via the shipped GeForce example | [`warp_mma_bf16_and_fp16`](warp_mma_bf16_and_fp16.md) |

@@ -83,6 +83,23 @@ Written down because they are all silent-corruption shaped, and all cost real ti
   a kernel region. Pointers (`make_ptr`) are legal at plain-Python level; tensors and layouts
   are not.
 
+## A shippable module, and what it is not
+
+`kernels/gemm/nvfp4_gemm/sm120/kernel.py` turns this into a `build()/gemm_nvfp4()/_bench()`
+module in the repo's standard shape. It is **a wrapper around the verified container kernel**
+(`DenseGemmKernel`), not a hand-written one — the from-scratch attempt is exactly the failure
+recorded above. What the wrapper owns is the caller-side encoding (e2m1 snapping + packing, the
+pre-permuted SF atom layout) and one cached `cute.compile` launch per shape. Measured:
+
+| shape | time | throughput | correctness |
+|---|---|---|---|
+| 2048 × 4096 × 4096 | 0.0804 ms | 855 TFLOP/s | md=2, cos 0.999999 |
+| 4096 × 4096 × 4096 | 0.2721 ms | 505 TFLOP/s | md=2, cos 0.999999 |
+
+Both exceed the TileLang sm120 baselines (fp8 375 TF, f16 158.8 TF); TileLang has no working fp4
+kernel at all. The 4096³ point is lower than 2048³ because a fixed 128×128 tile leaves the 4096
+grid under-filled — the same "wide, not starved" effect the TileLang lm_head entry records.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB, no NVLink
