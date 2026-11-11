@@ -356,14 +356,52 @@ NVFP4 does not yet compute correctly.** The verified numbers for NVFP4 on this c
 all come from the shipped kernel (`nvfp4_gemm_computes_correctly`), and the shipped
 wrapper `kernels/gemm/nvfp4_gemm/sm120/kernel.py` is still the thing to use.
 
+### Multi-CTA: the hand-built fp16 kernel is 4x faster than the shipped example
+
+The single-CTA skeleton was extended to a 2-D grid (one CTA per 128×128 output
+tile) and timed. It is still exact (512×384×1024, rel 1.7e-6, every element correct)
+and it is fast:
+
+| shape | hand-built | shipped `dense_gemm.py` |
+|---|---|---|
+| 1024³ | **30.2 µs, 71.1 TF/s** | 125 µs |
+| 2048³ | **100.1 µs, 171.7 TF/s** | — |
+| 4096³ | **961.1 µs, 143.0 TF/s** | — |
+
+So the from-scratch path is **4.1× faster than the official example at 1024³**, and
+its 2048³ peak (171.7 TF/s) is above the best TileLang fp16 kernel on this card
+(158.8 TF/s). Nothing here uses a shipped kernel.
+
+Three things the multi-CTA step needed that the single-CTA probe did not:
+
+1. **A 2-D grid, not a divided linear index.** `blockIdx.x // ntile_n` lowers to
+   `arith.floordivsi` and the IR verifier rejects it with "using value defined
+   outside the region". Use `tn, tm, _ = cute.arch.block_idx()` with
+   `grid=[N/128, M/128, 1]`.
+2. **Time through `cute.compile`, not by calling the jit function in a loop.**
+   Looping on the `@cute.jit` entry recompiles every iteration and reports a flat
+   ~22.8 ms for every shape — which reads as "0.1 TF/s". That is host compile time,
+   not the kernel; compile once and call the result.
+3. **Slice C per tile** with `cute.local_tile(c, (BM, BN), (tm, tn))`. Partitioning
+   the whole C tensor gives every CTA the same destination and silently drops all
+   but one tile's work.
+
+**Why 4096³ is slower than 2048³.** 2048³ is 256 tiles / 156 SMs = 1.64 waves, so
+two full waves with little tail; 4096³ is 1024 tiles / 156 = 6.56 waves and loses
+the last partial wave — the same wave-quantization effect tuned in
+`tuning_the_nvfp4_gemm`. Raising the K tile to 64 with 3 stages instead of 32 with 4
+changes nothing (73.3 / 173.2 / 142.7), so the limit is MMA issue plus wave fill,
+not TMA granularity.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
 - `lmsysorg/sglang:dev` container: cutlass-dsl **4.8.0**, torch 2.14.1+cu130, CUDA 13.0.3
 - probes `_probes/probe_sm120_tma_pipeline_smoke.py` (single stage load),
   `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles),
-  `_probes/probe_sm120_wmma_gemm_computes.py` (MMA only, rel 2.3e-7), and
-  `_probes/probe_sm120_wmma_gemm_tma_pipeline.py` (full GEMM, K=1024, rel 1.6e-6)
-  — all PASS
+  `_probes/probe_sm120_wmma_gemm_computes.py` (MMA only, rel 2.3e-7),
+  `_probes/probe_sm120_wmma_gemm_tma_pipeline.py` (full GEMM, single CTA, K=1024,
+  rel 1.6e-6), and `_probes/probe_sm120_wmma_gemm_multicta.py` (full GEMM on a 2-D
+  grid, rel 1.7e-6, 71.1 / 171.7 / 143.0 TF/s at 1024³ / 2048³ / 4096³) — all PASS
 - official `dense_gemm.py --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,64` —
   PASS, 125 µs
