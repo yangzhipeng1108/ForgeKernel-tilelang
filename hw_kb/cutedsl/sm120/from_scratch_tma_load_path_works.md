@@ -248,6 +248,54 @@ kernel (what `kernels/gemm/nvfp4_gemm/sm120/kernel.py` does at 853 TF/s) rather
 than re-derive its mainloop. The fp16 skeleton above is the right scaffold; the
 FP4 mainloop is a separate, larger port.
 
+### Follow-up round: the port was attempted; everything but the pipeline now lines up
+
+Acting on the recommendation above, the actual port was tried. The result narrows
+the remaining gap to exactly one thing — **the mbarrier pipeline** — with every
+type/layout/shape question in front of it now answered.
+
+**The rank wall falls once the smem is genuinely staged.** Building `sA` from the
+staged layout (`Storage` holding `MemRange[F4, M*TK]`, `get_tensor(outer, swizzle=inner)`)
+makes `partition_A(sA)` return a 3-D `tCsA` whose layout is
+`((8,2,2),4,2):((1,1024,32),4096,64)` — the trailing `2` **is** the K-block mode
+(`tile_k / mma_k = 128/64`). `make_fragment_A(tCsA)` (no extra slicing) then yields a
+`tCrA` that `cute.gemm` accepts. So the earlier advice to slice
+`tCsA[None,None,None,0]` was the error; the staged tensor must be passed whole.
+
+**The host-side fp4 recipe**, taken from the shipped sm120 blockscaled wrapper
+(`dense_blockscaled_gemm_sm120_b12x.py`, its `recast_ptr(dtype=...)` block) — the
+four details that each cost a round:
+
+| detail | correct form | what breaks otherwise |
+|---|---|---|
+| recast to fp4 | `cute.recast_ptr(t.iterator, **dtype=F4**)` | positional arg raises `AttributeError: type object 'Float4E2M1FN' has no attribute 'type'` |
+| A/B tensor rank | 3-D `make_ordered_layout((m,k,l), order=(1,0,2))` | `local_tile` then needs 3 coords, and a 2-D layout gives `failed to construct a valid coordinate` |
+| SF tensor | `make_tensor(ptr, bs_utils.tile_atom_to_shape_SF((m,k,1), 16))` | feeding a plain `(m, sf_k)` tensor to the TMA atom gives `expected top-level shape equivalence between the SMEM layout and the CTA V-map` |
+| SF TMA | `make_tiled_tma_atom(..., (m, tile_k), internal_type=cutlass.Int16)` — tile spans the **full** tile_k, not `(m,1)` | `(m,1)` is the wrong tile and the atom refuses to build |
+
+**TMA partition indexing is one dimension deeper than the fp16 case.** With the
+L-mode present, `tAgA` is 5-D `(tile,1,1,loopK,1)`; the copy index is
+`tAgA[(None,0,0,kt,0)]`. The fp16 skeleton's `tAgA[(None,0,kt)]` raises
+`expects coord and shape of view to be weakly congruent`.
+
+**Where it still stops: the barrier.** `cute.copy(atom, g, s)` with no pipeline
+raises `expects a pointer to an mbarrier to be provided via the tma_bar_ptr kw
+argument`. Passing a plain `MemRange[Int64,2]` pointer with a hand-rolled
+`mbarrier_init` / `mbarrier_arrive_and_expect_tx` / `mbarrier_wait` **compiles and
+then hangs** — for the same reason the fp16 load path did before it was switched to
+`PipelineTmaAsync`: the expect-tx byte count and the barrier phase both have to be
+owned by the pipeline, and a bare barrier gets them wrong. `cute.arch` has no
+`alloc_barrier` (the available names are `mbarrier_init`, `mbarrier_arrive`,
+`mbarrier_arrive_and_expect_tx`, `mbarrier_expect_tx`, `mbarrier_wait`,
+`mbarrier_try_wait`, `mbarrier_test_wait`, `mbarrier_conditional_try_wait`).
+
+So the remaining work is exactly: **drive A, B, SFA and SFB through one
+`PipelineTmaAsync`**, with `tx_count` summed over all four copies per stage and SF
+counted in Int16 elements. That is a contained change to the working skeleton, not a
+re-derivation — but it was not completed in this round, so the entry stays honest:
+**fp16 hand-built is solved end to end; NVFP4 hand-built now builds every piece and
+fails only at the un-pipelined TMA.**
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
