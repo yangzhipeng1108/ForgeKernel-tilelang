@@ -393,6 +393,33 @@ the last partial wave — the same wave-quantization effect tuned in
 changes nothing (73.3 / 173.2 / 142.7), so the limit is MMA issue plus wave fill,
 not TMA granularity.
 
+**A persistent grid makes it worse, not better** — worth knowing before trying it.
+The obvious fix for the 6.56-wave tail is a persistent kernel: cap the grid and let
+each CTA loop over the tiles it owns. Measured against the plain launch it loses at
+every size:
+
+| shape | plain multi-CTA | persistent (312 CTAs) |
+|---|---|---|
+| 1024³ | 71.1 TF/s | 69.1 |
+| 2048³ | 171.7 TF/s | 166.2 |
+| 4096³ | **143.0** TF/s | 137.4 |
+
+With a smaller grid (156 CTAs, one per SM) 4096³ collapses to **115.6 TF/s**, because
+156 CTAs cannot fill the machine the way many short CTAs can. So the nominal 44%-idle
+tail is already largely hidden — the hardware block scheduler overlaps the partial
+wave with the next one — and a persistent CTA pays for the serialisation: its
+4-stage pipeline must drain and refill at every tile boundary and each new tile
+re-issues A/B TMA from the start of K. **The plain one-CTA-per-tile launch is the
+right shape on this card.** Probe kept as `probe_sm120_wmma_gemm_persistent.py`,
+documented as a negative result.
+
+The persistent probe does pin down three things worth keeping for any future
+persistent kernel here: pipeline state must be created once outside the tile loop
+and keep advancing (re-creating it per tile desynchronises the barriers and hangs);
+only the accumulator is per-tile; and the tile loop must not divide in-kernel
+(`tile // ntile_n` → `arith.floordivsi`, IR verification fails) — stride along a
+grid axis and keep the other coordinate from `blockIdx`.
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
@@ -402,6 +429,8 @@ not TMA granularity.
   `_probes/probe_sm120_wmma_gemm_computes.py` (MMA only, rel 2.3e-7),
   `_probes/probe_sm120_wmma_gemm_tma_pipeline.py` (full GEMM, single CTA, K=1024,
   rel 1.6e-6), and `_probes/probe_sm120_wmma_gemm_multicta.py` (full GEMM on a 2-D
-  grid, rel 1.7e-6, 71.1 / 171.7 / 143.0 TF/s at 1024³ / 2048³ / 4096³) — all PASS
+  grid, rel 1.7e-6, 71.1 / 171.7 / 143.0 TF/s at 1024³ / 2048³ / 4096³) — all PASS.
+  `_probes/probe_sm120_wmma_gemm_persistent.py` is a **negative** result: correct
+  (rel 1.7e-6) but 69.1 / 166.4 / 134.8 TF/s, i.e. slower than the plain launch
 - official `dense_gemm.py --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,64` —
   PASS, 125 µs
