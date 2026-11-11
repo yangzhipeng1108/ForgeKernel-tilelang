@@ -80,6 +80,7 @@ are the kind of thing only a counter can settle:
 | **NVFP4 / T.gemm_blockscaled on sm120** — the mma.sync mxf4nvf4 instruction is real; the TileLang lowering returns a wrong answer | `nvfp4_blockscaled_is_broken_in_tilelang.md` | ✅ hardware probe: compiles + dispatches to `cuda.mma.blockscaled`; `rowmajor` → misaligned addr, `blockscaled_chunk_kmajor` → deterministic `2**-10` for a closed-form `1024`; production route is CuTeDSL |
 | **Re-running the archived probes** — one entry point, hardware readings appended per run | `_probes/revalidate_probes.py` | harness ✅ a probe runs in a subprocess under a timeout; sk / sk_fixed / ca2 / mla5 / g1(BN64) re-ran, all `cos=1.00000`; caught a real bug in the archived `sk.py` |
 | **The four winning probes as importable modules** — verdict baked into the API | `kernels/sm120_README.md` | ✅ all 4 re-ran on the 6000D: gemm SK8 182.8 TF / causal 145 TF / gqa 228 GB/s / mla 69.7 TF, `md=0` or `cos=1.00000` |
+| **Nine serving-path kernels** — gemm f16/fp8/lm_head, prefill, rmsnorm + the four above | `kernels/sm120_README.md` | ✅ all re-ran on the 6000D: f16 158.8 TF / fp8 375.2 TF / lm_head 73.3 TF (fp8 133.2) / prefill 143.8 TF / rmsnorm 1277.7 GB/s, all `cos~1.0` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 
