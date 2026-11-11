@@ -25,6 +25,13 @@ every scale was a power of two, so the reference is computable in fp32 without r
 is 1.85e-3 off, which is the fp16 output round-trip on values up to ~5.8 — the accumulator is
 fp32 and the epilogue stores fp16, so that residual is the store, not the MMA.
 
+Follow-up, measured: the store precision is the whole story, and fp16 was not even the best
+choice. At bf16 output MXFP8 is 2.86e-3 relative; at fp16 it is 3.64e-4 — a **7.9x** improvement
+from swapping the output dtype alone, since bf16 has an 8-bit mantissa against fp16's 10. A
+float32 output (which would show the true arithmetic error) cannot launch: its epilogue stage
+needs 134144 B against the 101376 B smem limit. See
+[`output_dtype_and_mixed_precision`](output_dtype_and_mixed_precision.md).
+
 ## Which op `sf_vec_size` selects
 
 The dispatch is not a guess; the constructor builds the atom off this table:

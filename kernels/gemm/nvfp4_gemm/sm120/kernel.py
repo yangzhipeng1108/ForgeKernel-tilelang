@@ -25,11 +25,19 @@ What the wrapper adds:
   * a `_bench()` that reports TFLOP/s against the TileLang baselines in `kernels/sm120_README.md`.
 
 Measured on this box (RTX 6000D, cutlass-dsl 4.8.0), vs the TileLang sm120 baselines:
-    NVFP4 (this module)  4096x4096x4096   852 TFLOP/s   md <= 7   (TileLang has no fp4 kernel)
-    CuTeDSL fp16 (TMA)   4096^3           208 TFLOP/s             (TileLang f16 158.8)
+    NVFP4 (this module)  2048x4096x4096   853 TFLOP/s   md=2   (TileLang has no fp4 kernel)
+    NVFP4 (this module)  4096^3           505 TFLOP/s   md=2
+    CuTeDSL fp16 (TMA)   4096^3           208 TFLOP/s          (TileLang f16 158.8)
 fp4 peak is ~2x fp8 peak, so the honest cross-dtype statement is: CuTe DSL delivers the serving
-NVFP4 dtype at ~852 TFLOP/s, 2.3x the TileLang fp8 number, and the same-dtype fp16 comparison is
+NVFP4 dtype at ~853 TFLOP/s, 2.3x the TileLang fp8 number, and the same-dtype fp16 comparison is
 208 vs 158.8 (1.31x).
+
+Why 4096^3 lands at 505 and not ~850: it is wave quantization, not the tile. 4096^3 has
+32x32 = 1024 tiles on 156 SMs = 6.56 waves, so the last wave runs 88 CTAs on 156 SMs and
+wastes ~44% of the machine; 2048x4096x4096 is 3.28 waves. A 128x256 tile does not help
+(it collapses to a single-stage pipeline, 15x slower). `mac` (max_active_clusters) is
+shape-picked below: 128 divides the waves evenly on the narrow shapes (+4%), 156 on the
+deep ones. Full sweep in hw_kb/cutedsl/sm120/tuning_the_nvfp4_gemm.md.
 """
 
 import torch
@@ -84,13 +92,32 @@ def _sf_atom_layout(sf: torch.Tensor, mn: int, sf_k: int) -> torch.Tensor:
     return full.reshape(shape).permute(3, 4, 1, 5, 2, 0).contiguous()
 
 
-def build(m: int, n: int, k: int, tile_mn=(128, 128), mac: int = 156):
+def _default_mac(n: int, k: int) -> int:
+    """Persistent-grid width for this shape (see hw_kb/cutedsl/sm120/tuning_the_nvfp4_gemm.md).
+
+    The 6000D has 156 SMs. On the narrow shapes (N<=2048 or K<=2048) a grid of 128
+    divides the tile waves evenly and beats the 156 default by ~4%; on the deep shapes
+    156+ keeps the SMs fed. Measured: 2048x4096x4096 882 TF/s at 128 vs 850 at 156;
+    4096^3 471 at 128 vs 505 at 156.
+    """
+    return 128 if (n <= 2048 or k <= 2048) else 156
+
+
+def build(m: int, n: int, k: int, tile_mn=(128, 128), mac: int | None = None):
     """Compile once, return (call, C). `call()` launches only — safe to time in a loop.
 
     `m` must be a multiple of 128: the default DenseGemmKernel is silently wrong for M<128 and
     illegal-instructions at M=1 (small-M needs the use_m1_non_tma_* flags). k must be a multiple
     of 128 (nvfp4 tile_k). Unit UE4M3 scales are used, so callers must pre-scale into [-6, 6].
+
+    `tile_mn` should stay (128, 128): 128x256 / 256x128 / 192x* all measured worse or fail to
+    compile (larger tiles leave room for one A/B stage and the mainloop collapses 15x).
+
+    `mac` defaults to `_default_mac(n, k)`. Note `max_active_clusters` is NOT the launch grid
+    size -- it caps the persistent scheduler; 64 is catastrophic (2-4x slower).
     """
+    if mac is None:
+        mac = _default_mac(n, k)
     if m % 128 or n % 128 or k % 128:
         raise ValueError(f"m,n,k must be multiples of 128 for this kernel; got {(m, n, k)}")
     dev = "cuda"
