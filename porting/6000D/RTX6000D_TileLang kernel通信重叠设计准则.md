@@ -163,6 +163,23 @@ producer warpgroup 变 256。`software_pipeline_stage_budget.md`：`stages=0` �
 | 2CTA UMMA（tcgen05）| ❌ | ✅ | 提高单 SM 算力密度 |
 | DSMEM 跨 CTA 交换 | ❌ | ✅ | 免 HBM 中转 |
 | CLC 动态调度 | ❌ 0 指令 | ✅ | 动态让出 SM |
+| **`multimem.ld_reduce`（跨卡归约，NVLink）** | ❌ | ✅ **API 已存在** | **kernel 内直接 all-reduce，无需 NCCL** |
+
+### 关于最后一行（必须说清）
+
+`cutlass.utils.distributed`（cutlass 4.8.0）提供 15 个 `multimem.ld_reduce` + 3 个
+`multimem.st`，是**真正的跨 GPU 集合原语**：kernel 可以在自己的 epilogue 里读对端并归约，
+不经过 NCCL、不经过 HBM 中转。详见 `hw_kb/cutedsl/sm100/multimem_ld_reduce_and_store.md`。
+
+但有三条硬限制，别把它当成万能钥匙：
+
+1. **需要 NVLink/NVSwitch 多播内存对象**。普通 cudaMalloc 指针不行，PCIe 拓扑不行。
+   **本机（2×RTX 6000D，GPU0↔GPU1 = SYS）用不了。**
+2. **只有 add**。没有 min/max/mul 的 multicast reduce。
+3. **机制未在硬件上验证**——该 KB 条目只核对了 API 表面，没有跑过任何多播指令。
+
+也就是说：CuTeDSL **有能力**在 kernel 内做跨卡归约，但这条能力在无 NVLink 的机器上
+不可达，且尚未被本仓库实测。**本文其余全部准则仍然只适用于 TileLang。**
 
 详见 `porting/6000D/RTX6000D_双卡优化总纲.md` 与 `hw_kb/cutedsl/`。
 
@@ -174,4 +191,5 @@ producer warpgroup 变 256。`software_pipeline_stage_budget.md`：`stages=0` �
    输出零拷贝（连续 layout）。
 3. **本卡上所有「调度技巧」对单 kernel 都是 tie**，所以按本文做减法**没有单 kernel 性能代价**——
    这是唯一能放心执行的部分。
-4. **主动优化需要 CuTeDSL**，TileLang 在集群协作层几乎全缺。
+4. **主动优化需要 CuTeDSL**，TileLang 在集群协作层几乎全缺；其中
+   `multimem.ld_reduce` 是唯一能进 kernel 的跨卡归约，但需要 NVLink 且尚未实测。
