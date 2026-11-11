@@ -208,8 +208,45 @@ raises `expects the 'transpose' Op parameter to be a bool instance`).
 
 So the full hand-built chain on sm120 is now: **TMA (multi-stage, swizzled smem) →
 ldmatrix → WMMA → register epilogue, end to end, exact.** Nothing here needs the
-shipped kernels any more; the remaining work for NVFP4/mixed precision is swapping
-the op and adding the block-scaled SF TMA, both of which already construct.
+shipped kernels any more.
+
+## NVFP4 on the same skeleton: what carries over and where it stops
+
+Swapping the fp16 WMMA for the block-scaled FP4 op gets **further than the earlier
+entry implied, but not to a running kernel**. Verified so far:
+
+| piece | status |
+|---|---|
+| `make_sm120_blockscaled_mma_op(F4,F4,F32,E4M3,16)` | **builds** |
+| `get_permutation_mnk((128,128,128), 16, False)` | **returns `(128, (8,2,2):(1,16,8), 64)`** — matches the earlier NVFP4 record |
+| `make_tiled_mma(op, (2,2,1), permutation_mnk=perm)` | **builds** |
+| `sm120_make_smem_layout_sfa/sfb(tiled_mma, tile, 16, 1)` | **builds** |
+| `partition_fragment_SFA/SFB(sSFA, thr, tidx)` | **returns a 4-D fragment** `((16,4),4,4,1)` |
+| list-operand `cute.gemm(..., [tCrA, tCrSFA], [tCrB, tCrSFB], acc)` | **fails rank check** unless A and SF are the same rank |
+
+Two concrete traps hit on the way, both now recorded:
+
+1. **fp4 cannot be assigned element-wise.** `sA[i] = F4(1.0)` raises `Sub-byte
+   scalar dereference not supported for type Float4E2M1FN`. Write packed bytes
+   (`Uint8(0x22)` is two 1.0 nibbles) or go through a vectorized copy atom / TMA.
+   Likewise `tCrA[...] = tCsA[...]` raises `Expected TensorSSA` — the fp4 smem→reg
+   move must also be a copy atom, not an assignment.
+
+2. **The SF fragment rank is fixed at 4, and `cute.gemm` demands A match it.**
+   The error is
+   `'cute.gemm' op expects all operands to have the same rank, but got: A[1]: 4 != A[0]: 2`.
+   The shipped `raw.py` satisfies this because its `tCrA` is `((8,2,2),4)` and it
+   slices **both** A and SF with `[None, mma_m, k_block_idx]` — i.e. A carries an
+   explicit K-block mode from a `tile_k`-tiled, staged smem layout. A flat `(M,K)`
+   smem tensor gives a 2-D `tCrA` and no amount of index juggling fixes it.
+
+So the missing piece is structural, not a parameter: **the FP4 path needs the same
+`tile_k`-tiled staged-smem + K-block loop the shipped kernel uses** (`ab_stage`,
+`tCsA[None,None,None,stage]`, `num_k_blocks = size(tCrA, mode=[2])`). That is why
+`raw.py` is 1457 lines and why the honest recommendation is to wrap the verified
+kernel (what `kernels/gemm/nvfp4_gemm/sm120/kernel.py` does at 853 TF/s) rather
+than re-derive its mainloop. The fp16 skeleton above is the right scaffold; the
+FP4 mainloop is a separate, larger port.
 
 ## Measured on
 
