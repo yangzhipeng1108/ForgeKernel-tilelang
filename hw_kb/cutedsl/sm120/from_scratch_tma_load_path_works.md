@@ -175,30 +175,50 @@ not `tidx % 128`. Using the modulo silently gives the wrong warp's data.
 With `atom_layout=(2,2,1)` (4 MMA warps = 128 threads) and the GeForce example's
 `MmaF16BF16Op(DT, ACC, (16,8,16))`, the whole chain is correct.
 
-## Still open: joining the two halves
+## Still open: joining the two halves — SOLVED
 
-The TMA load path needs a **swizzled** smem layout (`sm90_utils.make_smem_layout_a`
-/ `_b`), because TMA descriptors expect the swizzle. The ldmatrix atom rejects that
-layout at IR verify:
+The join now works. `_probes/probe_sm120_wmma_gemm_tma_pipeline.py` — one CTA, 128
+threads, full 128×128 over **K=1024**, 32 K-tiles through the 4-stage TMA ring —
+computes with **rel error 1.6e-6, every element correct**.
+
+The only thing that stood in the way was a hardcoded ldmatrix major flag, and it
+presented as an alignment error:
 
 ```
 error: 'cute.copy' op src ptr alignment (16 bits) does not meet requirement
        (128 bits) of atom 'ldsm<val_type = f16, num_matrices = 4, t>'
 ```
 
-The non-swizzled probe above ldmatrixes fine, so this is purely the swizzled-smem
-hand-off — the `partition_S` of a composed (swizzled) tensor loses the 128-bit
-alignment fact the ldsm atom needs. The official `dense_gemm.py` does both in one
-kernel and PASSes, so the recipe exists; the missing piece is how it threads the
-swizzled `tCsA_view[(None,None,None,stage)]` into `smem_tiled_copy_A` without the
-alignment being lost. That is the next thing to copy verbatim rather than derive.
+That error is **misleading**. The ldsm atom was built with
+`LdMatrix8x8x16bOp(True, 4)` unconditionally, but a row-major `(M,K)` A is
+**K-major**, so `is_m_major_a()` is `False`. With the wrong flag the atom expects
+a transposed layout the swizzled smem does not provide, and the verifier reports it
+as a 16-bit-vs-128-bit alignment failure rather than a transpose mismatch. The fix:
+
+```python
+la = utils.LayoutEnum.from_tensor(a)
+lb = utils.LayoutEnum.from_tensor(b)
+...
+LdMatrix8x8x16bOp(la.is_m_major_a(), 4)   # False for a row-major A
+LdMatrix8x8x16bOp(lb.is_n_major_b(), 4)   # False for a row-major B
+```
+
+Both flags must reach the `@cute.kernel` as `cutlass.Constexpr` (a runtime bool
+raises `expects the 'transpose' Op parameter to be a bool instance`).
+
+So the full hand-built chain on sm120 is now: **TMA (multi-stage, swizzled smem) →
+ldmatrix → WMMA → register epilogue, end to end, exact.** Nothing here needs the
+shipped kernels any more; the remaining work for NVFP4/mixed precision is swapping
+the op and adding the block-scaled SF TMA, both of which already construct.
 
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB
 - `lmsysorg/sglang:dev` container: cutlass-dsl **4.8.0**, torch 2.14.1+cu130, CUDA 13.0.3
 - probes `_probes/probe_sm120_tma_pipeline_smoke.py` (single stage load),
-  `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles), and
-  `_probes/probe_sm120_wmma_gemm_computes.py` (fp16 GEMM rel 2.3e-7) — all PASS
+  `_probes/probe_sm120_tma_pipeline_multistage.py` (4 stages × 16 K-tiles),
+  `_probes/probe_sm120_wmma_gemm_computes.py` (MMA only, rel 2.3e-7), and
+  `_probes/probe_sm120_wmma_gemm_tma_pipeline.py` (full GEMM, K=1024, rel 1.6e-6)
+  — all PASS
 - official `dense_gemm.py --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,64` —
   PASS, 125 µs
