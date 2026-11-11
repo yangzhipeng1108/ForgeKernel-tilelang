@@ -100,6 +100,10 @@ Both exceed the TileLang sm120 baselines (fp8 375 TF, f16 158.8 TF); TileLang ha
 kernel at all. The 4096³ point is lower than 2048³ because a fixed 128×128 tile leaves the 4096
 grid under-filled — the same "wide, not starved" effect the TileLang lm_head entry records.
 
+The from-scratch path was pursued further after this entry was written: the MMA half (tiled MMA,
+permutation, SF partition, list-operand `cute.gemm`) does compile from primitives, and the load
+half is where it stops. That result is [`from_scratch_load_path_is_the_wall`](from_scratch_load_path_is_the_wall.md).
+
 ## Measured on
 
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB, no NVLink
