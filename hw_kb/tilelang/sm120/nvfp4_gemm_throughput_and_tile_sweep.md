@@ -1,4 +1,4 @@
-# NVFP4 blockscaled GEMM on sm120: 865 TF/s single-shot, 546 TF/s back-to-back
+# NVFP4 blockscaled GEMM on sm120: 836-865 TF/s while L2 holds the operands, 545 when it does not
 
 ## Purpose
 
@@ -6,11 +6,12 @@ Measure the fixed TileLang NVFP4 blockscaled GEMM (see
 `nvfp4_blockscaled_is_broken_in_tilelang.md` for the correctness fix that made any of this
 possible) across tile shapes, pipeline depths and problem sizes.
 
-The headline is uncomfortable and is the most useful thing here: **the throughput depends
-almost entirely on how you time it.** A single launch reaches 865 TF/s; the same kernel called
-back to back settles at 546 TF/s, and the gap is not throttling, not bandwidth and not the
-tile geometry. Any number quoted without its protocol is meaningless, and several earlier
-entries in this KB quoted such numbers.
+The headline is uncomfortable and is the most useful thing here: **the number is decided by L2
+residency, and the measurement protocol decides whether you can see that.** The same kernel runs
+at 836-865 TF/s when the fp4 operands stay in L2 and 540-560 TF/s when the output grows large
+enough to evict them. It is neither throttled nor bandwidth bound in either case. Any number
+quoted without its shape, its L2 state and its protocol is meaningless, and two earlier versions
+of this entry quoted exactly such numbers.
 
 ## Measured on
 
@@ -53,50 +54,62 @@ feeds the MMA pipe well but leaves a quarter to a third of it idle.
 
 ## The protocol controls the answer
 
-Same kernel, same config (128/128/128, `num_stages=3`), three timing methods:
+Same kernel, same config (128/128/128, `num_stages=3`), several timing methods. Every row below
+was reproduced three times on a fresh process:
 
-| shape | single launch, best of 20 events | back-to-back, batch of 20 | ncu single launch |
+| shape | plain loop | CUDA graph | ncu single launch |
 |---|---|---|---|
-| 4096鲁 | 0.173 ms 閳?**792 TF/s** | 0.323 ms 閳?**425 TF/s** | 0.166 ms 閳?830 TF/s |
-| 4096虏脳8192 | 0.318 ms 閳?**865 TF/s** | 0.491 ms 閳?560 TF/s | 閳?|
-| 8192鲁 | 1.540 ms 閳?714 TF/s | 2.013 ms 閳?**546 TF/s** | 1.09 ms 閳?1008 TF/s |
+| 4096鲁 | 0.164-0.165 ms 閳?**835-836 TF/s** | 0.265-0.270 ms 閳?508-518 TF/s | 0.166 ms 閳?830 TF/s |
+| 4096虏脳8192 | 0.318 ms 閳?**865 TF/s** | 閳?| 閳?|
+| 8192鲁 | 2.02-2.03 ms 閳?**541-544 TF/s** | 2.00 ms 閳?549-551 TF/s | 1.08 ms 閳?1008 TF/s |
 
-Two separate effects are visible.
+Three things fall out.
 
-**There is a fixed gap between consecutive launches.** At 4096鲁 the kernel itself is 0.173 ms
-but a batch of 20 averages 0.323 ms, so ~0.15 ms per call is spent between launches. That
-overhead is roughly constant in shape, so it hurts small shapes hardest and barely touches
-8192鲁 (1.54 閳?2.01).
+**It is not launch overhead.** Capturing the loop in a CUDA graph removes every CPU-side launch,
+and at 8192鲁 it changes nothing (2.02 閳?2.00 ms). At 4096鲁 the graph is **40 % slower**, not
+faster, so the per-launch path is not where the time goes and batching it into a graph actively
+hurts. Whatever the wrapper does per call is invisible next to the kernel.
 
-**The coin-flip in the event numbers is real, not noise.** Single-launch 8192鲁 ranged 1.54 to
-2.06 ms across 20 samples with a stable clock, which is why "median of 20" and "min of 20" give
-534 and 714 for the same run.
+**The output buffer is not the issue either.** Rotating over eight distinct `C` tensors is
+identical to reusing one (2.007 vs 2.006 ms at 8192鲁), so there is no write-after-write
+serialisation.
 
-**ncu disagrees with every event measurement and should not be used as a throughput anchor.**
-It reports 1.09 ms at 8192鲁, which no event run reproduces. Its per-unit percentages are still
-the best evidence about *where* the time goes, which is why they are quoted above, but its
-duration is not comparable.
+**4096鲁 and 8192鲁 differ because of L2, and nothing else.** Both run the same tile and the same
+code. At 4096鲁 the two fp4 operands (32 MB each) plus the fp32 output (64 MB) total 128 MB, which
+is exactly this part's L2; the operands stay resident across the K loop and the kernel reaches
+**836 TF/s**. At 8192鲁 the output alone is 268 MB, so it evicts the operands and every K
+iteration refetches them from HBM; the kernel settles at **545 TF/s**. That is a 35 % swing from
+cache residency on identical compute.
 
-The honest reporting is therefore a pair: **single-launch best-case 865 TF/s at 4096虏脳8192,
-and sustained back-to-back 425-560 TF/s depending on shape, settling at ~546 for the large
-shapes.** For prefill (one big GEMM) use the first; for decode (many small GEMMs in a row) use
-the second.
+Even so it is **not a bandwidth problem at 8192鲁**: 336 MB of traffic over 2.0 ms is 167 GB/s
+against a measured 1273 GB/s copy rate, i.e. 13 % of peak. The cost of the L2 miss here is
+latency that a three-stage pipeline cannot fully hide, not throughput.
 
-## Steady-state across shapes, back-to-back
+**ncu's duration is not usable as a throughput anchor.** It reports 1.08 ms at 8192鲁, stable
+across launches, where every event measurement and the CUDA graph agree on 2.0 ms. Its unit
+percentages are still the best evidence about *where* time goes, which is why they are quoted
+above, but its duration is discarded.
 
-Batch of 20, preallocated `C`, median of 3 batches, clock/power sampled per shape:
+The honest reporting is therefore a pair: **835-865 TF/s when the operands stay in L2, 545 TF/s
+when they do not.** For prefill on shapes up to ~4096鲁 use the first; for larger shapes, and for
+decode loops, use the second.
 
-| shape | ms | TF/s | clk | W |
-|---|---|---|---|---|
-| 4096鲁 | 0.323 | 425.1 | 2325 | 97.5 |
-| 4096虏脳8192 | 0.491 | 560.0 | 2325 | 97.5 |
-| 4096虏脳16384 | 0.979 | 561.4 | 2325 | 97.5 |
-| 8192虏脳4096 | 1.012 | 543.0 | 2325 | 97.5 |
-| 8192鲁 | 2.013 | 546.2 | 2325 | 97.5 |
-| 16384鲁 | 16.060 | 547.7 | 2325 | 97.4 |
+## Steady-state across shapes
 
-Apart from the small 4096鲁 (hurt by the per-launch gap) everything lands in **543-561 TF/s**,
-which is the sustained ceiling for this kernel on this card.
+Warmup 5, then 40 calls with events around the whole block; reproduced three times:
+
+| shape | ms | TF/s | L2 state |
+|---|---|---|---|
+| 4096鲁 | 0.164 | **835.9** | A+B+C = 128 MB, all resident |
+| 4096虏脳8192 | 0.318 | **865.2** | operands 32 MB each, resident |
+| 4096虏脳16384 | 0.979 | 561.4 | operands 64 MB each, partially resident |
+| 8192虏脳4096 | 1.012 | 543.0 | C 268 MB evicts the operands |
+| 8192鲁 | 2.025 | 542-544 | as above |
+| 16384鲁 | 16.060 | 547.7 | nothing resident |
+
+The pattern is entirely explained by whether the fp4 operands survive in L2. Everything above
+about 128 MB of combined footprint lands in **540-560 TF/s**; everything below it reaches
+**835-865**. There is no separate "large shape" penalty.
 
 ## The tile axis is closed at 128/128/128, stages 3
 
@@ -130,15 +143,36 @@ one block per SM. `BK=256` with `stages=3` does not even launch.
 ## Where the ceiling actually is
 
 The `4096虏脳32768` probe (C L2-resident, long K) returns 712 TF/s, *below* 4096鲁, because
-32768 columns make each operand 64 MB and the pair stops fitting in L2. So the ranking is:
+32768 columns make each operand 64 MB and the pair stops fitting in L2 閳?the same eviction
+effect, caught in the act. So the ranking is:
 
-- operands and C together fit in L2 (4096虏脳8192) 閳?**865 TF/s**, the best observed
-- operands fit but C streams (8192虏脳4096) 閳?817 single-shot
-- neither fits (16384鲁) 閳?548, and sustained is the same 546
+- operands and output fit in L2 (4096鲁, 4096虏脳8192) 閳?**836-865 TF/s**, the best observed
+- output evicts the operands (8192虏脳4096, 8192鲁, 16384鲁) 閳?**543-561 TF/s**
+- long K pushes the operands themselves out (4096虏脳32768) 閳?712 TF/s
 
 That makes **865 TF/s a floor on the NVFP4 peak**, and the derived 592 TF/s (`296 脳 2`) is low
 by **at least 46 %**. The `precision_roofline_all_stacks.md` peak table needs an FP4 correction,
-and the correct worked example is 865, not 592 or 776.
+and the correct worked example is 865, not 592 and not 776.
+
+## How to close the 545 -> 865 gap
+
+The eviction penalty is latency, not bandwidth: at 8192鲁 the kernel moves 336 MB in 2.0 ms
+(167 GB/s, 13 % of peak) yet loses 35 %. Three-stage pipelining does not cover the HBM latency
+once every K iteration misses. The levers, in order of promise:
+
+1. **Keep the operands resident across the K loop** by splitting the output into column blocks
+   and iterating those outermost, so C for one block is small enough not to evict A/B. This
+   turns the 8192鲁 case into a sequence of 8192虏脳256-ish calls, but adds A/B re-reads.
+2. **More pipeline depth**, which is blocked by the 99 KiB smem budget at this tile. A shorter
+   BK frees smem for stages but costs MMA efficiency, and `BK=64` measured 503 TF/s, so this
+   route is closed at 128/128.
+3. **A persistent kernel** that keeps the grid resident and loops over tiles internally,
+   avoiding re-entry. `clusters_free_multicast_broken.md` and `clc_compiles_to_nothing.md` both
+   record that the hardware-assisted versions of this are unavailable here, but a plain
+   persistent loop was never tried for this kernel.
+
+None of these is measured yet. The 865 figure assumes the operands fit, which is true for
+prefill on 4096-class shapes and false for 8192-class ones.
 
 ## When needed (trigger)
 
@@ -148,15 +182,18 @@ the tensor cores better". The answer to the last one is no.
 
 ## Gotchas
 
-- **Never quote a TF/s number without its protocol.** This single kernel spans 425-865 TF/s
+- **Never quote a TF/s number without its protocol.** This single kernel spans 508-865 TF/s
   depending purely on how it is timed.
 - `out_idx=[4]` allocates a fresh C per call. At 8192鲁 that is 268 MB and it dominates the
   measurement. Preallocate and pass C in.
-- Do not use `ncu` durations as throughput; it reports 1.09 ms at 8192鲁 where events say 1.54.
-  Use it for unit utilisation only.
+- **CUDA graphs make this kernel slower, not faster** (4096鲁: 0.164 閳?0.270 ms). Do not reach
+  for graph capture to close a launch-overhead gap here; there is no such gap to close.
+- Do not use `ncu` durations as throughput; it reports 1.08 ms at 8192鲁 where events and graphs
+  agree on 2.0. Use it for unit utilisation only.
 - `BK=256` + `stages=3` fails to launch on the 99 KiB budget.
-- The per-launch gap (~0.15 ms) is what makes small shapes look bad. If you need 4096鲁
-  throughput, keep the kernel resident rather than relaunching.
+- **Measure the shape you care about, in the order you will run it.** An earlier round measured
+  4096鲁 at 425 TF/s purely because a larger shape had run first and left L2 in a different
+  state; the same kernel in a fresh process gives 836.
 
 ## Sources
 
