@@ -115,3 +115,18 @@ See [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md). The sam
 - RTX 6000D, compute capability **(12, 0)** = sm_120a, 85651 MiB per card, no NVLink between them
 - `lmsysorg/sglang:dev` container: cutlass **4.8.0**, torch 2.14.1+cu130, CUDA 13.0.3
 - TileLang readings quoted in this tree come from `~/tlvenv` (tilelang 0.1.15)
+- **Clock / power: leave the SM clock alone.** `nvidia-smi` reports `clocks.max.sm 2430 MHz`,
+  a 600 W limit, and ~1995 MHz at idle. Pinning the SM to its 2430 maximum
+  (`nvidia-smi -i 0 -lgc 2430,2430`) makes a loaded GPU hit the **600 W cap at ~2385 MHz**
+  and *halves* throughput instead of raising it:
+
+  | shape | free clocks (1995 idle / 2385 under load) | `-lgc 2430,2430` |
+  |---|---|---|
+  | fp16 4096³ | **143.1 TF/s** | 72.3 |
+  | fp8 4096³ | **281 TF/s** (earlier run) | 134.1 |
+
+  The lock was reverted (`-rgc`) and the 1995 numbers reproduce exactly
+  (71.3 / 172.0 / 143.1 TF/s at 1024³ / 2048³ / 4096³). So this card is **power-limited,
+  not clock-limited**: the number to tune against is the free-running one, and pinning the
+  clock is an anti-optimisation here. Any TF/s figure in this tree without a clock lock is
+  the free-running reading.
