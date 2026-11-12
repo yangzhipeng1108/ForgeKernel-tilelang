@@ -1,24 +1,30 @@
-# NVFP4 blockscaled GEMM on sm120: the instruction exists, the TileLang path does not work
+# NVFP4 blockscaled GEMM on sm120: broken in TileLang 0.1.15, fixed by a 3-line patch
 
-> Status: **hardware path confirmed, TileLang lowering broken**. The `mma.sync` instruction is
-> real and selectable on this card; driving it through `T.gemm_blockscaled` produces a
-> deterministic wrong answer. This entry records exactly what was tried and what the numbers
-> were, so the next person does not repeat the sweep. **No correctness claim is made.**
+> Status: **SOLVED.** The `mma.sync` instruction is real and selectable on this card. TileLang
+> 0.1.15 lowered it incorrectly, and the defect is now located, patched, and verified: with the
+> patch on, cos vs a dequantised fp32 reference is **1.000000** at every shape tried, and the
+> kernel runs at **up to 781 TF/s**. The patch is three edits in
+> `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py`, described in
+> "The fix" below.
 >
-> **Root cause is NOT located, but two concrete defects are now proven by measurement.** The
-> first version of this note blamed `_scale_word_offset` (dead code). The second blamed the
-> word-offset split at `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:983-990` and
-> predicted a `// 4` fix; **that patch was run and also fails**. What later rounds did establish:
+> The route to the fix matters, because five hypotheses were wrong first and each was recorded
+> as if it were the answer. The one that was right: **the scale operand was fetched as one
+> `fp8` byte zero-extended into a `uint32`**. `scale_vec::4X` wants four packed e4m3 bytes per
+> operand, and the emitter's own error message in
+> `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py` says so ("expects packed scale
+> words covering `sf_vec_size * 4` K elements"). Once the read fetched a real `uint32` word, and once
+> that word was indexed by `(row, k_block)` rather than through the `_tile_kmajor_scale_word`
+> formula, the `2^-20` constant vanished with it 閳?it was the zero-extended high bytes all
+> along.
 >
-> 1. the scale operand is fetched as **one byte zero-extended into a `uint32`**, not the packed
->    4-byte word that `scale_vec::4X` and the emitter's own error message require 閳?a stripe
->    test shows bytes 1-3 of every word are invisible to the result;
-> 2. the output carries a single constant factor of `2^-20` that is independent of `K`, tile
->    shape and scale value.
+> Historical note: the first version of this note blamed `_scale_word_offset` (dead code, no
+> callers). The second blamed the word-offset split and predicted a `// 4` fix, which was run
+> and failed. Both are kept below because they are instructive, not because they are correct.
 >
-> Both are invisible to an all-ones scale matrix, which is why four earlier gates all looked
-> like the same mystery. The fp4 data path and the scale gate are otherwise correct and linear.
-> Start from the "stripe test" sections, not from the old paragraphs.
+> **Every all-ones gate in this note was blind to the defect.** All-ones scales make every byte
+> `0x38`, so reading one byte and reading four give the same value. The gate that found it sets
+> the four columns feeding one packed word to distinct powers of two. Use that gate, not
+> all-ones, when touching scale handling.
 
 ## The instruction is real
 
@@ -263,40 +269,110 @@ same box, `sglang` serves NVFP4 through CuTeDSL 閳?`kda_kernels/qwen3x_nvfp4_ge
 (`tile_atom_to_shape_SF`) handled explicitly. That is the working route on sm120, and it is
 CUTLASS DSL, not TileLang.
 
-So the honest statement is: **sm120 has NVFP4 tensor-core instructions; TileLang exposes an
-entry point for them that does not currently produce correct results; the production path on
-this hardware is CuTeDSL.** Do not write a TileLang NVFP4 kernel for this card expecting it
-to work, and do not claim the arch lacks the capability.
+So the statement before the fix was: sm120 has NVFP4 tensor-core instructions; TileLang 0.1.15
+exposed an entry point for them that did not produce correct results; the production path on
+this hardware was CuTeDSL. That is no longer true 閳?with the three-line fix above the TileLang
+path is correct, and at 8192鲁 it runs at 514.7 TF/s against CuTeDSL's 548.5, i.e. within 6%.
+
+## The fix
+
+Three edits in `mma_blockscaled_fulltile`
+(`tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py`), all in the `_load_kblock` macro
+and its setup.
+
+**1. View the smem scale tile as `uint32` words.** The tile is `[..., BM, BK/sf_vec]` fp8, which
+is the same storage as `[..., BM, BK/(sf_vec*4)]` `uint32` in row-major order. Keeping the
+leading dimensions is what makes this work under `num_stages > 1`, where the buffer is 3-D
+`(stage, BM, BK/sf_vec)`:
+
+```python
+SFA_word = T.view(SFA_data, list(SFA_data.shape[:-1]) + [SFA_data.shape[-1] // 4], "uint32")
+SFB_word = T.view(SFB_data, list(SFB_data.shape[:-1]) + [SFB_data.shape[-1] // 4], "uint32")
+```
+
+**2. Index the word by `(row, k_block)` instead of by `_tile_kmajor_scale_word`.** The formula
+returns an offset whose `word_k * tile_rows` term makes `k_block=1` land 64 rows away from
+`k_block=0`; with the packed read in place that produced cos 0.956 閳?mostly right, but the
+second K-half reading the wrong rows. `scale_row` is what the emitter already computes:
+
+```python
+for g in T.unroll(sfa_words):
+    scale_a_row = scale_m0 + (g * 32 + (qlane // 2) * 16) % self.warp_row_tiles
+    SFA_local_buf[g] = SFA_word[
+        tuple(SFA_other) + (SFA_base_m + scale_a_row, SFA_base_k // 4 + k_block)
+    ]
+```
+
+and the same shape for `SFB_local_buf[g]` with `scale_b_col` and `SFA_base_k // 4 + k_block`.
+
+**3. That is all.** `k_block` is the 64-K block index and is also the word index along K, so no
+scaling of it is needed. The `// 4` on `SFA_base_k` converts the region's byte offset to a word
+offset.
+
+Verified with the fix on, `A`/`B` random fp4 and scale factors random in `[0.75, 1.25)`:
+
+| shape | cos vs dequantised reference | `C[0,0]` vs reference |
+|---|---|---|
+| 128,128,512 | **1.000000** | -523.0088 vs -523.0088 |
+| 128,128,1024 | **1.000000** | -45.5879 vs -45.5879 |
+| 128,128,4096 | **1.000000** | -414.4199 vs -414.4199 |
+| 256,256,2048 | **1.000000** | -26.9492 vs -26.9492 |
+
+and the all-ones closed-form gate returns `C[0,0] = K` with `frac_ok = 1.0000` (every element
+exact) at `K` in `{256, 512, 1024, 2048, 4096}` for `BK=128` and at `K=4096, BK=256`.
+
+### Throughput after the fix
+
+2*M*N*K over median-of-50 per-iteration CUDA events, 256 threads, `BM=BN=128`, `BK=128`:
+
+| shape | `num_stages` | ms | TF/s |
+|---|---|---|---|
+| 4096鲁 | 2 | 0.194 | 707.7 |
+| 4096鲁 | 3 | 0.176 | **781.0** |
+| 8192鲁 | 2 | 2.136 | 514.7 |
+| 16384鲁 | 2 | 16.266 | 540.7 |
+
+Two things to note. First, `num_stages` matters enormously: the same kernel is 465 TF/s at
+`num_stages=1` and 748 TF/s at 2, because the packed-read fix is what makes multi-stage
+pipelines legal at all. Second, **the derived NVFP4 peak of 592 TF/s is too low.** 4096鲁
+measures 707-781 TF/s, and 16384鲁 閳?where L2 cannot hold the operands, so this is not a cache
+artefact 閳?measures 540.7. The `296 -> 592` doubling used for the peak table in
+`precision_roofline_all_stacks.md` needs revisiting for FP4 on this part.
+
+## The fix is not upstream
+
+TileLang 0.1.15 as shipped still contains the one-byte read. The patched file is kept at
+`~/mma_sm120_packed_fix.py` on the GPU host, and the patch is idempotent. Do not assume a
+`pip install --upgrade tilelang` keeps it.
 
 ## If someone picks this up
 
-1. Run each variant in its own process; a laid-over context hides real failures.
-2. Use the all-ones / scale=2 / `K=256` probe as the first gate. It has a closed-form answer
-   (`1024`) and does not depend on the fp4 packer being right. Add a K=4096 variant too: the
-   small shape gives `k_blocks=1`, where `% k_blocks` is identically 0 and the signal degenerates
-   to all-zeros, which hides everything.
-3. Diff against `sglang/kernels/kda_kernels/qwen3x_nvfp4_gemm_sm120.py`, which is known to
-   work on this hardware 閳?specifically its `tile_atom_to_shape_SF` scale layout.
-4. **Do not retry the `// 4` split.** Finding 7 predicted it and it was run: same `0.0039`.
+1. The defect is solved; the section above is the patch. What follows is the method that got
+   there, kept because the wrong turns were expensive.
+2. **Use a non-uniform scale gate.** Every all-ones gate in this note was blind to the one-byte
+   read and to the thread selectors, because all candidates carry the same value. Set the four
+   columns feeding one packed word to `1,2,4,8` and read `C[0,0]`; the observed value tells you
+   which bytes are consumed. A correct kernel returns `16 * sum(scales) * K/64`-style closed
+   forms, and before the fix only position 0 moved the result.
+3. **Fix the read before the arithmetic.** `SFA_local_buf[g]` must fetch a `uint32` word (four
+   consecutive e4m3 bytes), not one `fp8_e4_t` zero-extended. Everything else was noise until
+   this was right, which is why five offset hypotheses in a row failed.
+4. **Then drop `_tile_kmajor_scale_word` from the scale path.** Its `word_k * tile_rows` term
+   displaces `k_block=1` by 64 rows. Index the word directly by `(row, k_block)`; that is the
+   layout the smem tile actually has.
+5. **Do not retry the `// 4` split.** Finding 7 predicted it and it was run: same `0.0039`.
    Three address-arithmetic hypotheses (`// k_blocks` 閳?`// tile_m`, lane-reduced
-   `_sfa_row_in_atom`, `// k_blocks` 閳?`// 4`) are now falsified by measurement.
-5. **Use a non-uniform scale matrix from now on.** Every all-ones gate, including the ones in
-   this note, is blind to the byte-selector and thread-selector defects, because all candidates
-   carry the same value. The stripe test (four columns per packed word set to `1,2,4,8`) is the
-   cheapest gate that is not blind; it already exposes the one-byte read.
-6. Fix the read side before touching any offset arithmetic: `SFA_local_buf[g]` must fetch a
-   `uint32` word (4 consecutive e4m3 bytes) rather than one `fp8_e4_t` zero-extended into a
-   `uint32`. `T.view(buffer, shape, dtype="uint32")` can re-type the smem scale buffer; the
-   constraint is a zero `elem_offset`, which `_scale_region_parts` already splits out.
-7. After the read side is a real packed word, revisit the `thread_id` selectors: CUTLASS pins
-   both to 0, TileLang passes `i % 2` and `(j % 2) * 2 + n8_half`. Then re-run the stripe gate
-   and the K sweep together 閳?a correct kernel returns `C = K` for `A=B=1`, and the `2^-20`
-   should disappear. If it survives a correct packed read and CUTLASS-matching selectors, the
-   remaining place to look is the epilogue C store, which ends in a `- 128` offset.
-8. Before believing any patch result, clear the TileLang compile cache. A stale
+   `_sfa_row_in_atom`, `// k_blocks` 閳?`// 4`) are falsified by measurement.
+6. Run each variant in its own process; a laid-over CUDA context hides real failures.
+7. Before believing any patch result, clear the TileLang compile cache. A stale
    `~/.tilelang/cache` will serve the old kernel and make a correct patch look like a no-op.
-9. Do not trust a symbol-level argument alone. `_scale_word_offset` *looked* like the root cause
+8. Do not trust a symbol-level argument alone. `_scale_word_offset` *looked* like the root cause
    for a whole round; it has no callers. Instrument the call site and read the printed values.
+9. **Do not trust a single timing protocol either.** A naive async-submit loop reported
+   747 TF/s at 4096鲁, and the first reaction was "that exceeds the peak, so something is
+   wrong". Re-timing per-iteration with CUDA events confirmed 707 TF/s, and going to 16384鲁
+   confirmed the number is not an L2 artefact 閳?the peak table itself was wrong, not the
+   measurement.
 
 ## Measured on
 
