@@ -334,10 +334,11 @@ exact) at `K` in `{256, 512, 1024, 2048, 4096}` for `BK=128` and at `K=4096, BK=
 
 Two things to note. First, `num_stages` matters enormously: the same kernel is 465 TF/s at
 `num_stages=1` and 748 TF/s at 2, because the packed-read fix is what makes multi-stage
-pipelines legal at all. Second, **the derived NVFP4 peak of 592 TF/s is too low.** 4096鲁
-measures 707-781 TF/s, and 16384鲁 閳?where L2 cannot hold the operands, so this is not a cache
-artefact 閳?measures 540.7. The `296 -> 592` doubling used for the peak table in
-`precision_roofline_all_stacks.md` needs revisiting for FP4 on this part.
+pipelines legal at all. Second, **the derived NVFP4 peak of 592 TF/s is too low 閳?by a lot.**
+A later round with a cleaner protocol (`nvfp4_gemm_throughput_and_tile_sweep.md`) reaches
+**865 TF/s** at 4096虏脳8192 and shows that these event-loop numbers understate single-launch
+throughput, because a fresh output tensor is allocated per call and there is a fixed ~0.15 ms
+gap between launches. Read those numbers for the correctness story, not as a ceiling.
 
 ## The fix is not upstream
 

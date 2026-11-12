@@ -43,8 +43,9 @@ cannot be double-precision throughput** (measured 1.06 TF/s, a 70× gap), so the
 | NVFP4 | CuTeDSL 2048×4096×4096 | **847.6** | 143 % ⚠ | see below: M=2048 only |
 | NVFP4 | CuTeDSL 4096³ | 504.9 | 85 % | wave-quantized |
 | NVFP4 | CuTeDSL 8192³ | 548.5 | 93 % | large shape recovers |
-| **NVFP4** | **TileLang `T.gemm_blockscaled` 4096³** | **775.7** | **131 % of 592** | fixed; 128/128/128 st3 |
-| NVFP4 | TileLang `T.gemm_blockscaled` 8192³ | 531.0 | 90 % of 592 | fixed; same stack, larger shape |
+| **NVFP4** | **TileLang `T.gemm_blockscaled` 4096²×8192** | **865.2** | **146 % of 592** | fixed; single launch, L2-resident |
+| NVFP4 | TileLang `T.gemm_blockscaled` 4096³ / 8192³ | 792 / 714 | 134 / 121 % | fixed; single launch |
+| NVFP4 | TileLang `T.gemm_blockscaled` back-to-back | 543–561 | 92–95 % | fixed; batch of 20, sustained |
 | FP64 | cuBLAS | **1.06** | — | CUDA cores only, no fp64 tensor core |
 | FP32 (true) | cuBLAS (`allow_tf32=False`) | **44.93** | 30 % of 148 | CUDA cores |
 | MXFP4 | CuTeDSL MX path | (511) | — | **runs-but-wrong**, cos 0.03 |
@@ -53,12 +54,17 @@ cannot be double-precision throughput** (measured 1.06 TF/s, a 70× gap), so the
 Derived peak column: FP16 = 148, FP8 = 296, FP16-sparse = 296, NVFP4 = 592. See
 "Where the nameplate sits" for why these are the right denominators.
 
-> **The NVFP4 peak is wrong.** Two independent measurements now exceed 592 TF/s: CuTeDSL at
-> M=2048 (847.6) and TileLang at 4096³ (775.7, `cos` 1.000000, both operands and C L2-resident).
-> A 30 % overshoot is not wave quantization 閳?it means the `296 脳 2` derivation does not hold
-> for FP4 on this part. Until a cleaner probe lands, treat **776 TF/s as the working NVFP4
-> denominator**, and read the FP16/FP8 rows of this table as the ones the nameplate actually
-> pins down. Details in `nvfp4_gemm_throughput_and_tile_sweep.md`.
+> **The NVFP4 peak is wrong.** Three independent measurements exceed 592 TF/s: CuTeDSL at
+> M=2048 (847.6), and the fixed TileLang kernel at 4096²×8192 (865.2, `cos` 1.000000) and
+> 4096³ (792). A 46 % overshoot is not wave quantization 閳?it means the `296 脳 2` derivation
+> does not hold for FP4 on this part. Use **865 TF/s as the working NVFP4 floor**, and read the
+> FP16/FP8 rows of this table as the ones the nameplate actually pins down.
+>
+> Note the TileLang rows carry a protocol caveat that no other row does: the same kernel
+> sustains only 543-561 TF/s when launched back to back, because there is a ~0.15 ms gap
+> between launches. Single-launch is the right basis for comparing against cuBLAS/CuTeDSL,
+> which are also measured single-shot, but decode loops must use the sustained figure.
+> Details in `nvfp4_gemm_throughput_and_tile_sweep.md`.
 
 ## The three traps, in the order they bit
 
