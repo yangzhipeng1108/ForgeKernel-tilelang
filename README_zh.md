@@ -76,8 +76,8 @@ ForgeKernel 属于 **Forge 家族**，同一家族的项目还有
 **环境要求。** 运行 `forge` 的机器：Linux 或 macOS、Python ≥ 3.11、git，以及
 [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) CLI（已登录，或设置
 `ANTHROPIC_API_KEY`）；任务没有参照时还需要 tmux。GPU 机器（同一台或一台 ssh 主机）：NVIDIA
-Hopper（`sm90`）或 Blackwell（`sm100`）GPU，`python3` 带 CUDA 版 PyTorch，CuTe DSL 任务还需要
-`nvidia-cutlass-dsl`；建议装 Nsight Compute（`ncu`），没有它时运行只按计时推进。
+Hopper（`sm90`）或 Blackwell（`sm100`、`sm120`）GPU，`python3` 带 CUDA 版 PyTorch，CuTe DSL 任务还需要
+`nvidia-cutlass-dsl`，TileLang 任务需要 `tilelang`；建议装 Nsight Compute（`ncu`），没有它时运行只按计时推进。
 
 **1. 安装**
 
@@ -86,11 +86,12 @@ cd ForgeKernel                   # 本仓库的 clone
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 pip install nvidia-cutlass-dsl   # 建议安装，见下
+pip install tilelang             # 只有 TileLang 任务需要
 forge --version                  # forgekernel 0.1.0
 ```
 
 coding agent 离线工作；把 `nvidia-cutlass-dsl` 装在 ForgeKernel 旁边，它才能读到要用的 CuTe
-DSL API。
+DSL API；TileLang 任务同理，需要 `tilelang` 可导入。
 
 **2. 告诉它 GPU 在哪**
 
@@ -147,7 +148,7 @@ forge run .artifacts/rmsnorm_<id>                       # 中断后续跑
 | arch agent | *teacher*（`task.toml` 的 `[agent.teacher]`） |
 | coding agent | *student*（`[agent.student]`） |
 | campaign | 一次运行，`.artifacts/<op>_<id>/` |
-| 知识库 | `hw_kb/cutedsl/`（CuTe DSL）、`hw_kb/cuda/`（CUDA C++） |
+| 知识库 | `hw_kb/cutedsl/`（CuTe DSL）、`hw_kb/cuda/`（CUDA C++）、`hw_kb/tilelang/`（TileLang） |
 
 > 设计说明 → [docs/design/milestone-distillation.md](docs/design/milestone-distillation.md)，
 > milestone 格式 → [docs/milestones-template.md](docs/milestones-template.md)
@@ -158,7 +159,7 @@ forge run .artifacts/rmsnorm_<id>                       # 中断后续跑
 
 - `description.md`：完整描述算子（签名、语义、合法输入）。teacher 只凭这个文件写正确性判据。
 - `shapes.json`：要优化的 shape；每个 shape 的每个输入组都会判对错和计时。
-- `task.toml`：语言（`cutedsl` 或 `cuda`）、GPU 架构、参照、目标、模型、预算。
+- `task.toml`：语言（`cutedsl`、`cuda` 或 `tilelang`）、GPU 架构、参照、目标、模型、预算。
 
 参照决定模式：
 
@@ -220,23 +221,33 @@ forge export .artifacts/rms_<id> --out solution.json
 
 每个 kernel 的加速、对比对象与运行环境见 [kernels/README_zh.md](kernels/README_zh.md)。
 
+另有一组 RTX 6000D（`sm120`）的 kernel，来自论文之后的 TileLang 模式运行：9 个 TileLang kernel
+（`kernel_tl.py`：FP16/FP8/split-K/distributed lm_head GEMM、causal/GQA/MLA paged attention、RMSNorm）
+和一个 CuTe DSL 的 NVFP4 GEMM（`kernel.py`）。它们不是新算子，而是把 `hw_kb/tilelang/sm120/` 里
+测赢的配方固化成可复用模块，每个都以 `cos ~ 1.0` 复现了对应配方的数字。见
+[kernels/sm120_README.md](kernels/sm120_README.md)。
+
 ## 实验环境
 
 论文实验使用的 GPU 与软件如下。大部分实验用的是每种 GPU 的主镜像：
 
-| | Hopper | Blackwell |
-|---|---|---|
-| GPU | NVIDIA H100 80 GB HBM3 SXM，132 个 SM（`sm_90a`） | NVIDIA B200，180 GB HBM3e，148 个 SM（`sm_100a`），1000 W，SM 最高频率 1965 MHz |
-| 驱动 | 550.90.07 | 580.105.08 |
-| CUDA toolkit | 12.8 | 13.1（`nvcc` 13.1.115） |
-| PyTorch | 2.6.0a0（NGC 25.01） | 2.10.0+cu130 |
-| CuTe DSL（`nvidia-cutlass-dsl`） | 4.4.2 | 4.4.2 |
-| Nsight Compute（`ncu`） | 2025.1 | 2025.4.1 |
-| cuDNN | 9.7 | 9.19.1 |
+| | Hopper | Blackwell | Blackwell（论文之后） |
+|---|---|---|---|
+| GPU | NVIDIA H100 80 GB HBM3 SXM，132 个 SM（`sm_90a`） | NVIDIA B200，180 GB HBM3e，148 个 SM（`sm_100a`），1000 W，SM 最高频率 1965 MHz | NVIDIA RTX 6000D，156 个 SM（`sm_120a`），600 W |
+| 驱动 | 550.90.07 | 580.105.08 | 610.43.02 |
+| CUDA toolkit | 12.8 | 13.1（`nvcc` 13.1.115） | 13.3 |
+| PyTorch | 2.6.0a0（NGC 25.01） | 2.10.0+cu130 | 2.15.0+cu132 |
+| CuTe DSL（`nvidia-cutlass-dsl`） | 4.4.2 | 4.4.2 | — |
+| TileLang | — | — | 0.1.15（源码构建，见 `hw_kb/tilelang/sm120/mxfp4_source_build_state.md`） |
+| Nsight Compute（`ncu`） | 2025.1 | 2025.4.1 | 2026.3.0 |
+| cuDNN | 9.7 | 9.19.1 | — |
 
 另有一部分实验用的是第二个镜像：H100 上是 CUDA 13.1、PyTorch 2.10（NGC 25.12）、CuTe DSL 4.6.1；
 B200 上是 CUDA 13.0、PyTorch 2.13、CuTe DSL 4.6.2，Nsight Compute 2025.3.1。所有报告的提升都是
 参照与候选在同一个 GPU 作业里计时得到的，因此比较结果不受实验所用镜像的影响。
+
+RTX 6000D 一列在论文之后加入，用于 TileLang 模式：该卡各精度的实测吞吐、峰值占比与正确性
+（cosine 校验）整理在 [`hw_kb/tilelang/sm120/precision_roofline_all_stacks.md`](hw_kb/tilelang/sm120/precision_roofline_all_stacks.md)。
 
 ## 仓库结构
 
@@ -251,7 +262,7 @@ tasks/               <op>/：task.toml、description.md、shapes.json、referenc
 skills/              agent 用的工具，每个一份 SKILL.md 加脚本，每轮开始前镜像到
                      agent 工作目录的 .claude/skills/
 meta/                teacher 与 student 的 prompt（meta/cuda/：CUDA C++）
-hw_kb/               硬件知识库（cutedsl/、cuda/），按 GPU 架构组织
+hw_kb/               硬件知识库（cutedsl/、cuda/、tilelang/），按 GPU 架构组织
 docs/                设计说明、milestone 模板、榜单、知识库收割
 scripts/             agent 启动脚本、/goal 驱动、自进化
 tests/               pytest 测试（只需 CPU）

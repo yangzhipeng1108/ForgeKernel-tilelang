@@ -86,9 +86,9 @@ Show me the plan it prints.
 **Requirements.** The machine you run `forge` on: Linux or macOS, Python ≥ 3.11, git, and the
 [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) CLI (logged in, or an
 `ANTHROPIC_API_KEY`); tmux if a task has no reference. The GPU machine (the same one, or an ssh
-host): an NVIDIA Hopper (`sm90`) or Blackwell (`sm100`) GPU, `python3` with a CUDA build of
-PyTorch and, for CuTe DSL tasks, `nvidia-cutlass-dsl`; Nsight Compute (`ncu`) is recommended,
-and without it a run proceeds on timings alone.
+host): an NVIDIA Hopper (`sm90`) or Blackwell (`sm100`, `sm120`) GPU, `python3` with a CUDA build of
+PyTorch and, for CuTe DSL tasks, `nvidia-cutlass-dsl`, for TileLang tasks `tilelang`; Nsight Compute
+(`ncu`) is recommended, and without it a run proceeds on timings alone.
 
 **1. Install**
 
@@ -97,11 +97,12 @@ cd ForgeKernel                   # a clone of this repository
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 pip install nvidia-cutlass-dsl   # recommended, see below
+pip install tilelang             # only TileLang tasks need it
 forge --version                  # forgekernel 0.1.0
 ```
 
 The coding agent works offline; installing `nvidia-cutlass-dsl` next to ForgeKernel is how it
-reads the CuTe DSL API it writes against.
+reads the CuTe DSL API it writes against. TileLang tasks likewise need `tilelang` importable.
 
 **2. Say where the GPU is**
 
@@ -164,7 +165,7 @@ distillation policy. The paper's terms map onto the code as follows:
 | arch agent | the *teacher* (`[agent.teacher]` in `task.toml`) |
 | coding agent | the *student* (`[agent.student]`) |
 | campaign | a run, `.artifacts/<op>_<id>/` |
-| knowledge base | `hw_kb/cutedsl/` (CuTe DSL), `hw_kb/cuda/` (CUDA C++) |
+| knowledge base | `hw_kb/cutedsl/` (CuTe DSL), `hw_kb/cuda/` (CUDA C++), `hw_kb/tilelang/` (TileLang) |
 
 > Design notes → [docs/design/milestone-distillation.md](docs/design/milestone-distillation.md),
 > milestone format → [docs/milestones-template.md](docs/milestones-template.md)
@@ -176,7 +177,7 @@ distillation policy. The paper's terms map onto the code as follows:
 - `description.md`: the operator, completely (signature, semantics, legal inputs). The teacher
   writes the correctness judge from this file alone.
 - `shapes.json`: the shapes to optimize for; every shape and every input group is judged and timed.
-- `task.toml`: language (`cutedsl` or `cuda`), GPU architecture, the reference, the target, the
+- `task.toml`: language (`cutedsl`, `cuda` or `tilelang`), GPU architecture, the reference, the target, the
   models, the budget.
 
 The reference decides the mode:
@@ -245,25 +246,36 @@ and GPU:
 The speedup of each kernel, what it was compared against, and the environment it ran in are listed
 in [kernels/README.md](kernels/README.md).
 
+A further set targets the RTX 6000D (`sm120`), from post-paper TileLang-mode runs: nine TileLang
+kernels (`kernel_tl.py`: FP16/FP8/split-K/distributed lm_head GEMM, causal/GQA/MLA paged
+attention, RMSNorm) and one CuTe DSL NVFP4 GEMM (`kernel.py`). They are not new operators but the
+winning recipes of `hw_kb/tilelang/sm120/` fixed into reusable modules, each reproducing its
+recipe's numbers with `cos ~ 1.0`. See [kernels/sm120_README.md](kernels/sm120_README.md).
+
 ## Environment
 
 The paper's experiments ran on the following GPUs and software. Most campaigns used the main
 image of each GPU:
 
-| | Hopper | Blackwell |
-|---|---|---|
-| GPU | NVIDIA H100 80 GB HBM3 SXM, 132 SMs (`sm_90a`) | NVIDIA B200, 180 GB HBM3e, 148 SMs (`sm_100a`), 1000 W, max SM clock 1965 MHz |
-| Driver | 550.90.07 | 580.105.08 |
-| CUDA toolkit | 12.8 | 13.1 (`nvcc` 13.1.115) |
-| PyTorch | 2.6.0a0 (NGC 25.01) | 2.10.0+cu130 |
-| CuTe DSL (`nvidia-cutlass-dsl`) | 4.4.2 | 4.4.2 |
-| Nsight Compute (`ncu`) | 2025.1 | 2025.4.1 |
-| cuDNN | 9.7 | 9.19.1 |
+| | Hopper | Blackwell | Blackwell (post-paper) |
+|---|---|---|---|
+| GPU | NVIDIA H100 80 GB HBM3 SXM, 132 SMs (`sm_90a`) | NVIDIA B200, 180 GB HBM3e, 148 SMs (`sm_100a`), 1000 W, max SM clock 1965 MHz | NVIDIA RTX 6000D, 156 SMs (`sm_120a`), 600 W |
+| Driver | 550.90.07 | 580.105.08 | 610.43.02 |
+| CUDA toolkit | 12.8 | 13.1 (`nvcc` 13.1.115) | 13.3 |
+| PyTorch | 2.6.0a0 (NGC 25.01) | 2.10.0+cu130 | 2.15.0+cu132 |
+| CuTe DSL (`nvidia-cutlass-dsl`) | 4.4.2 | 4.4.2 | — |
+| TileLang | — | — | 0.1.15 (source build, see `hw_kb/tilelang/sm120/mxfp4_source_build_state.md`) |
+| Nsight Compute (`ncu`) | 2025.1 | 2025.4.1 | 2026.3.0 |
+| cuDNN | 9.7 | 9.19.1 | — |
 
 Some campaigns ran on a second image: on H100, CUDA 13.1, PyTorch 2.10 (NGC 25.12) and CuTe DSL
 4.6.1; on B200, CUDA 13.0, PyTorch 2.13 and CuTe DSL 4.6.2 with Nsight Compute 2025.3.1.
 Every reported gain times the reference and the candidate in the same GPU job, so the
 comparison does not depend on which image a campaign used.
+
+The RTX 6000D column was added after the paper for TileLang mode: that card's measured
+per-precision throughput, fraction of peak and correctness (cosine gate) are collected in
+[`hw_kb/tilelang/sm120/precision_roofline_all_stacks.md`](hw_kb/tilelang/sm120/precision_roofline_all_stacks.md).
 
 ## Repository Layout
 
@@ -278,7 +290,7 @@ tasks/               <op>/: task.toml, description.md, shapes.json, reference/;
 skills/              the agents' tools, one SKILL.md + scripts each, mirrored into
                      the agent's .claude/skills/ before every turn
 meta/                teacher and student prompts (meta/cuda/: CUDA C++)
-hw_kb/               the hardware knowledge base (cutedsl/, cuda/), by GPU architecture
+hw_kb/               the hardware knowledge base (cutedsl/, cuda/, tilelang/), by GPU architecture
 docs/                design notes, milestone template, leaderboards, KB
 scripts/             agent launcher, /goal driver, self-evolution
 tests/               pytest suite (CPU only)

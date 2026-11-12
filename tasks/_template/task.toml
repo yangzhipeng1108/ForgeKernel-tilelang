@@ -3,7 +3,7 @@
 # [target], [budget]); write only what changes.
 
 [task]
-language = "cutedsl"                 # cutedsl | cuda
+language = "cutedsl"                 # cutedsl | cuda | tilelang
 arch     = "sm100"                   # the target GPU (sm90, sm100, ...)
 
 # The reference: the implementation to learn from and to beat. Leave the table out and a
