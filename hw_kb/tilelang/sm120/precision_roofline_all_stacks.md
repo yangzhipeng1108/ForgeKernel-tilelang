@@ -5,6 +5,37 @@
 > wall-clock loop (warmup 5, 40 iterations, one `synchronize` at each end). The correctness
 > column is a cosine against an fp32 reference, so a fast-but-wrong kernel cannot pass.
 
+## Overview: precision × stack (RTX 6000D, 4096³, cos-gated)
+
+The one-screen matrix. One row per precision, one column per stack, TF/s at 4096³. This is a
+**transpose of the detailed per-implementation table** below ("Measured on"); where they differ
+in a cell, the detailed table wins. `—` = that stack has no usable tensor-core path for the
+dtype (not "slow": absent). `—†` = cuBLAS exposes no public entry (FP4 / sparse). `⚠` = exceeds
+the derived nameplate (FP4 nameplate 592 is too low — see "Where the nameplate sits"). `~` =
+approximate (same compute path as the row above; not separately timed).
+
+| precision | nameplate | cuBLAS | CuTeDSL | TileLang |
+|---|---|---|---|---|
+| FP16 dense | 148 | 133.1 | **143.1** | 131.1 |
+| BF16 dense | 148 | 130.7 | ~143 (same as fp16) | 132.2 |
+| FP8 e4m3 | 296 | **285.3** | 281.1 | 272.9 |
+| FP8 e5m2 | 296 | — (unsupported) | — | 271.6 |
+| NVFP4 | 592 | —† | 504.9 | **835.9** ⚠ |
+| MXFP4 | 592 | —† | **509.6** | not runnable (cos 0.59) |
+| MXFP8 | 296 | —† | **256.5** | not implemented |
+| FP16 2:4 sparse | 296 | —† | — | **262.9** (2.00× dense) |
+| FP8 2:4 sparse | 593 | —† | — | **522.0** (1.91× dense) |
+| TF32 | ~68 (≈148/2) | **65.1** | — | — |
+| FP32 (true, no TF32) | 148 (CUDA core) | **44.93** | — | — |
+| FP64 | 74 (misleading) | **1.06** | — | — |
+
+Reading notes: **MXFP4/MXFP8 numbers are CuTeDSL only** — TileLang's MX is a source-side
+extension in progress (MXFP4 cos 0.59, MXFP8 unimplemented; see `mxfp4_source_build_state.md`),
+so the TileLang MX cells are not performance, they are status. NVFP4 TileLang is the fixed
+kernel (835.9 @ 4096³, 865.2 @ 4096²×8192). cuBLAS has no FP4 or sparse entry, so a blank there
+is **not** "cuBLAS is slower". MXFP8 (256.5) sits below dense FP8 (285) because the MX atom is
+`k=32` against NVFP4's `k=64`.
+
 ## Purpose
 
 The stock question is "what is this card's TF/s per precision, and what fraction of nameplate
@@ -134,14 +165,20 @@ and returns **cos = 0.16** — fast and wrong, exactly the failure mode a timing
 would miss. `E` is one `uint8` per 8 elements of A (`get_e_factor(f16, uint8) = 8`), and A is
 compressed to `K/2`.
 
-## NVFP4 in TileLang does not run
+## NVFP4 in TileLang: was broken, now fixed (historical note)
 
-`T.gemm_blockscaled` compiles and then faults with `misaligned address` at 4096³. This matches
-the source-level finding in `nvfp4_blockscaled_is_broken_in_tilelang.md`: the scale-word offset
-in `mma_sm120_macro_generator._scale_word_offset` disagrees with the hardware layout at 2046 of
-2048 positions, so the SF gather walks outside the tile. Use the CuTeDSL
-`DenseGemmKernel` path (`nvfp4_gemm_computes_correctly.md`) instead; it is the only working
-NVFP4 on this box.
+> **Superseded.** An earlier revision said "`T.gemm_blockscaled` compiles and then faults with
+> `misaligned address`". That was the pre-patch state. The defect is now located and fixed (the
+> scale operand was fetched as one zero-extended fp8 byte instead of the packed uint32 word
+> `scale_vec::4X` needs); with the Python patch, NVFP4 in TileLang runs at cos 1.000000 and up to
+> 865 TF/s — see `nvfp4_blockscaled_is_broken_in_tilelang.md` and the fixed rows in the table
+> above. The CuTeDSL path remains correct and is the reference. Keep this section only as the
+> "why the first NVFP4 TileLang attempt failed" record.
+
+The original symptom: `T.gemm_blockscaled` compiled and then faulted at 4096³; the scale-word
+offset in `mma_sm120_macro_generator._scale_word_offset` disagreed with the hardware layout at
+2046 of 2048 positions, so the SF gather walked outside the tile. The fix is the uint32 scale
+word read, described in `nvfp4_blockscaled_is_broken_in_tilelang.md`.
 
 ## Where the nameplate sits
 
@@ -224,6 +261,17 @@ MX is now **usable**, not "do not use". NVFP4 remains the validated production 4
 the finer UE4M3 block scale for a coarser UE8M0 power-of-two scale (cheaper to quantise, less
 accurate per block). MXFP8 lands under dense fp8. Size work on the NVFP4 rows; use the MX rows
 only when a quantiser already emits UE8M0 scales.
+
+### MX in TileLang (source-side): partial, not usable yet
+
+The table above is **CuTeDSL**. TileLang's own MX is a source-level extension still in progress
+and must not be counted as a working MX path on this box. Built from source (requires pinning
+`TileLang/tvm@4211874e9…` + `tvm-ffi@3c35034f…` — the only TVM pair matching 0.1.15's old ffi
+API), MXFP4 compiles and launches, and the multi-stage crash is fixed, but per-block scale values
+are still misplaced (**cos ≈ 0.59**; cos jumps to 1.0 with all scales set to 1.0, proving the MMA
+itself is right). MXFP8 is wired at the config/PTX/enum level but needs a new 8-bit `m16n8k32`
+ldmatrix layout and is not implemented. Full state, patch list and the remaining defect:
+`mxfp4_source_build_state.md`. **For MX numbers use the CuTeDSL rows, not TileLang.**
 
 ## How to reproduce
 
