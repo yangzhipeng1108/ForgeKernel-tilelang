@@ -15,8 +15,11 @@ reason, so this note pins the whole table down at once:
 2. `do_bench`'s default `backend="event"` reports fp8 ~42 % high on this part,
 3. NVFP4 numbers were compared across different shapes (M=2048 vs 4096³).
 
-With those three fixed, every cell lands at 85–97 % of the derived peak and the table is
-internally consistent. That consistency is the evidence that the peak column is right.
+With those three fixed, the tensor-core rows all land at 85–97 % of the derived peak and the
+table is internally consistent — that consistency is the evidence that the peak column is
+right. Once fp64/fp32 were actually measured, a fourth problem surfaced: **the plate's `74`
+cannot be double-precision throughput** (measured 1.06 TF/s, a 70× gap), so the bottom of the
+`74 / 148 / 296 / 593` chain is not what it looks like either. See "Where the nameplate sits".
 
 ## Measured on
 
@@ -41,6 +44,10 @@ internally consistent. That consistency is the evidence that the peak column is 
 | NVFP4 | CuTeDSL 4096³ | 504.9 | 85 % | wave-quantized |
 | NVFP4 | CuTeDSL 8192³ | 548.5 | 93 % | large shape recovers |
 | NVFP4 | TileLang `T.gemm_blockscaled` | — | — | **broken**, misaligned address |
+| FP64 | cuBLAS | **1.06** | — | CUDA cores only, no fp64 tensor core |
+| FP32 (true) | cuBLAS (`allow_tf32=False`) | **44.93** | 30 % of 148 | CUDA cores |
+| MXFP4 | CuTeDSL MX path | (511) | — | **runs-but-wrong**, cos 0.03 |
+| MXFP8 | CuTeDSL MX path | (234) | — | **runs-but-wrong**, cos 0.04 |
 
 Derived peak column: FP16 = 148, FP8 = 296, FP16-sparse = 296, NVFP4 = 592. See
 "Where the nameplate sits" for why these are the right denominators.
@@ -126,8 +133,8 @@ NVFP4 on this box.
 
 | precision | nameplate (derived) | best measured | % |
 |---|---|---|---|
-| FP64 | 74 | not measured | — |
-| FP32 (CUDA core) | 148 | ~97 theoretical | — |
+| FP64 | 74 | **1.06** | **1.4 %** ⚠ |
+| FP32 (CUDA core) | 148 | **44.93** | 30 % |
 | TF32 | ~68 | 65.1 | 96 % |
 | FP16 dense | 148 | 143.1 | 97 % |
 | FP8 dense | 296 | 285.3 | 96 % |
@@ -135,16 +142,40 @@ NVFP4 on this box.
 | FP8 2:4 sparse | 593 | 522.0 | 88 % |
 | NVFP4 | 592 | 847.6 (M=2048) | 143 % ⚠ |
 
-The one row over 100 % is NVFP4 at M=2048. Either the 2× chain understates the fp4 path (the
-MXFP4/`MmaMXF4NVF4Op` unit may sustain more than 2× FP8 on this arch), or 847.6 is the one
-shape where fill hides enough tail to exceed a nominal peak. Do not use it as the fp4
-denominator; quote 504.9/548.5 against 592 for shipped shapes and treat 847.6 as a
-small-M curiosity.
+Two rows are outside the 85–97 % band, and they are different problems.
+
+**FP64 at 1.06 TF/s is not a tuning gap — the 74 on the plate cannot be fp64.** If it were,
+4096³ would finish in 1.9 ms; cuBLAS takes **129 ms**, 70× longer. This is a consumer die with
+no fp64 tensor core, so fp64 falls back to the CUDA cores and lands at ~1/140 of the fp16
+throughput. Whatever `74` refers to, it is not double-precision GEMM on one of these cards.
+Anyone sizing a milestone on "74 TF/s fp64" is off by two orders of magnitude — measure this
+row before trusting the plate.
+
+FP32 at 44.9 TF/s (true fp32, `allow_tf32=False`) is the honest CUDA-core number; the ~97 in the
+old note was a lane-count estimate that ignores instruction issue. 30 % of the 148 figure is
+expected for core-bound work, and TF32 at 65.1 shows the tensor path is the only way up.
+
+**NVFP4 at M=2048 (143 %)** is the opposite kind of outlier. Either the 2× chain understates the
+fp4 path (the `MmaMXF4NVF4Op` unit may sustain more than 2× FP8 on this arch), or 847.6 is the
+one shape where fill hides enough tail to exceed a nominal peak. Do not use it as the fp4
+denominator; quote 504.9/548.5 against 592 for shipped shapes and treat 847.6 as a small-M
+curiosity.
+
+## MXFP4 / MXFP8: reachable but not yet correct
+
+The CuTeDSL MX path (`DenseGemmKernel` with `sf_vec_size=32` and `Float8E8M0FNU` scales) compiles
+and runs at **511 TF/s (MXFP4)** and **234 TF/s (MXFP8)** at 4096³, but **cosine is 0.03 and 0.04**
+— the kernels compute, the numbers are wrong. The scale tensor wants the same packed SF layout
+NVFP4 uses, and feeding it a row-major `(M, K/32)` uint8 view is silently wrong rather than
+illegal. So these two rows are **runs-but-wrong** and carry no throughput claim; the MX
+throughput would sit between the NVFP4 and FP8 numbers once the layout is derived. Recorded here
+so the gap is visible rather than silently assumed to match NVFP4.
 
 ## How to reproduce
 
 Probes live at
 `C:\Users\yangzhipeng\AppData\Local\Temp\opencode\p21_tl_dense.py` (dense f16/bf16/fp8),
 `p22_tl_sparse.py` (2:4 f16/fp8 with the selector gate), `p23_tl_nvfp4.py` (TileLang NVFP4),
-`p20_nvfp4_shapes.py` (CuTeDSL NVFP4 across shapes), and `p16/p17/p19` (cuBLAS + timing
-backends). All gate on cosine before reporting a speed.
+`p20_nvfp4_shapes.py` (CuTeDSL NVFP4 across shapes), `p24_nongemm.py` (RMSNorm/RoPE/attention/
+LM head), `p25_fp64_fp32_mx.py` (FP64, true FP32, MXFP4/MXFP8), and `p16/p17/p19` (cuBLAS +
+timing backends). All gate on cosine before reporting a speed.
