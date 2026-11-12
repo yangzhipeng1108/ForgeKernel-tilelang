@@ -61,7 +61,7 @@ here name mechanisms that exist only, or differently, on sm120.
 | `cute.nvgpu.warp.MmaMXF8Op` (fp8, `(16,8,32)`, UE8M0 scale) | **MXFP8 GEMM verified**: `md=1.85e-3`, `cos=1.0` | [`blockscaled_three_paths`](blockscaled_three_paths.md) |
 | `cute.nvgpu.warp.MmaMXF4Op` (fp4, `(16,8,64)`, UE8M0 scale) | **MXFP4 GEMM verified exact**: `md=0` | [`blockscaled_three_paths`](blockscaled_three_paths.md) |
 | `cute.nvgpu.warp.MmaF16BF16Op` (fp16 / bf16) | **verified PASS** at 512³, 2048³, 8192³ via the shipped GeForce example | [`warp_mma_bf16_and_fp16`](warp_mma_bf16_and_fp16.md) |
-| `cute.nvgpu.warp.MmaFP8Op` (plain fp8, `(16,8,32)`) | op constructs (arch-neutral) but **no shipped sm120 kernel drives it**; no per-tensor-scaled fp8 GEMM here | [`warp_mma_bf16_and_fp16`](warp_mma_bf16_and_fp16.md) |
+| `cute.nvgpu.warp.MmaFP8Op` (plain fp8, `(16,8,32)`) | **hand-built dense fp8 GEMM now works**: cos 1.0, **281.1 TF/s at 4096³**. `LdMatrix16x16x8bOp` refuses this use, so it reuses `LdMatrix8x8x16bOp(major, 4)`; `tx_count` has no `* 2` because fp8 is one byte | [`probe_sm120_fp8_gemm_multicta.py`](_probes/probe_sm120_fp8_gemm_multicta.py) |
 | `cpasync.*` TMA + bulk-copy family | **all present**; constructor is `make_tiled_tma_atom`, **not** `make_tma_copy`; full fp16 GEMM through TMA **PASS** at 1024³–4096³ | [`tma_and_copy_family`](tma_and_copy_family.md), [`tma_gemm_end_to_end`](tma_gemm_end_to_end.md) |
 | split-K (`split_k_slices > 1`) | **correct only when M ≤ 128** (one M-tile); ~1.9× on a starved grid, silently wrong above that | [`split_k_only_when_m_is_small`](split_k_only_when_m_is_small.md) |
 | cluster / barrier primitives | **clusters boot to (16,1)**; single-device only | [`clusters_and_two_gpus`](clusters_and_two_gpus.md) |
@@ -93,8 +93,11 @@ See [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md). The sam
   ([`clusters_and_two_gpus`](clusters_and_two_gpus.md)) but a cluster is device-local by
   definition, and the two cards are SYS-linked (no NVLink), so there is no NVLink multimem to
   write about — unreachable, not unmeasured.
-- **No plain per-tensor-scaled fp8 GEMM.** The op exists; no shipped sm120 kernel drives it,
-  and the example rejects fp8 outright. MXFP8 (block-scaled) is the fp8 path that works.
+- **No plain per-tensor-scaled fp8 GEMM** *from the shipped kernels* — the example rejects fp8
+  outright. But this was **closed by hand**: `_probes/probe_sm120_fp8_gemm_multicta.py` is a
+  from-scratch dense fp8 (e4m3) GEMM, cos 1.000000, **281.1 TF/s at 4096³** (274.7 at 2048³),
+  against TileLang's 297 — close, slightly behind. The limit is the instruction shape:
+  `MmaFP8Op` only offers `(16,8,32)`, and BK=128/3-stage vs BK=64/4-stage moves nothing.
 - No `sm100` content copied over. If a mechanism is arch-neutral (DSL algebra, probe
   methodology) it belongs in every tree, but it has to be **re-earned or explicitly
   re-certified** here with a "Certification source" line — location is not provenance.
