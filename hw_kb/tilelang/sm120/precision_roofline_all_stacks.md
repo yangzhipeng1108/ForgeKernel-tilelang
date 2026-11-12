@@ -48,8 +48,8 @@ cannot be double-precision throughput** (measured 1.06 TF/s, a 70× gap), so the
 | NVFP4 | TileLang `T.gemm_blockscaled` 8192³ / 16384³ | 545 / 548 | 92 % | fixed; output evicts the operands |
 | FP64 | cuBLAS | **1.06** | — | CUDA cores only, no fp64 tensor core |
 | FP32 (true) | cuBLAS (`allow_tf32=False`) | **44.93** | 30 % of 148 | CUDA cores |
-| MXFP4 | CuTeDSL MX path | (511) | — | **runs-but-wrong**, cos 0.03 |
-| MXFP8 | CuTeDSL MX path | (234) | — | **runs-but-wrong**, cos 0.04 |
+| MXFP4 | CuTeDSL MX path (UE8M0 SF) | 509.6 | — | **correct**, cos 1.000000, md 0.25 (fp16 store) |
+| MXFP8 | CuTeDSL MX path (UE8M0 SF) | 256.5 | — | **correct**, cos 1.000000, md 0.0078 (fp16 store) |
 
 Derived peak column: FP16 = 148, FP8 = 296, FP16-sparse = 296, NVFP4 = 592. See
 "Where the nameplate sits" for why these are the right denominators.
@@ -175,36 +175,55 @@ one shape where fill hides enough tail to exceed a nominal peak. Do not use it a
 denominator; quote 504.9/548.5 against 592 for shipped shapes and treat 847.6 as a small-M
 curiosity.
 
-## MXFP4 / MXFP8: reachable but not correct — a closed-form gate localises why
+## MXFP4 / MXFP8: correct once the SF is shipped in MMA-atom order (earlier "wrong" was the probe, not the kernel)
 
-The CuTeDSL MX path (`DenseGemmKernel` with `sf_vec_size=32`, `Float8E8M0FNU` scales,
-`MmaMXF4Op` / `MmaMXF8Op` chosen internally from `a_dtype`) compiles and runs at
-**511 TF/s (MXFP4)** and **234 TF/s (MXFP8)** at 4096³, but **cosine is 0.03 and 0.04**. These
-two rows carry **no throughput claim**.
+> **Correction.** An earlier revision of this file claimed the CuTeDSL MX path "runs but is
+> wrong" (cos 0.03 / 0.04). That was the *probe feeding the wrong scale layout*, not a kernel
+> defect. Re-measured with rank-3 tensors and the SF pre-permuted into MMA-atom order, both MX
+> paths are numerically correct at every shape up to 4096³. The section below is rewritten.
 
-Three experiments pinned it down without guessing:
+Same `DenseGemmKernel` (`sf_vec_size=32`, `Float8E8M0FNU` scales, `MmaMXF4Op` / `MmaMXF8Op`
+chosen from `a_dtype`), tile `(128,128)`, `max_active_clusters=156`, unit UE8M0 scales,
+fp16 output. Numeric gate vs a dequantised fp32 reference, and a compiled-then-timed run
+(compile once, 30 CUDA-event iterations after warmup):
 
-1. **Closed-form gate** — all-ones operands, unit e8m0 scale, so every `C` entry must be `K`:
-   MXFP4 gets **25 %** of entries right, MXFP8 **78 %**. A working kernel gives 100 %.
-2. **The SF layout is not the cause** — with all-ones scales, *any* permutation still yields
-   all-ones output. Re-deriving the scatter from `BlockScaledBasicChunk(sf_vec).layout`
-   (`((32,4),(sf_vec,4))` stride `((16,4),(0,1))`, tiled `(2,1,3)`) changed the result by
-   exactly nothing. Rule that out.
-3. **`tile_k` is the lever, but not a free one** — `tile_k` defaults to `sf_vec_size*8 = 256`,
-   giving 16 K-tiles at K=4096. Forcing `tile_k=128` moves MXFP4 to 75 % correct but with
-   exploded values (a garbage scale is now being read), and drops MXFP8 to 25 %. So the
-   operand tile and the SF atom disagree.
+| path | 4096³ | 2048×4096×4096 | max abs diff | cos |
+|---|---|---|---|---|
+| NVFP4 (`MmaMXF4NVF4Op`, UE4M3 SF) | 504.4 | 957.7 | 0.25 | 1.000000 |
+| **MXFP4** (`MmaMXF4Op`, UE8M0 SF) | **509.6** | 622.7 | 0.25 | 1.000000 |
+| **MXFP8** (`MmaMXF8Op`, UE8M0 SF) | **256.5** | 228.1 | 0.0078 | 1.000000 |
 
-What that points at: the kernel builds a `tile_k=256` TMA descriptor from `a.shape=(M,K,1)`, and
-a packed fp4/fp8 buffer handed over as `(M,K)` does not satisfy it — the NVFP4 wrapper gets away
-with the same call because its atom and `sf_vec_size=16` line up. The fix is a correctly packed
-A/B layout (or `K/2` as the inner extent), which needs a validated example to diff against;
-**flashinfer ships none for MX**. Recorded as a real gap rather than an assumed match.
+The `md≈0.25` at 4096³ is the fp16 epilogue store (same residual NVFP4 carries), not the MMA;
+cos is 1.0 across all shapes tested — `(128,128,256)`, `(256,256,512)`, `(512,512,1024)`,
+`(1024,1024,2048)`, `(4096,4096,4096)`. MXFP4 at 509 TF/s already matches NVFP4 (504) on the
+square shape; MXFP8 at 257 is below dense fp8 (285) because the MX atom does `k=32` per step
+against NVFP4's `k=64`.
 
-Practical stance: **do not use MX on this stack today.** NVFP4 (fp4 + e4m3 scale, sf_vec 16) is
-the validated 4-bit path at 848/505 TF/s, and fp8 covers the 8-bit case at 285. The MX numbers
-would land between them once the operand layout is solved, but nothing should be sized on them
-yet.
+### What the wrong probe did (so it is not repeated)
+
+The earlier probe handed a **row-major `(M, K/sf_vec)`** scale buffer to the kernel and used
+rank-2 `(M,K)` operands. On this path that produces plausible-but-wrong numbers **with no
+error** — `blockscaled_three_paths.md` names this "the single most dangerous failure mode". The
+fix is exactly three things, all in `_probes/probe_sm120_blockscaled_three_gate.py`:
+
+1. **All five tensors rank-3** `(M,K,1)` / `(N,K,1)` / `(M,N,1)`; a rank-2 view fails inside
+   `tile_atom_to_shape_SF` or silently mis-addresses.
+2. **SF pre-permuted into MMA-atom order**: reshape to `(l, mn/128, sf_k/4, 32, 4, 4)` then
+   `permute(3,4,1,5,2,0)`, zero-padded to 128-row / 4-K-block boundaries. Feeding row-major
+   scales is what made cos collapse.
+3. **`sf_vec_size` fixes `tile_k`**: 16 → 128, 32 → 256 (default `sf_vec_size*8`). A `tile_k`
+   that is not a multiple of the k-atom is rejected at plan time.
+
+The "closed-form 25 % / 78 % correct" numbers from the old probe were the row-major layout
+mis-scatter, not the instruction. With the atom-order SF, the same all-ones gate returns 100 %.
+
+### Practical stance (unchanged in spirit, changed in fact)
+
+MX is now **usable**, not "do not use". NVFP4 remains the validated production 4-bit path
+(fp4 + e4m3 scale, sf_vec 16) at 505/958 TF/s; MXFP4 is an equal-speed alternative that trades
+the finer UE4M3 block scale for a coarser UE8M0 power-of-two scale (cheaper to quantise, less
+accurate per block). MXFP8 lands under dense fp8. Size work on the NVFP4 rows; use the MX rows
+only when a quantiser already emits UE8M0 scales.
 
 ## How to reproduce
 
@@ -212,5 +231,11 @@ Probes live at
 `C:\Users\yangzhipeng\AppData\Local\Temp\opencode\p21_tl_dense.py` (dense f16/bf16/fp8),
 `p22_tl_sparse.py` (2:4 f16/fp8 with the selector gate), `p23_tl_nvfp4.py` (TileLang NVFP4),
 `p20_nvfp4_shapes.py` (CuTeDSL NVFP4 across shapes), `p24_nongemm.py` (RMSNorm/RoPE/attention/
-LM head), `p25_fp64_fp32_mx.py` (FP64, true FP32, MXFP4/MXFP8), and `p16/p17/p19` (cuBLAS +
-timing backends). All gate on cosine before reporting a speed.
+LM head), `p25_fp64_fp32_mx.py` (FP64, true FP32), and `p16/p17/p19` (cuBLAS + timing backends).
+
+**For MX use the gate probe, not p25.** `p25_fp64_fp32_mx.py` feeds row-major `(M,K/sf_vec)`
+scales and rank-2 operands, which is what produced the old "cos 0.03" reading — it is the wrong
+layout, not a broken kernel. The correct MX path is gated in
+`hw_kb/cutedsl/sm120/_probes/probe_sm120_blockscaled_three_gate.py` (rank-3 tensors + SF
+pre-permuted `permute(3,4,1,5,2,0)`), which returns cos 1.0 for NVFP4 / MXFP4 / MXFP8. All gate
+on cosine before reporting a speed.
