@@ -161,15 +161,36 @@ one shape where fill hides enough tail to exceed a nominal peak. Do not use it a
 denominator; quote 504.9/548.5 against 592 for shipped shapes and treat 847.6 as a small-M
 curiosity.
 
-## MXFP4 / MXFP8: reachable but not yet correct
+## MXFP4 / MXFP8: reachable but not correct — a closed-form gate localises why
 
-The CuTeDSL MX path (`DenseGemmKernel` with `sf_vec_size=32` and `Float8E8M0FNU` scales) compiles
-and runs at **511 TF/s (MXFP4)** and **234 TF/s (MXFP8)** at 4096³, but **cosine is 0.03 and 0.04**
-— the kernels compute, the numbers are wrong. The scale tensor wants the same packed SF layout
-NVFP4 uses, and feeding it a row-major `(M, K/32)` uint8 view is silently wrong rather than
-illegal. So these two rows are **runs-but-wrong** and carry no throughput claim; the MX
-throughput would sit between the NVFP4 and FP8 numbers once the layout is derived. Recorded here
-so the gap is visible rather than silently assumed to match NVFP4.
+The CuTeDSL MX path (`DenseGemmKernel` with `sf_vec_size=32`, `Float8E8M0FNU` scales,
+`MmaMXF4Op` / `MmaMXF8Op` chosen internally from `a_dtype`) compiles and runs at
+**511 TF/s (MXFP4)** and **234 TF/s (MXFP8)** at 4096³, but **cosine is 0.03 and 0.04**. These
+two rows carry **no throughput claim**.
+
+Three experiments pinned it down without guessing:
+
+1. **Closed-form gate** — all-ones operands, unit e8m0 scale, so every `C` entry must be `K`:
+   MXFP4 gets **25 %** of entries right, MXFP8 **78 %**. A working kernel gives 100 %.
+2. **The SF layout is not the cause** — with all-ones scales, *any* permutation still yields
+   all-ones output. Re-deriving the scatter from `BlockScaledBasicChunk(sf_vec).layout`
+   (`((32,4),(sf_vec,4))` stride `((16,4),(0,1))`, tiled `(2,1,3)`) changed the result by
+   exactly nothing. Rule that out.
+3. **`tile_k` is the lever, but not a free one** — `tile_k` defaults to `sf_vec_size*8 = 256`,
+   giving 16 K-tiles at K=4096. Forcing `tile_k=128` moves MXFP4 to 75 % correct but with
+   exploded values (a garbage scale is now being read), and drops MXFP8 to 25 %. So the
+   operand tile and the SF atom disagree.
+
+What that points at: the kernel builds a `tile_k=256` TMA descriptor from `a.shape=(M,K,1)`, and
+a packed fp4/fp8 buffer handed over as `(M,K)` does not satisfy it — the NVFP4 wrapper gets away
+with the same call because its atom and `sf_vec_size=16` line up. The fix is a correctly packed
+A/B layout (or `K/2` as the inner extent), which needs a validated example to diff against;
+**flashinfer ships none for MX**. Recorded as a real gap rather than an assumed match.
+
+Practical stance: **do not use MX on this stack today.** NVFP4 (fp4 + e4m3 scale, sf_vec 16) is
+the validated 4-bit path at 848/505 TF/s, and fp8 covers the 8-bit case at 285. The MX numbers
+would land between them once the operand layout is solved, but nothing should be sized on them
+yet.
 
 ## How to reproduce
 
