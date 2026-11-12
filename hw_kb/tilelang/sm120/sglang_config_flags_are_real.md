@@ -116,18 +116,47 @@ checkpoints twice as often, which keeps a finer history for MTP look-back at a h
 cost. The assertion in `mamba_cache_chunk_size` (`max % min == 0`) is satisfied because both 64
 and 32 divide evenly; a page size that does not divide 64 would fault at startup.
 
-**Not yet measured: whether 128 is faster than 256 here.** The mechanism above is confirmed
-from source and from a live import, but no sweep of `interval ∈ {64, 128, 256, 512}` against
-`tokens/s` has been run. Until it is, treat `128` as "a live knob with a known halving effect on
-checkpoint spacing", not as an established optimum.
+### Measured: 128 vs 256 is a tie, and C=16 is too noisy to see one anyway
+
+The service was run twice — once with `--mamba-track-interval 128`, once with `256`, all else
+identical to the shipped PG32 config — and `bench_serving` was run repeatedly at
+`in=10000 / out=2000 / C=16` against each. Output-token throughput:
+
+| `--mamba-track-interval` | per-run output tok/s | median |
+|---|---|---|
+| 128 (shipped) | 600, 818, 638, 847, 967 | ~818 |
+| 256 (default) | 825, 708, 620, 858 | ~766 |
+
+**The two medians differ by ~6 %, which is inside the run-to-run spread.** The same server,
+same config, produced anywhere from **600 to 967 tok/s** across repeated single runs — a ±38 %
+swing. The interval's halving of checkpoint spacing does not move throughput by more than that
+noise.
+
+Two traps this exposed, both worth remembering:
+
+- **The first run against a freshly launched server is not a data point.** The first 128 run
+  reported `600 tok/s` with TTFT `11.1 s`; that was Triton compiling `_fwd_kernel` (both TP ranks
+  log `took ~1.0 s to compile after serving started`) plus cold caches. The identical config
+  re-run after warm-up gave `818`. A cold first sample of a sglang server reads ~25 % low — warm
+  it up or discard run #1 before recording.
+- **Single-run `bench_serving` at C=16 cannot resolve small effects here.** Decode-batch
+  composition shifts from run to run (which requests finish when), so the same config swings
+  hundreds of tok/s. Any claim about this config needs several runs and a median, not one number.
+
+So `128` is harmless — it neither helps nor hurts — but the `730`-class number comes from the
+rest of the config (speculative NEXTN, chunked-prefill sizing, page size), not from the track
+interval. Leave it at `128` if the config already says so; do not expect a gain from tuning it.
 
 ## What this changes
 
 Nothing about the numbers — the earlier `PG32 = 730` stands, and this is the evidence that it was
 measured on the path it claims. What it removes is the doubt: the tuning tail is applied, the
 backend is the requested one, and the verify routing is deliberate rather than accidental.
-The `--mamba-track-interval 128` additionally has a known consumption path (the LCM above) rather
-than being assumed live, but its optimality is still open.
+The `--mamba-track-interval 128` additionally has a confirmed consumption path (the LCM above)
+and is now measured: it is a tie against the default `256`, inside a ±38 % single-run spread. It
+is a harmless choice, not a performance lever. What the sweep did produce is a methodology
+result: a fresh sglang server's first `bench_serving` run reads ~25 % low while Triton compiles,
+and single-run C=16 numbers swing too widely to compare configs — quote a median of several runs.
 
 ## Sources
 
