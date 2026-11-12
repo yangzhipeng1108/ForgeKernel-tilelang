@@ -136,9 +136,10 @@ Single-launch events, `4096鲁`, 256 threads:
 | 256 | 256 | 64 | 2 | 12.141 | 90.6 |
 
 The ranking holds under either protocol: **128/128/128 with three stages wins and every larger
-tile collapses**, exactly as the fp8 sweep in `gemm_dtype_throughput.md` found. The cause is
-the 99 KiB smem budget 閳?a 256-row fp4 tile leaves no room for pipeline depth, so it drops to
-one block per SM. `BK=256` with `stages=3` does not even launch.
+tile collapses**. The cause is **register pressure on the accumulator, not smem** 閳?a 192脳192
+fp32 fragment is 147 KB of registers per block, past the 255-register limit, so it spills. See
+"Why the tile axis is closed" below. `BK=256` with `stages=3` does exceed smem and does not
+launch, but that is the only smem-limited case found.
 
 ## Where the ceiling actually is
 
@@ -154,25 +155,65 @@ That makes **865 TF/s a floor on the NVFP4 peak**, and the derived 592 TF/s (`29
 by **at least 46 %**. The `precision_roofline_all_stacks.md` peak table needs an FP4 correction,
 and the correct worked example is 865, not 592 and not 776.
 
-## How to close the 545 -> 865 gap
+## How to close the 545 -> 865 gap: three levers, all measured, all closed
 
 The eviction penalty is latency, not bandwidth: at 8192鲁 the kernel moves 336 MB in 2.0 ms
 (167 GB/s, 13 % of peak) yet loses 35 %. Three-stage pipelining does not cover the HBM latency
-once every K iteration misses. The levers, in order of promise:
+once every K iteration misses. Three candidate fixes were proposed and every one was run.
 
-1. **Keep the operands resident across the K loop** by splitting the output into column blocks
-   and iterating those outermost, so C for one block is small enough not to evict A/B. This
-   turns the 8192鲁 case into a sequence of 8192虏脳256-ish calls, but adds A/B re-reads.
-2. **More pipeline depth**, which is blocked by the 99 KiB smem budget at this tile. A shorter
-   BK frees smem for stages but costs MMA efficiency, and `BK=64` measured 503 TF/s, so this
-   route is closed at 128/128.
-3. **A persistent kernel** that keeps the grid resident and loops over tiles internally,
-   avoiding re-entry. `clusters_free_multicast_broken.md` and `clc_compiles_to_nothing.md` both
-   record that the hardware-assisted versions of this are unavailable here, but a plain
-   persistent loop was never tried for this kernel.
+**Lever 1 閳?block the output columns so the operand slice stays resident.** Grid becomes
+(M-tiles, panels) and each block walks a panel's N tiles. It loses at every panel size:
 
-None of these is measured yet. The 865 figure assumes the operands fit, which is true for
-prefill on 4096-class shapes and false for 8192-class ones.
+| variant | 8192鲁 ms | TF/s | 4096鲁 ms | TF/s |
+|---|---|---|---|---|
+| plain | 2.014 | 545.9 | 0.165 | 834.6 |
+| panel N=512 | 2.078 | 529.1 | 0.185 | 744.9 |
+| panel N=1024 | 2.127 | 516.9 | 0.183 | 753.1 |
+| panel N=2048 | 2.271 | 484.2 | 0.527 | 260.6 |
+
+The arithmetic is unforgiving: each panel re-reads A and B, and 33 MB 脳 2 脳 16 panels costs
+more than the eviction it avoids. **Re-reading the operands is worse than letting them be
+evicted**, which is worth knowing before anyone proposes tiling for cache again.
+
+**Lever 2 閳?deeper pipelining.** The earlier claim that the 99 KiB budget blocked `stages > 3`
+was **wrong**. Measured dynamic smem, 128/128/128:
+
+| stages | BK | smem B | 8192鲁 TF/s | 4096鲁 TF/s |
+|---|---|---|---|---|
+| 3 | 128 | 52,224 | 541.4 | 833.7 |
+| 4 | 128 | 69,632 | 545.4 | 719.9 |
+| 4 | 64 | 34,816 | 517.2 | 584.8 |
+| 6 | 64 | 52,224 | 520.6 | 583.1 |
+| 8 | 64 | 69,632 | 423.0 | 409.3 |
+
+Four stages fit comfortably (69 KB of a 101,376 B budget) and buy nothing at 8192鲁 while costing
+14 % at 4096鲁. Smaller BK is worse at every depth. **Deeper pipelining is not the lever**, and
+the smem budget was never the constraint it was said to be.
+
+**Lever 3 閳?a persistent kernel.** Grid sized to the SM count (156) or twice that, each block
+walking a strided tile list. Identical to plain: 2.027 / 2.021 ms at 8192鲁, 0.167 ms at 4096鲁.
+No scheduling cost to recover, so no gain.
+
+## Why the tile axis is closed: registers, not smem
+
+The retry of large tiles with `stages=3`, now that the smem headroom is known to be real:
+
+| BM | BN | stages | smem B | 4096鲁 TF/s | 8192鲁 TF/s |
+|---|---|---|---|---|---|
+| 128 | 128 | 3 | 52,224 | **836.2** | **537.3** |
+| 192 | 128 | 3 | 66,048 | 601.2 | 546.6 |
+| 128 | 192 | 3 | 66,048 | 511.3 | 536.0 |
+| 192 | 192 | 3 | 78,336 | **120.2** | 135.7 |
+| 256 | 128 | 3 | 79,872 | 204.4 | 230.1 |
+| 128 | 256 | 3 | 79,872 | 166.2 | 189.0 |
+| 256 | 256 | 2 | 69,632 | 76.2 | 78.0 |
+
+192脳192 collapses to 120 TF/s while using only 78 KB of smem, so the collapse is **not** the
+shared-memory budget. The accumulator is: a 192脳192 fp32 fragment is 147 KB of registers per
+block, and with 256 threads that is 576 B/thread 閳?far past the 255-register limit, so it spills.
+`256脳128` (128 KB accumulator, 512 B/thread) spills too. Only 128脳128 keeps the accumulator at
+64 KB, i.e. 256 B/thread, which fits. **The tile axis is closed by the register file, and the
+smem budget is irrelevant at these shapes.**
 
 ## When needed (trigger)
 
@@ -190,10 +231,14 @@ the tensor cores better". The answer to the last one is no.
   for graph capture to close a launch-overhead gap here; there is no such gap to close.
 - Do not use `ncu` durations as throughput; it reports 1.08 ms at 8192鲁 where events and graphs
   agree on 2.0. Use it for unit utilisation only.
-- `BK=256` + `stages=3` fails to launch on the 99 KiB budget.
+- `BK=256` + `stages=3` fails to launch on smem. That is the only smem-limited combination
+  found; `BK=128` fits at `stages=4` (69,632 B of 101,376) and still loses, so do not blame smem
+  for the large-tile collapse 閳?blame the accumulator's register footprint.
 - **Measure the shape you care about, in the order you will run it.** An earlier round measured
   4096鲁 at 425 TF/s purely because a larger shape had run first and left L2 in a different
   state; the same kernel in a fresh process gives 836.
+- Column-panel blocking and persistent grids both lose. If a later reader is tempted to tile for
+  cache, the numbers above say the re-read cost exceeds the eviction cost on this part.
 
 ## Sources
 
