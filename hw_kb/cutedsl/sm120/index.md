@@ -98,6 +98,14 @@ See [`nvfp4_gemm_computes_correctly`](nvfp4_gemm_computes_correctly.md). The sam
   from-scratch dense fp8 (e4m3) GEMM, cos 1.000000, **281.1 TF/s at 4096³** (274.7 at 2048³),
   against TileLang's 297 — close, slightly behind. The limit is the instruction shape:
   `MmaFP8Op` only offers `(16,8,32)`, and BK=128/3-stage vs BK=64/4-stage moves nothing.
+- **No 2:4 sparse kernel, and one cannot be written on this stack.** `MmaF16BF16SparseOp`
+  constructs for shape `(16,8,16)` / `(16,8,32)`, but driving it through `make_tiled_mma`
+  raises `AttributeError: ... cute_nvgpu has no attribute 'MmaAtomSM80SparseType'` — the
+  DSL's own `_make_trait` references an MLIR atom type the dialect does not export (only
+  `MmaAtomSM100UMMASparseType` / `MmaAtomSM107UMMASparseType` exist; there is no SM80 *or*
+  SM120 sparse atom). No fragment_A, no `cute.gemm`, no kernel — a lowering gap, not missing
+  effort. Sparse on this box is TileLang-only (`T.gemm_sp`, 262 TF/s at 4096³, 1.95× dense).
+  Probe: `_probes/probe_sm120_sparse_mma_gate.py` (NEGATIVE).
 - No `sm100` content copied over. If a mechanism is arch-neutral (DSL algebra, probe
   methodology) it belongs in every tree, but it has to be **re-earned or explicitly
   re-certified** here with a "Certification source" line — location is not provenance.
