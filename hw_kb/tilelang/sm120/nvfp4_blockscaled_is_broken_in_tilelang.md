@@ -5,15 +5,20 @@
 > deterministic wrong answer. This entry records exactly what was tried and what the numbers
 > were, so the next person does not repeat the sweep. **No correctness claim is made.**
 >
-> **Root cause is NOT located, but the failure is now characterised exactly.** The first version
-> of this note blamed `_scale_word_offset`; that function turned out to be dead code with no
-> callers. The second version blamed the word-offset split at
-> `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:983-990` and predicted a `// 4`
-> fix; **that patch was run and also fails**. What the closing round did establish is that the
-> fp4 data path and the scale gate are both correct and linear, and that the output carries a
-> single constant factor of `2^-20` that is independent of `K`, tile shape and scale value.
-> That factor 閳?not the scale layout 閳?is what any further work has to explain. The transfer
-> curve is in the "Closing round" section; start there, not from the old paragraph.
+> **Root cause is NOT located, but two concrete defects are now proven by measurement.** The
+> first version of this note blamed `_scale_word_offset` (dead code). The second blamed the
+> word-offset split at `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:983-990` and
+> predicted a `// 4` fix; **that patch was run and also fails**. What later rounds did establish:
+>
+> 1. the scale operand is fetched as **one byte zero-extended into a `uint32`**, not the packed
+>    4-byte word that `scale_vec::4X` and the emitter's own error message require 閳?a stripe
+>    test shows bytes 1-3 of every word are invisible to the result;
+> 2. the output carries a single constant factor of `2^-20` that is independent of `K`, tile
+>    shape and scale value.
+>
+> Both are invisible to an all-ones scale matrix, which is why four earlier gates all looked
+> like the same mystery. The fp4 data path and the scale gate are otherwise correct and linear.
+> Start from the "stripe test" sections, not from the old paragraphs.
 
 ## The instruction is real
 
@@ -191,6 +196,65 @@ The honest summary: three separate address-arithmetic hypotheses have now been f
 running them, and the surviving signal points at the MMA operand/byte-selector plumbing rather
 than at the scale word layout that the first two versions of this note kept blaming.
 
+## The scale operand is read as one byte, not a packed word
+
+The design intent is explicit in the source. At
+`tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:552` the emitter raises
+`f"{self.kind} expects packed scale words covering {self.sf_vec_size * 4} K elements"` 閳?
+i.e. one `uint32` scale operand is supposed to carry **4 e4m3 bytes covering 64 K elements**,
+which is exactly what `scale_vec::4X` means in the PTX string.
+
+The generated code does not do that. The SF loads compile to
+
+```cpp
+SFA_local_0[g] = ((uint)((fp8_e4_t*)sfa_s)[<byte offset>]);
+```
+
+a **scalar byte load zero-extended into a `uint32`**, so the three high bytes of every scale
+operand are `0x00` regardless of what the caller put in the scale matrix.
+
+A stripe test proves the bytes past the first are discarded, not merely unused. Set the four
+columns that feed one packed word to distinct powers of two and read `C[0,0]`:
+
+| bytes per word | `C[0,0]` |
+|---|---|
+| `1,1,1,1` | `0.000488` |
+| `1,2,4,8` | `0.000488` (unchanged) |
+| `8,4,2,1` | `0.003906` (**8x**) |
+| `1,1,1,8` | `0.000488` (unchanged) |
+| `8,1,1,1` | `0.003906` (**8x**) |
+| `1,1,8,1` | `0.000488` (unchanged) |
+
+Only the byte at position 0 of each word moves the result. Positions 1-3 are invisible. This is
+a real defect and it is independent of everything in the earlier sections: it is why the word
+split is not the point 閳?a split can be perfectly correct and still have nothing to split,
+because only one byte per word is ever fetched.
+
+It is, however, **not** the source of the `2^-20`. With an all-ones scale matrix every byte is
+`0x38`, so reading one byte instead of four yields the same value.
+
+## CUTLASS `cute/arch/mma_sm120.hpp` disagrees with TileLang on the selectors
+
+CUTLASS ships a working sm120 atom for the same instruction
+(`tilelang/3rdparty/cutlass/include/cute/arch/mma_sm120.hpp`, the
+`SM120_16x8x64_TN_VS` specialisation guarded by `CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED`). It
+passes the selectors as
+
+```cpp
+static constexpr uint16_t tidA = 0;
+static constexpr uint16_t bidA = 0;
+static constexpr uint16_t tidB = 0;
+static constexpr uint16_t bidB = 0;
+```
+
+all four pinned to zero. TileLang pins the `byte_id`s to zero as well, matching, but passes
+`scale_a_thread_id = i % 2` and `scale_b_thread_id = (j % 2) * 2 + n8_half`
+(`tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:884-906`). With an all-ones scale
+matrix a wrong thread selector is also invisible, so this is consistent with the `2^-20`
+surviving all the all-ones gates. **The two surviving suspects are the `thread_id` selectors and
+the `2^-20` constant itself, and a gate that uses a non-uniform scale matrix is required to see
+either of them.**
+
 
 
 The Qwen3.8 NVFP4 MoE does **not** run through this path, and should not be made to. On the
@@ -215,18 +279,23 @@ to work, and do not claim the arch lacks the capability.
    work on this hardware 閳?specifically its `tile_atom_to_shape_SF` scale layout.
 4. **Do not retry the `// 4` split.** Finding 7 predicted it and it was run: same `0.0039`.
    Three address-arithmetic hypotheses (`// k_blocks` 閳?`// tile_m`, lane-reduced
-   `_sfa_row_in_atom`, `// k_blocks` 閳?`// 4`) are now falsified by measurement. The next
-   place to look is the MMA plumbing, not the scale word layout 閳?specifically the pinned
-   `scale_a_byte_id=0` / `scale_b_byte_id=0` at
-   `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:884-906`, and the `2^-20`
-   constant itself. A useful next experiment: find a configuration that makes `2^-20` move
-   (different `sf_vec_size`, different `chunk`, unpacked-A fragment path); a constant that will
-   not move is a constant in the wrong place.
-5. Cross-check the unpacked-A path: try A as a fragment (`IsFragmentBuffer` is allowed for A
-   in the sm120 clause) to see whether the shared-memory fp4 read is implicated.
-6. Before believing any patch result, clear the TileLang compile cache. A stale
+   `_sfa_row_in_atom`, `// k_blocks` 閳?`// 4`) are now falsified by measurement.
+5. **Use a non-uniform scale matrix from now on.** Every all-ones gate, including the ones in
+   this note, is blind to the byte-selector and thread-selector defects, because all candidates
+   carry the same value. The stripe test (four columns per packed word set to `1,2,4,8`) is the
+   cheapest gate that is not blind; it already exposes the one-byte read.
+6. Fix the read side before touching any offset arithmetic: `SFA_local_buf[g]` must fetch a
+   `uint32` word (4 consecutive e4m3 bytes) rather than one `fp8_e4_t` zero-extended into a
+   `uint32`. `T.view(buffer, shape, dtype="uint32")` can re-type the smem scale buffer; the
+   constraint is a zero `elem_offset`, which `_scale_region_parts` already splits out.
+7. After the read side is a real packed word, revisit the `thread_id` selectors: CUTLASS pins
+   both to 0, TileLang passes `i % 2` and `(j % 2) * 2 + n8_half`. Then re-run the stripe gate
+   and the K sweep together 閳?a correct kernel returns `C = K` for `A=B=1`, and the `2^-20`
+   should disappear. If it survives a correct packed read and CUTLASS-matching selectors, the
+   remaining place to look is the epilogue C store, which ends in a `- 128` offset.
+8. Before believing any patch result, clear the TileLang compile cache. A stale
    `~/.tilelang/cache` will serve the old kernel and make a correct patch look like a no-op.
-7. Do not trust a symbol-level argument alone. `_scale_word_offset` *looked* like the root cause
+9. Do not trust a symbol-level argument alone. `_scale_word_offset` *looked* like the root cause
    for a whole round; it has no callers. Instrument the call site and read the printed values.
 
 ## Measured on
