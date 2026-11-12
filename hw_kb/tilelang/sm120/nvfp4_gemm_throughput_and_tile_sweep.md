@@ -194,6 +194,44 @@ the smem budget was never the constraint it was said to be.
 walking a strided tile list. Identical to plain: 2.027 / 2.021 ms at 8192鲁, 0.167 ms at 4096鲁.
 No scheduling cost to recover, so no gain.
 
+**Lever 4 閳?cache eviction hints.** `T.copy` takes
+`eviction_policy in {"evict_normal", "evict_first", "evict_last"}`, which maps to the TMA cache
+hint. The idea is to pin the operands (`evict_last`) and stream the output (`evict_first`). A
+single run looked promising 閳?542.3 閳?555.2 at 8192鲁 閳?so it was reproduced three times in
+fresh processes, and the effect dissolved into the run-to-run spread:
+
+| variant | run 1 | run 2 | run 3 | best |
+|---|---|---|---|---|
+| base | 541.7 | 550.9 | 549.4 | 550.9 |
+| A/B `evict_last` | 535.7 | 550.7 | 543.8 | 550.7 |
+| A/B + SF `evict_last` | 541.1 | 553.4 | 544.2 | 553.4 |
+| A/B `last`, SF `first` | 539.5 | 544.5 | 549.2 | 549.2 |
+| all `evict_last` | 540.0 | 545.5 | 548.7 | 548.7 |
+
+**The base config alone spans 541.7-550.9, i.e. 卤1.7 %.** The apparent 2.4 % gain from
+`evict_last` is smaller than the noise of the control, so it is not a result. `evict_first` on
+the output changes nothing at all, which suggests the C store is not competing for L2 residency
+in the first place.
+
+> **Method note.** This is the trap that nearly produced a false positive: a single 2.4 % run
+> looks like a finding, and the only defence is repeating the control. Anything smaller than the
+> control's own spread has to be reported as no effect.
+
+## The 545 ceiling is real
+
+Four independent attacks on the L2-eviction penalty 閳?column panels, deeper pipelining,
+persistent grids, eviction hints 閳?all fail. None of them changes how much data the K loop
+must refetch, and the one that could in principle (panels, by making the working set small
+enough to stay resident) pays more in re-reads than it saves. The conclusion is that **545 TF/s
+is this hardware's throughput for this kernel when the operands cannot stay in L2**, and there
+is no configuration knob on the current structure that moves it.
+
+Getting past it would need a different shape of solution 閳?an algorithm that does not re-read
+the operands per K iteration at large N, such as a fused producer-consumer split across blocks
+(split-K with partial-sum reduction, `split_k_fills_a_starved_grid.md`) or a layout that keeps
+each operand slice hot by construction. Neither is measured, and both change the numerical
+contract, so they are out of scope for a drop-in GEMM.
+
 ## Why the tile axis is closed: registers, not smem
 
 The retry of large tiles with `stages=3`, now that the smem headroom is known to be real:
