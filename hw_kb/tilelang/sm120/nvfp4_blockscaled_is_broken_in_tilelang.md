@@ -14,7 +14,7 @@
 > `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py` says so ("expects packed scale
 > words covering `sf_vec_size * 4` K elements"). Once the read fetched a real `uint32` word, and once
 > that word was indexed by `(row, k_block)` rather than through the `_tile_kmajor_scale_word`
-> formula, the `2^-20` constant vanished with it 閳?it was the zero-extended high bytes all
+> formula, the `2^-20` constant vanished with it — it was the zero-extended high bytes all
 > along.
 >
 > Historical note: the first version of this note blamed `_scale_word_offset` (dead code, no
@@ -35,7 +35,7 @@ mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X
 ```
 
 with `static_assert(ScaleVecSize == 4)` and a `ue4m3 scale factors` requirement. The guard
-is `sm_120a` + CUDA 12.8 or newer. So RTX 6000D is a supported target at the PTX level 閳?this is not "the arch cannot do NVFP4".
+is `sm_120a` + CUDA 12.8 or newer. So RTX 6000D is a supported target at the PTX level — this is not "the arch cannot do NVFP4".
 
 CUTLASS ships the collective for it too (`cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp`,
 `builders/sm120_blockscaled_mma_builder.inl`).
@@ -85,18 +85,18 @@ With `sf_layout="blockscaled_chunk_kmajor"` and all scale factors set to 1.0, ra
 | 64,64,64 | 0.5000 | 1.8e-4 | 94 |
 | 128,128,256 | 0.5000 | 1.8e-4 | 94 |
 
-The output magnitude is `1.8e-4` **independent of tile shape, K, and the data** 閳?the kernel
+The output magnitude is `1.8e-4` **independent of tile shape, K, and the data** — the kernel
 is not computing a small version of the right thing, it is reading the wrong memory.
 
 A sharper probe settles it. With every A/B nibble set to the fp4 code for `1.0`, every scale
-factor set to `2.0`, and `K = 256`, the correct output is `(1璺?)璺?1璺?)璺?56 = 1024` in every
+factor set to `2.0`, and `K = 256`, the correct output is `(1×2)×(1×2)×256 = 1024` in every
 element. The kernel returns
 
 ```
 0.0009765625  ==  2**-10
 ```
 
-uniformly. `2閳﹀鍏変紗` is not a plausible partial sum of this problem; it is the value obtained by
+uniformly. `2**-10` is not a plausible partial sum of this problem; it is the value obtained by
 reinterpreting a scale-factor byte at the wrong offset. The scale-factor addressing is wrong.
 
 ## What the generated code does
@@ -106,7 +106,7 @@ Compiled source shows the SF load indexing rows with a stride of 8192 bytes for 
 built from an `(uint)` cast of a single fp8 byte.
 
 > **Correction (later investigation).** An earlier version of this note blamed
-> `_scale_word_offset` in `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py`. That function is **dead code** 閳?> it and its only would-be caller `compact_selector_scale_word_offsets` have **no callers
+> `_scale_word_offset` in `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py`. That function is **dead code** — it and its only would-be caller `compact_selector_scale_word_offsets` have **no callers
 > anywhere in the tree**, which was confirmed both by a full-tree symbol search and by
 > instrumenting it (it never fires). Blaming it was wrong. The real path is traced below.
 
@@ -117,16 +117,16 @@ Facts, each established by running the kernel rather than reading it:
 | # | finding | how it was established |
 |---|---|---|
 | 1 | `_scale_word_offset`(156-167) and `compact_selector_scale_word_offsets`(190) in `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py` have **zero callers** | full-tree grep + an injected `print` that never fires |
-| 2 | the executing path is `tilelang/cuda/op/gemm/gemm_mma_sm120.py:167` 閳?`mma_blockscaled_fulltile`(919) 閳?**`_tile_kmajor_scale_word`(563-566)** | `print` injected at `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:569` fired once compiling the gate |
+| 2 | the executing path is `tilelang/cuda/op/gemm/gemm_mma_sm120.py:167` — `mma_blockscaled_fulltile`(919) → **`_tile_kmajor_scale_word`(563-566)** | `print` injected at `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:569` fired once compiling the gate |
 | 3 | `word_k` is **always 0** at runtime, so the `word_k * tile_rows` term is dead | same trace: `word_k= 0` printed |
 | 4 | real geometry at K=4096/BK=128: `tile_m=tile_n=128`, **`k_blocks=2`**, `warp_row_tiles=64`, `warp_col_tiles=32`, `sfa_words=2`, `sfb_words=1` | trace at the call site |
 | 5 | the SF **copy into shared memory is correct** | `smem == gmem for SFA tile 0 : True` from a debug buffer the kernel writes back |
-| 6 | two candidate patches both fail to change the answer | (a) `// k_blocks` 閳?`// tile_m`/`// tile_n`: still `0.0039`; (b) `_sfa_row_in_atom`/`_sfb_col_in_atom` using `lane = tx % 32` instead of global `tx`: still `0.0039` |
-| 7 | ~~remaining suspect: split the word offset by **4** (`micro_size_k/sf_vec_size`) instead of by `k_blocks`~~ 閳?**FALSIFIED** on the closing round: patched to `// 4` / `% 4`, fresh cache, still `0.0039` | patch applied + rerun |
+| 6 | two candidate patches both fail to change the answer | (a) `// k_blocks` — `// tile_m`/`// tile_n`: still `0.0039`; (b) `_sfa_row_in_atom`/`_sfb_col_in_atom` using `lane = tx % 32` instead of global `tx`: still `0.0039` |
+| 7 | ~~remaining suspect: split the word offset by **4** (`micro_size_k/sf_vec_size`) instead of by `k_blocks`~~ → **FALSIFIED** on the closing round: patched to `// 4` / `% 4`, fresh cache, still `0.0039` | patch applied + rerun |
 
 The formula itself (`word_k * tile_rows + (idx % 32) * (tile_rows // 32) + idx // 32`) is
 byte-identical to the dead `_scale_word_offset`, so "the formula is wrong" was never a useful
-statement 閳?the same arithmetic is reached from a different caller. What actually differs is
+statement — the same arithmetic is reached from a different caller. What actually differs is
 **how the flattened word offset is split into `SFA_data[...]` coordinates** at
 `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:983-990`:
 
@@ -142,7 +142,7 @@ SFA_local_buf[g] = SFA_data[
 wrong place, so the fault is in this address arithmetic, not in the copy and not in the packer.
 
 Finding 4 also exposes an out-of-range read worth noting: with `tile_m=128`, `k_blocks=2` the
-reachable word range is `[0, 256)`, yet enumerating the formula over `tx 閳?[0,256)` reaches
+reachable word range is `[0, 256)`, yet enumerating the formula over `tx — [0,256)` reaches
 offset **256** for four lanes (tx 190/221/252), i.e. one word past the tile. Patching the
 lane reduction (finding 6b) removes that overrun but does **not** fix the answer, so the
 overrun is real but is not the primary fault.
@@ -156,20 +156,20 @@ patch result. This cost a round of false "the function is dead" readings.
 
 Finding 7 above predicted the fix was to split the word offset by 4 instead of by `k_blocks`.
 That patch was applied at `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:983-990`
-(`// k_blocks` 閳?`// 4`, `% k_blocks` 閳?`% 4`), the compile cache was pointed at a fresh
+(`// k_blocks` — `// 4`, `% k_blocks` — `% 4`), the compile cache was pointed at a fresh
 directory, and the K=4096 gate was rerun. Result: **`C[0,0]=0.0039`, unchanged.** Finding 7 is
 falsified, exactly as findings 6(a) and 6(b) were.
 
 What the round *did* settle is more useful than another failed patch.
 
 **The fp4 data path is correct.** With `sfa=sfb=1.0`, changing the packed nibble scales the
-output exactly: `0x22`(1.0) 閳?`0.003906`, `0x44`(2.0) 閳?`0.007812`, `0x11`(0.5) 閳?half again.
+output exactly: `0x22`(1.0) — `0.003906`, `0x44`(2.0) — `0.007812`, `0x11`(0.5) — half again.
 A and B contribute independently and multiplicatively.
 
 **The scale gate is correct and linear.** Sweeping `sfa` through exact powers of two with the
-data held at 1.0 gives `C/K = sfa 闁?2^-20`, with slope exactly 1 from `2^0` to `2^6` and a
+data held at 1.0 gives `C/K = sfa × 2^-20`, with slope exactly 1 from `2^0` to `2^6` and a
 saturation at the e4m3 maximum (`448`) above `2^9`, which is what e4m3 should do. So the scale
-bytes are read, decoded as e4m3, and applied 閳?they are simply multiplied by a constant that
+bytes are read, decoded as e4m3, and applied — they are simply multiplied by a constant that
 nothing in the model explains.
 
 | `sfa` | `C[0,0]` | `C/K` | `log2(C/K)` |
@@ -180,7 +180,7 @@ nothing in the model explains.
 | `2^3` | `0.03125` | `7.63e-06` | -17.000 |
 | `2^4` | `0.0625` | `1.53e-05` | -16.000 |
 
-**The `2^-20` is independent of `K` and of the tile split.** Sweeping `K 閳?{256, 512, 1024,
+**The `2^-20` is independent of `K` and of the tile split.** Sweeping `K — {256, 512, 1024,
 2048, 4096}` at `BK=128`, and `K=4096` at `BK=256`, all give `C[0,0] * 2^20 / K = 1.000000` to
 six places. It is not a partial sum that happens to look small; it is the correct answer times
 one constant.
@@ -192,7 +192,7 @@ in the `T.ptx_mma_block_scale` call at
 - `scale_a_byte_id` and `scale_b_byte_id` are the literals `0` and `0`. Under `scale_vec::4X`
   the byte selector is how a `uint32` packs 4 K-sub-block scales; pinning it to zero means every
   MMA in the tile selects byte 0 of its scale word. With an all-ones scale byte that is
-  invisible 閳?which is why the all-ones gate cannot see this 閳?but it is wrong in general.
+  invisible — which is why the all-ones gate cannot see this — but it is wrong in general.
 - the C store emitted by the epilogue ends in `... + ((threadIdx.x >> 6) * 32) + ... - 128`, a
   negative final offset. The whole output matrix carries the same `2^-20` value, so this is not
   a scattered address error, but the `-128` has no obvious counterpart in the tile indexing and
@@ -206,7 +206,7 @@ than at the scale word layout that the first two versions of this note kept blam
 
 The design intent is explicit in the source. At
 `tilelang/cuda/intrinsics/macro/mma_sm120_macro_generator.py:552` the emitter raises
-`f"{self.kind} expects packed scale words covering {self.sf_vec_size * 4} K elements"` 閳?
+`f"{self.kind} expects packed scale words covering {self.sf_vec_size * 4} K elements"` —
 i.e. one `uint32` scale operand is supposed to carry **4 e4m3 bytes covering 64 K elements**,
 which is exactly what `scale_vec::4X` means in the PTX string.
 
@@ -233,7 +233,7 @@ columns that feed one packed word to distinct powers of two and read `C[0,0]`:
 
 Only the byte at position 0 of each word moves the result. Positions 1-3 are invisible. This is
 a real defect and it is independent of everything in the earlier sections: it is why the word
-split is not the point 閳?a split can be perfectly correct and still have nothing to split,
+split is not the point — a split can be perfectly correct and still have nothing to split,
 because only one byte per word is ever fetched.
 
 It is, however, **not** the source of the `2^-20`. With an all-ones scale matrix every byte is
@@ -264,15 +264,15 @@ either of them.**
 
 
 The Qwen3.8 NVFP4 MoE does **not** run through this path, and should not be made to. On the
-same box, `sglang` serves NVFP4 through CuTeDSL 閳?`kda_kernels/qwen3x_nvfp4_gemm_sm120.py`, ~1970 lines, built on
+same box, `sglang` serves NVFP4 through CuTeDSL — `kda_kernels/qwen3x_nvfp4_gemm_sm120.py`, ~1970 lines, built on
 `CUTLASS blockscaled-layout helpers` and `sm120_utils`, with the scale-factor layout
 (`tile_atom_to_shape_SF`) handled explicitly. That is the working route on sm120, and it is
 CUTLASS DSL, not TileLang.
 
 So the statement before the fix was: sm120 has NVFP4 tensor-core instructions; TileLang 0.1.15
 exposed an entry point for them that did not produce correct results; the production path on
-this hardware was CuTeDSL. That is no longer true 閳?with the three-line fix above the TileLang
-path is correct, and at 8192鲁 it runs at 514.7 TF/s against CuTeDSL's 548.5, i.e. within 6%.
+this hardware was CuTeDSL. That is no longer true — with the three-line fix above the TileLang
+path is correct, and at 8192³ it runs at 514.7 TF/s against CuTeDSL's 548.5, i.e. within 6%.
 
 ## The fix
 
@@ -292,7 +292,7 @@ SFB_word = T.view(SFB_data, list(SFB_data.shape[:-1]) + [SFB_data.shape[-1] // 4
 
 **2. Index the word by `(row, k_block)` instead of by `_tile_kmajor_scale_word`.** The formula
 returns an offset whose `word_k * tile_rows` term makes `k_block=1` land 64 rows away from
-`k_block=0`; with the packed read in place that produced cos 0.956 閳?mostly right, but the
+`k_block=0`; with the packed read in place that produced cos 0.956 — mostly right, but the
 second K-half reading the wrong rows. `scale_row` is what the emitter already computes:
 
 ```python
@@ -327,16 +327,16 @@ exact) at `K` in `{256, 512, 1024, 2048, 4096}` for `BK=128` and at `K=4096, BK=
 
 | shape | `num_stages` | ms | TF/s |
 |---|---|---|---|
-| 4096鲁 | 2 | 0.194 | 707.7 |
-| 4096鲁 | 3 | 0.176 | **781.0** |
-| 8192鲁 | 2 | 2.136 | 514.7 |
-| 16384鲁 | 2 | 16.266 | 540.7 |
+| 4096³ | 2 | 0.194 | 707.7 |
+| 4096³ | 3 | 0.176 | **781.0** |
+| 8192³ | 2 | 2.136 | 514.7 |
+| 16384³ | 2 | 16.266 | 540.7 |
 
 Two things to note. First, `num_stages` matters enormously: the same kernel is 465 TF/s at
 `num_stages=1` and 748 TF/s at 2, because the packed-read fix is what makes multi-stage
-pipelines legal at all. Second, **the derived NVFP4 peak of 592 TF/s is too low 閳?by a lot.**
+pipelines legal at all. Second, **the derived NVFP4 peak of 592 TF/s is too low — by a lot.**
 A later round with a cleaner protocol (`nvfp4_gemm_throughput_and_tile_sweep.md`) reaches
-**865 TF/s** at 4096虏脳8192 and shows that these event-loop numbers understate single-launch
+**865 TF/s** at 4096²×8192 and shows that these event-loop numbers understate single-launch
 throughput, because a fresh output tensor is allocated per call and there is a fixed ~0.15 ms
 gap between launches. Read those numbers for the correctness story, not as a ceiling.
 
@@ -362,17 +362,17 @@ TileLang 0.1.15 as shipped still contains the one-byte read. The patched file is
    displaces `k_block=1` by 64 rows. Index the word directly by `(row, k_block)`; that is the
    layout the smem tile actually has.
 5. **Do not retry the `// 4` split.** Finding 7 predicted it and it was run: same `0.0039`.
-   Three address-arithmetic hypotheses (`// k_blocks` 閳?`// tile_m`, lane-reduced
-   `_sfa_row_in_atom`, `// k_blocks` 閳?`// 4`) are falsified by measurement.
+   Three address-arithmetic hypotheses (`// k_blocks` — `// tile_m`, lane-reduced
+   `_sfa_row_in_atom`, `// k_blocks` — `// 4`) are falsified by measurement.
 6. Run each variant in its own process; a laid-over CUDA context hides real failures.
 7. Before believing any patch result, clear the TileLang compile cache. A stale
    `~/.tilelang/cache` will serve the old kernel and make a correct patch look like a no-op.
 8. Do not trust a symbol-level argument alone. `_scale_word_offset` *looked* like the root cause
    for a whole round; it has no callers. Instrument the call site and read the printed values.
 9. **Do not trust a single timing protocol either.** A naive async-submit loop reported
-   747 TF/s at 4096鲁, and the first reaction was "that exceeds the peak, so something is
-   wrong". Re-timing per-iteration with CUDA events confirmed 707 TF/s, and going to 16384鲁
-   confirmed the number is not an L2 artefact 閳?the peak table itself was wrong, not the
+   747 TF/s at 4096³, and the first reaction was "that exceeds the peak, so something is
+   wrong". Re-timing per-iteration with CUDA events confirmed 707 TF/s, and going to 16384³
+   confirmed the number is not an L2 artefact — the peak table itself was wrong, not the
    measurement.
 
 ## Measured on

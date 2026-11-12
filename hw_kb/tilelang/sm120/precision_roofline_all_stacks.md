@@ -56,7 +56,7 @@ Derived peak column: FP16 = 148, FP8 = 296, FP16-sparse = 296, NVFP4 = 592. See
 
 > **The NVFP4 peak is wrong.** Three independent measurements exceed 592 TF/s: CuTeDSL at
 > M=2048 (847.6), and the fixed TileLang kernel at 4096²×8192 (865.2) and 4096³ (835.9), all
-> `cos` 1.000000. A 46 % overshoot is not wave quantization 閳?it means the `296 脳 2` derivation
+> `cos` 1.000000. A 46 % overshoot is not wave quantization — it means the `296 × 2` derivation
 > does not hold for FP4 on this part. Use **865 TF/s as the working NVFP4 floor**, and read the
 > FP16/FP8 rows of this table as the ones the nameplate actually pins down.
 >
