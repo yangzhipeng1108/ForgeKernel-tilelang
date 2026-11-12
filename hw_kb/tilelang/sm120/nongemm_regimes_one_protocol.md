@@ -24,7 +24,22 @@ kernel" has a single answer.
 | RoPE | 8192×32×128 | 89.0 µs | **1507.3 GB/s** | see note | 1.00026 |
 | causal attention (FA-2 style) | 4×32×2048×128 | 1046.4 µs | **131.3 TF/s** | 89 % of fp16 peak | 1.00000 |
 | LM head | M=16, vocab 152064 | 957.1 µs | **1301.6 GB/s** / 20.8 TF/s | 114 % of read | 1.00000 |
-| LM head | M=256, vocab 152064 | 6396.2 µs | 194.8 GB/s / **49.9 TF/s** | 34 % of fp16 peak | 1.00000 |
+| LM head | M=256, vocab 152064 | 2298.4 µs | **138.7 TF/s** | **94 % of fp16 peak** | 1.00000 |
+
+> **Correction 閳?the M=256 LM-head row used to read 49.9 TF/s / 34 %, and that was a
+> misconfigured kernel, not a property of the shape.** The row was produced by `BM=256` with
+> `threads=128`. At 128 threads a 256-row tile gives each of the four warps 64 rows of
+> accumulator, which spills; the same tile at 256 threads runs **2.8脳 faster**. Reproduced
+> exactly: 6428.7 µs / 49.6 TF/s at `threads=128` versus 2298.4 µs / 138.7 TF/s at
+> `threads=256`, same tile, `cos` 1.000000 both. `BM=128` is insensitive to this (136.9 at 128
+> threads, 137.4 at 256), so the trap is specific to pairing a large BM with too few threads.
+> Three fresh-process repeats of the fast config give 136.2 / 136.6 / 137.1 TF/s.
+>
+> The consequence for planning is the opposite of what the old row implied: **there is no 3脳
+> headroom in the LM head.** At M=256 it is at 94 % of the fp16 peak and the vocabulary
+> projection is not a tuning target. What remains is the M=16 case, which is bandwidth bound at
+> the wall, and byte reduction (block-sparsity over the vocabulary, see
+> `lm_head_is_wide_not_starved.md`), not scheduling.
 
 ## The elementwise rows read over 100 % of "peak" — here is why that is not an error
 
@@ -48,18 +63,22 @@ Note this is a **naive FA-2 with a per-block stride loop, not a tuned tile sched
 is the regime verdict, not a tuned ceiling. A production kernel with the same tiling as the GEMM
 tables would sit in the same 89–97 % band.
 
-## LM head changes regime with M — the one shape-dependent wall
+## LM head changes regime with M — and only the small-M end is short of the wall
 
 | M | bound by | throughput | reading |
 |---|---|---|---|
 | 16 | **HBM (weights)** | 1301.6 GB/s = 114 % of read wall | bandwidth-bound; the 209 MB weight matrix dominates |
-| 256 | **compute** | 49.9 TF/s = 34 % of peak | arithmetic-bound, but badly underfilled at this tile |
+| 256 | **compute** | 138.7 TF/s = **94 % of peak** | arithmetic-bound and essentially at the wall |
 
-At M=16 the kernel re-reads the whole 152064×4096 weight for 16 rows, so it is a bandwidth
-problem and it is at the wall. At M=256 the same shape becomes compute-bound and only reaches
-34 % — there is real headroom there (bigger BM, or the fp8 path the KB measured at 133 TF), and
-it is the one non-GEMM row with a clear tuning target. Again the rule from
-`lm_head_is_wide_not_starved.md`: "skinny" is about M, but the regime is about total work.
+At M=16 the kernel re-reads the whole 152064脳4096 weight for 16 rows, so it is a bandwidth
+problem and it is at the wall. At M=256 the same shape becomes compute-bound and reaches
+**94 %** once the tile is configured sanely (`BM=256` with 256 threads; `threads=128` at that BM
+spills and halves throughput). There is no headroom left to tune here 閳?the earlier "34 %, lots
+of headroom" reading came from that thread misconfiguration and was wrong. The remaining levers
+for the vocabulary projection are byte-level: fp8 weights, or block-sparsity over the vocabulary
+as `lm_head_is_wide_not_starved.md` measured end to end. The rule from that entry still holds:
+"skinny" is about M, but the regime is about total work 閳?and at M=256 the work is already near
+the tensor peak.
 
 ## What this adds to the earlier KB readings
 
