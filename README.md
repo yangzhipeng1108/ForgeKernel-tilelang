@@ -197,6 +197,37 @@ can name, with the key read from `local.env`. The defaults are a 1.2× target in
 4 hours of loop, 3 teacher rounds, and `claude-opus-5-5` for both agents (the paper's runs used
 Claude Fable 5.1 as the arch agent and Claude Opus 5 as the coding agent).
 
+**Which timing window the verdicts read** is `[loop] gate_window` in the run's `loop.toml`, and
+it depends on how the kernel is deployed:
+
+| `gate_window` | What it measures | Pick it when |
+|---|---|---|
+| `device` (default) | pipelined batch ÷ N ≈ pure device time | the claim is kernel quality, or a saturated training step pays the host cost once |
+| `e2e` | per-call latency, host tax inside | every call is its own round trip (an inference caller paying launch + python) |
+| `server:<qps>` | per-request at an offered rate: queueing + service | the kernel is served behind a request queue, where the queue and the tail are part of what it costs |
+
+The server window replays the arrival process rather than a batch, so it reads what a caller at
+that rate actually waits. Its reference must be measured at the same rate — a target derived
+across two rates is a comparison of queueing regimes, not of kernels, so it is refused rather
+than silently divided. Set `SERVER_QPS` in the card's `eval/bench.py` to have the bench measure
+it; without that the window is simply absent. The offline and server readings can disagree by a
+lot (CUDA-L2, the source of this window, measured +19.2% offline vs +26.0% server against cuBLAS
+on one GPU), which is why the choice is config and not a constant.
+
+**A second baseline column** to report next to the reference: `[[comparison]]` rows in
+`task.toml` name extra implementations the report times beside it, as `cuBLASLt-AutoTuning`
+does in CUDA-L2's GEMM tables:
+
+```toml
+[[comparison]]
+name = "cuBLASLt-AutoTuning"
+run  = "reference/cublaslt_at.py:run"
+```
+
+These are a report, not a gate: the reference stays the single opponent the loop decides on and
+the only same-job ratio. The rows land in `report.md` as median-vs-median ratios, so a "beats
+cuBLAS" claim names which of the four matmul baselines it beat.
+
 ## Self-Evolution
 
 ```bash
