@@ -40,7 +40,8 @@ from forgekernel.baseline import (
     save_baseline,
     workloads_mismatch,
 )
-from forgekernel.inner.trajectory import GATE_WINDOW_DEFAULT, GATE_WINDOWS
+from forgekernel.inner.trajectory import (GATE_WINDOW_DEFAULT, GATE_WINDOWS,
+                                              gate_window_name)
 from forgekernel.loop.agentctx import inspect_agent_cmd
 from forgekernel.loop import agent_policy as agent_policy_mod
 from forgekernel.loop import dsl_source as dsl_source_mod
@@ -1580,15 +1581,21 @@ def _resolve_gate_window(flag: str | None, cfg: dict) -> str:
     Mirrors _resolve_language. "device" (pipelined batch ≈ device time — the
     kernel-quality claim, and the default) or "e2e" (per-call+sync,
     host tax inside; per-card opt-in for kernels whose deployment pays the host tax
-    on every call). Per-card because the right window depends on how the kernel is
-    deployed, and validated here because a typo'd window silently gating on the
-    wrong number is the failure mode this whole knob exists to prevent.
+    on every call), or "server:<qps>" (the request-driven window: what a served
+    deployment actually pays, borrowed from CUDA-L2's server mode — its advantage
+    over cuBLAS was consistently larger there than offline). Per-card because the
+    right window depends on how the kernel is deployed, and validated here because
+    a typo'd window silently gating on the wrong number is the failure mode this
+    whole knob exists to prevent.
     """
+    from forgekernel.inner.trajectory import parse_gate_window
     chosen = flag or cfg.get("loop", {}).get("gate_window") or GATE_WINDOW_DEFAULT
-    if chosen not in GATE_WINDOWS:
-        raise SystemExit(
-            f"gate_window must be one of {GATE_WINDOWS}, got {chosen!r} "
-            f"(--gate-window / loop.toml [loop].gate_window)")
+    if isinstance(chosen, str):
+        chosen = chosen.strip()
+    try:
+        parse_gate_window(chosen)
+    except ValueError as e:
+        raise SystemExit(f"{e} (--gate-window / loop.toml [loop].gate_window)")
     return chosen
 
 
@@ -2772,6 +2779,7 @@ def _main(argv: list[str] | None = None) -> int:
         meta_status_path=meta_status_path,
         branch_prefix=branch_prefix, target_ms=target_ms,
         language=language, gate_window=gate_window, kb_arch=kb_arch,
+        fast_skip=bool(cfg.get("loop", {}).get("fast_skip", False)),
         ref_baseline=ref_baseline, arch_baseline=arch_baseline,
         window_contract=window_contract,
         deadline_epoch=time.time() + args.hours * 3600, backend=backend, now=time.time,
@@ -2862,7 +2870,7 @@ def _main(argv: list[str] | None = None) -> int:
         # measure_ref_fresh re-measures — baseline_cli keeps the fastest, so the
         # driver pairs it min-vs-min.
         if args.target_ms is None and ref_baseline is not None:
-            anchor_ms = (ref_baseline.ms_device if ctx.gate_window == "device"
+            anchor_ms = (ref_baseline.ms_device if gate_window_name(ctx.gate_window) == "device"
                          else ref_baseline.ms)
             if anchor_ms:
                 ctx.target_anchor_ms = float(anchor_ms)
@@ -2914,7 +2922,7 @@ def _main(argv: list[str] | None = None) -> int:
             origin = "--target-ms"
         elif (src := arch_baseline or ref_baseline):
             role = "architecture ref" if src is arch_baseline else "library baseline"
-            device_gated = gate_window == "device"
+            device_gated = gate_window_name(gate_window) == "device"
             anchor = src.device_anchor_ms if device_gated else src.ms
             basis = f", {src.device_anchor_basis}" if device_gated else ""
             origin = (f"derived: {anchor} ms {role} ({gate_window} window{basis}"
@@ -3145,7 +3153,7 @@ def _main(argv: list[str] | None = None) -> int:
                 try:
                     from forgekernel.baseline_cli import measure_ref_fresh
                     runs = measure_ref_fresh(args.op, ref_spec, repeat=confirm_jobs)
-                    key = "ms_device" if ctx.gate_window == "device" else "ms"
+                    key = "ms_device" if gate_window_name(ctx.gate_window) == "device" else "ms"
                     ref_samples = [r[key] for r in runs if r.get(key) is not None]
                     if wl_why := _fresh_ref_workloads_mismatch(runs, confirm):
                         confirm["ref_workloads_mismatch"] = wl_why

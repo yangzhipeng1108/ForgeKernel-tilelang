@@ -42,11 +42,13 @@ from forgekernel.loop import lang_mode
 from forgekernel.inner.trajectory import (
     GATE_WINDOW_DEFAULT,
     GATE_WINDOW_DEVICE,
+    GATE_WINDOW_SERVER,
     GATE_WINDOWS,
     IterationRecord,
     append_record,
     constant_output_flag,
     gate_ms,
+    gate_window_name,
     load_records,
 )
 from forgekernel.meta_trajectory import (
@@ -231,6 +233,12 @@ class LoopContext:
     # in this same window; the CLI derives it that way and refuses a device gate
     # over a baseline that never measured the device window.
     gate_window: str = GATE_WINDOW_DEFAULT
+    # Skip the profiling half of an eval for a candidate that is clearly SLOWER
+    # than the sitting best (see FAST_SKIP_NOISE_MULTIPLE / _fast_skip_reason).
+    # Off by default: the mechanism line of the gate wants an NCU table on every
+    # committed row, and only runs that pay more in GPU time than in diagnosis
+    # should turn it on (loop.toml [loop] fast_skip = true).
+    fast_skip: bool = False
     meta_status_path: Path | None = None  # meta-loop trajectory (meta agent's memory)
     fresh_recipe: str | None = None  # a just-certified KB recipe to point the student at
     # In-place reopening of structural / split patches: keep the best green tree
@@ -1201,8 +1209,13 @@ def _best_ms(records, gate_window: str = GATE_WINDOW_DEFAULT) -> float | None:
 
 def _gate_ratio(rec, gate_window: str = GATE_WINDOW_DEFAULT) -> float | None:
     """The record's same-job ratio (ref / student) in the gate window; None when
-    the reference did not ride that job."""
-    return rec.vs_ref_device if gate_window == GATE_WINDOW_DEVICE else rec.vs_ref
+    the reference did not ride that job or that window was not measured."""
+    window = gate_window_name(gate_window)
+    if window == GATE_WINDOW_DEVICE:
+        return rec.vs_ref_device
+    if window == GATE_WINDOW_SERVER:
+        return getattr(rec, "vs_ref_server", None)
+    return rec.vs_ref
 
 
 def _best_ratio(records, gate_window: str = GATE_WINDOW_DEFAULT) -> float | None:
@@ -1268,7 +1281,7 @@ def _home_ref_ms(ctx: LoopContext) -> float | None:
     # numerator by a graph-window denominator would loosen the scaled target
     # by the host tax, inside the noise band, and hand out stop=target for
     # a mediocre KEEP. Same field the phantom-gap anchor uses.
-    return ref.ms_device if ctx.gate_window == "device" else ref.ms
+    return ref.ms_device if gate_window_name(ctx.gate_window) == "device" else ref.ms
 
 
 def _anchors_path(ctx: LoopContext) -> Path:
@@ -1349,7 +1362,7 @@ def _cluster_scale(ctx: LoopContext) -> float | None:
     home = _home_ref_ms(ctx)
     if not home:
         return None
-    key = "ref_device_ms" if ctx.gate_window == "device" else "ref_median_ms"
+    key = "ref_device_ms" if gate_window_name(ctx.gate_window) == "device" else "ref_median_ms"
     seen = [getattr(r, key) for r in
             _on_cluster(load_records(ctx.status_path), ctx, cluster)
             if getattr(r, key, None)]
@@ -1439,6 +1452,42 @@ def _enforce_single_ref(ctx: LoopContext, ev):
 # node — the free cross-signal that convicts it sits in the same record.
 _NCU_REGRESSION_BAND = 1.05
 
+# Fast-skip band, as a multiple of the noise floor: a candidate slower than the
+# sitting best by more than this may skip the profiling half of its eval.
+#
+# Borrowed from CUDA-L2, whose whole inner signal is one scalar (execution speed)
+# and which therefore never spends a second GPU pass on a candidate that already
+# lost. ForgeKernel cannot copy that — the three line gate (correctness /
+# performance / mechanism) is exactly what stops "fast but wrong" and "fast on a
+# lucky node" — so what is borrowed is the cheap case only: a candidate far
+# outside the noise band in the WRONG direction cannot become the best, and its
+# NCU table only matters to a diagnosis nobody will run on it. Wide on purpose
+# (4x the noise floor, so ~6% at the default 1.5%): a candidate close enough that
+# a mechanism reading might explain a later win still gets profiled.
+FAST_SKIP_NOISE_MULTIPLE = 4.0
+
+
+def _fast_skip_reason(ctx: LoopContext, ev, metric_before: float | None) -> str | None:
+    """Why this eval may skip the rest of its GPU work, or None to proceed.
+
+    Applies only to a KEEP-eligible candidate that is clearly SLOWER than the
+    sitting best (never to a correctness fail, and never when there is no bar to
+    be slower than). The number is the gate window's, so the comparison is the one
+    the loop actually decides on.
+    """
+    if not getattr(ctx, "fast_skip", False) or metric_before is None:
+        return None
+    ms = gate_ms(ev, ctx.gate_window)
+    if ms is None:
+        return None
+    noise = ctx.watermark_margin or 0.015        # the loop's own noise floor
+    cutoff = metric_before * (1 + noise * FAST_SKIP_NOISE_MULTIPLE)
+    if ms <= cutoff:
+        return None
+    return (f"{ms} ms is {ms / metric_before:.3f}x the sitting best {metric_before} ms — "
+            f"past {FAST_SKIP_NOISE_MULTIPLE:g}x the {noise:.1%} noise floor, so it cannot "
+            f"take the watermark; skipping the profile")
+
 
 def _best_keep_ncu_ns(records, gate_window: str) -> float | None:
     """NCU kernel time of the sitting best KEEP, if it was profiled."""
@@ -1517,7 +1566,7 @@ def _confirm_suspicious_watermark(ctx: LoopContext, be, branch: str, ev, metric_
     if why is None:
         return ev
     _log(f"watermark: {ms} {why} — confirming before it takes the watermark")
-    key = "device_median_ms" if ctx.gate_window == "device" else "bwd_median_ms"
+    key = "device_median_ms" if gate_window_name(ctx.gate_window) == "device" else "bwd_median_ms"
     readings = [ms]
 
     def _confirmed():
@@ -2397,7 +2446,16 @@ def run_inner_iteration(
     # NCU is best-effort on the GPU side: a PASSING kernel with an empty profiler means
     # NCU itself failed (e.g. a lost job), so retry; a correctness-broken kernel yields
     # no NCU legitimately (the bench crashes), so don't waste GPU retrying that.
-    profiler = _ncu_profiler(ctx, branch, correctness=ev.correctness)
+    skip = _fast_skip_reason(ctx, ev, metric_before)
+    if skip:
+        # A candidate this far behind the bar cannot take the watermark, so its
+        # NCU table would only serve a diagnosis of a row that loses anyway. It
+        # still gets a KEEP/REVERT verdict and a record -- what it does not get is
+        # a second GPU pass (see FAST_SKIP_NOISE_MULTIPLE).
+        _log(f"iter {iter_no}: fast-skip: {skip}")
+        profiler = {}
+    else:
+        profiler = _ncu_profiler(ctx, branch, correctness=ev.correctness)
     orch_summary = _pop_orch_summary(profiler)
     kernels = _pop_kernels(profiler)
     serial_raw = _parse_serial_census(profiler)
@@ -2433,6 +2491,10 @@ def run_inner_iteration(
         ref_median_ms=ev.ref_median_ms, vs_ref=ev.vs_ref,
         device_median_ms=ev.device_median_ms, ref_device_ms=ev.ref_device_ms,
         vs_ref_device=ev.vs_ref_device,
+        server_median_ms=getattr(ev, "server_median_ms", None),
+        ref_server_ms=getattr(ev, "ref_server_ms", None),
+        vs_ref_server=getattr(ev, "vs_ref_server", None),
+        server_qps=getattr(ev, "server_qps", None),
         host_enqueue_ms=ev.host_enqueue_ms, host_bound_ratio=ev.host_bound_ratio,
         ref_host_bound_ratio=ev.ref_host_bound_ratio,
         device_window_basis=ev.device_window_basis,
@@ -2879,7 +2941,7 @@ def run_inner_loop(ctx: LoopContext, start_iter: int, *,
             _log(f"iter {iter_no}: {rec.error} — structural, stopping ({stop}); fix "
                  f"eval/bench.py / window.toml, not the kernel")
             return stop
-        if (ctx.gate_window == "device" and rec.verdict == "KEEP"
+        if (gate_window_name(ctx.gate_window) == "device" and rec.verdict == "KEEP"
                 and rec.bwd_median_ms is not None and rec.device_median_ms is None):
             # Structural bench-contract violation: the bench timed the e2e window
             # but not the device window this run gates on — that never heals on
@@ -5775,7 +5837,7 @@ def _timeline_due(ctx: LoopContext, new_ms) -> bool:
     if last is None:
         return True
     last_ms = _ms_of_tree(ctx, str(last.get("sha") or ""))
-    if last_ms is None and ctx.gate_window == GATE_WINDOW_DEVICE:
+    if last_ms is None and gate_window_name(ctx.gate_window) == GATE_WINDOW_DEVICE:
         last_ms = last.get("ms")          # the probe's own base variant, a device reading
     if new_ms is None or not last_ms:
         return True
@@ -11908,7 +11970,7 @@ def run_best_confirmation(ctx: LoopContext, jobs: int = 3, max_extra: int = 2,
         consecutive_errors = 0
         ev = _enforce_single_ref(ctx, parse_eval(log))
         job = getattr(be, "last_job_id", "") or "?"
-        if ctx.gate_window == "device":
+        if gate_window_name(ctx.gate_window) == "device":
             ms, ref_ms, ratio = ev.device_median_ms, ev.ref_device_ms, ev.vs_ref_device
         else:
             ms, ref_ms, ratio = ev.bwd_median_ms, ev.ref_median_ms, ev.vs_ref

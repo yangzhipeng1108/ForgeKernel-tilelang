@@ -109,6 +109,7 @@ _MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 _KEYS = {
     "task": {"language", "arch"},
     "reference": {"run", "source", "blackbox", "deny", "deny_urls", "deny_modules"},
+    "comparison": {"name", "run"},
     "target": {"ratio", "ms", "timing"},
     "agent.role": {"backend", "provider", "model", "effort", "timeout_s"},
     "budget": {"hours", "max_meta", "reference_hours"},
@@ -165,6 +166,29 @@ class Reference:
 
 
 @dataclass(frozen=True)
+class Comparison:
+    """An extra baseline the run times and reports next to the reference.
+
+    The reference decides ``[target]``'s denominator and is the only opponent the
+    gates read. A comparison is the opposite: it changes nothing the loop decides,
+    it only adds rows to the report, so a claim like "beats cuBLAS" cannot be read
+    as "beats whichever library happened to be this run's ref". Borrowed from
+    CUDA-L2, whose GEMM tables always carry torch.matmul / cuBLAS /
+    cuBLASLt-heuristic / cuBLASLt-AutoTuning side by side — the four differ by up
+    to 11 points on one GPU, so a single column cannot support a competitiveness
+    claim.
+    """
+
+    name: str            # the row's label, free-form ("cuBLASLt-AutoTuning")
+    run_file: Path       # absolute
+    run_fn: str
+
+    @property
+    def run(self) -> str:
+        return f"{self.run_file}:{self.run_fn}"
+
+
+@dataclass(frozen=True)
 class Target:
     ratio: float | None
     ms: float | None
@@ -209,6 +233,7 @@ class Task:
     budget: Budget
     notes: tuple = field(default=())   # non-fatal remarks worth printing at launch
     leaderboard: Leaderboard | None = None
+    comparisons: tuple = field(default=())   # Comparison, in task.toml order
 
     @property
     def mode(self) -> str:
@@ -273,6 +298,7 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
             problems.append("[reference]: a leaderboard task's reference is the board's "
                             "(sealed into its card at `forge new`); leave the table out")
     reference = _read_reference(d, cfg, problems)
+    comparisons = _read_comparisons(d, cfg, problems)
     target = _read_target(cfg, problems)
     teacher = _read_agent(cfg.get("agent", {}), "teacher", problems)
     student = _read_agent(cfg.get("agent", {}), "student", problems)
@@ -286,13 +312,17 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
     elif reference is None:
         notes.append("no [reference]: a /goal session writes one first "
                      f"(budget {budget.reference_hours:g} h)")
+    if comparisons:
+        notes.append(f"{len(comparisons)} comparison baseline(s) reported next to the "
+                     f"reference: {', '.join(c.name for c in comparisons)}")
     for s in shapes:
         if s.groups_to_add:
             notes.append(f"shape {s.name}: {len(s.inputs)} input group(s) given, the teacher "
                          f"adds {s.groups_to_add}")
     return Task(name=name, dir=d, language=language, arch=arch, description=description,
                 shapes=tuple(shapes), reference=reference, target=target, teacher=teacher,
-                student=student, budget=budget, notes=tuple(notes), leaderboard=board)
+                student=student, budget=budget, notes=tuple(notes), leaderboard=board,
+                comparisons=tuple(comparisons))
 
 
 BOARD_SUITES = ("flashinfer-bench", "sol-execbench")
@@ -361,6 +391,13 @@ def merge_config(base: dict, top: dict) -> dict:
     out = {k: ({kk: (dict(vv) if isinstance(vv, dict) else vv) for kk, vv in v.items()}
                if isinstance(v, dict) else v) for k, v in base.items()}
     for table, body in top.items():
+        if table == "comparison":
+            # An array of tables: the deeper layer's list REPLACES the shallower one
+            # (per-row merging would make a row's identity ambiguous). Deep-copied so a
+            # later mutation cannot reach the loaded TOML.
+            out[table] = [dict(r) if isinstance(r, dict) else r for r in body] \
+                if isinstance(body, list) else body
+            continue
         if not isinstance(body, dict) or not isinstance(out.get(table), dict):
             out[table] = dict(body) if isinstance(body, dict) else body
             continue
@@ -397,8 +434,17 @@ def dump_task_toml(cfg: dict) -> str:
         raise TypeError(f"{type(v).__name__} is not a task.toml value")
 
     out = []
-    for table in ("task", "leaderboard", "reference", "target", "agent", "budget"):
+    for table in ("task", "leaderboard", "reference", "target", "agent", "budget",
+                  "comparison"):
         body = cfg.get(table)
+        if table == "comparison":
+            # [[comparison]] rows: an array of tables, written after the scalar tables.
+            if isinstance(body, list):
+                for row in body:
+                    if isinstance(row, dict):
+                        out += ["[[comparison]]",
+                                *(f"{k} = {value(v)}" for k, v in row.items()), ""]
+            continue
         if not isinstance(body, dict):
             continue
         if table == "agent":
@@ -433,6 +479,20 @@ def _unknown_keys(cfg: dict, problems: list[str], where: str = TASK_FILE) -> Non
     for key, val in cfg.items():
         if key not in _KEYS or key == "agent.role":
             problems.append(f"{where}: unknown table [{key}]")
+            continue
+        if key == "comparison":
+            # An array of tables ([[comparison]]): each row's own keys are checked by
+            # _read_comparisons, which also resolves and validates its ``run``.
+            if not isinstance(val, list):
+                problems.append(f"{where}: [[comparison]] must be an array of tables")
+                continue
+            for i, row in enumerate(val):
+                if not isinstance(row, dict):
+                    problems.append(f"{where}: [[comparison]][{i}] must be a table")
+                    continue
+                for k in row:
+                    if k not in _KEYS["comparison"]:
+                        problems.append(f"{where}: unknown key {k!r} in [[comparison]]")
             continue
         if not isinstance(val, dict):
             problems.append(f"{where}: {key} must be a table")
@@ -628,6 +688,52 @@ def _read_reference(d: Path, cfg: dict, problems: list[str]) -> Reference | None
 def _positive(v: object) -> bool:
     return (isinstance(v, (int, float)) and not isinstance(v, bool)
             and math.isfinite(v) and v > 0)
+
+
+def _read_comparisons(d: Path, cfg: dict, problems: list[str]) -> list[Comparison]:
+    """``[[comparison]]`` rows: extra baselines reported beside the reference.
+
+    Each row is ``name`` (the report's label) + ``run`` (the same
+    ``"<file>.py:<function>"`` form [reference] uses, resolved inside the task
+    directory). They are additive only: nothing here feeds a gate, so a bad row is a
+    report defect and must fail validation rather than silently drop a column.
+    """
+    rows = cfg.get("comparison", [])
+    if not isinstance(rows, list):
+        problems.append("[[comparison]] must be an array of tables")
+        return []
+    out: list[Comparison] = []
+    seen: set[str] = set()
+    for i, row in enumerate(rows):
+        where = f"[[comparison]][{i}]"
+        if not isinstance(row, dict):
+            problems.append(f"{where} must be a table")
+            continue
+        for k in row:
+            if k not in _KEYS["comparison"]:
+                problems.append(f"{where}: unknown key {k!r}")
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"{where}: name must be a non-empty label, got {name!r}")
+            continue
+        name = name.strip()
+        if name in seen:
+            problems.append(f"{where}: duplicate comparison name {name!r}")
+            continue
+        seen.add(name)
+        run = row.get("run")
+        m = _ENTRY_RE.match(run) if isinstance(run, str) else None
+        if m is None:
+            problems.append(f"{where}: run must be \"<file>.py:<function>\", got {run!r}")
+            continue
+        run_file = _inside(d, m["file"], f"{where}: run", problems)
+        if run_file is None:
+            continue
+        if not run_file.is_file():
+            problems.append(f"{where}: run: {m['file']!r} is not a file")
+            continue
+        out.append(Comparison(name=name, run_file=run_file, run_fn=m["fn"]))
+    return out
 
 
 def _read_target(cfg: dict, problems: list[str]) -> Target:

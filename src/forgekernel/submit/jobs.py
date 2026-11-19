@@ -20,7 +20,6 @@ A job id is the submit time in epoch seconds, bumped past collisions.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import signal
@@ -28,6 +27,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+try:                      # POSIX job locks; on Windows (test-only hosts) the module still
+    import fcntl          # imports, and ``locked`` degrades to a no-op below.
+except ImportError:       # pragma: no cover - exercised on win32
+    fcntl = None
 
 from forgekernel.submit.config import SubmitConfig
 
@@ -108,6 +112,9 @@ def locked(op_dir: Path):
     d = jobs_dir(op_dir)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / LOCK_NAME, "w") as fh:
+        if fcntl is None:      # no flock here: the GPU host is always POSIX
+            yield
+            return
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             yield

@@ -628,6 +628,52 @@ def best_of(run, task) -> dict | None:
             "kernel": src.stdout if src.returncode == 0 else None}
 
 
+def comparison_rows(run, task, best: dict | None) -> list[dict]:
+    """The ``[[comparison]]`` rows of a finished run, read against the best kernel.
+
+    This is a REPORT, not a gate. The reference stays the single opponent the loop
+    decides on; these rows exist because a one-column "beats the reference" claim
+    cannot distinguish "beat cuBLAS" from "beat the slowest of the four matmul
+    baselines" — CUDA-L2 reports torch.matmul / cuBLAS / cuBLASLt-heuristic /
+    cuBLASLt-AutoTuning side by side for exactly that reason.
+
+    Each row's number is a MEDIAN-vs-MEDIAN ratio (best kernel's confirmed reading
+    over the comparison's archived reading), never a same-job ratio: a comparison
+    does not ride the eval jobs, so mixing it into the gate would break the
+    same-job timing contract the reference obeys. Returns [] when the task declares
+    no comparisons or the run has no confirmed best.
+    """
+    from forgekernel.baseline import RefBaseline, ROLE_LIBRARY
+    if not getattr(task, "comparisons", ()) or best is None or not best.get("median_ms"):
+        return []
+    op_dir = run.operators_dir / task.name
+    window = best.get("window") or "device"
+    best_ms = float(best["median_ms"])
+    rows = []
+    for comp in task.comparisons:
+        archive = op_dir / f"comparison_{_slug(comp.name)}.json"
+        try:
+            data = json.loads(archive.read_text(encoding="utf-8"))
+            base = RefBaseline(**{k: v for k, v in data.items()
+                                  if k in RefBaseline.__dataclass_fields__})
+        except (OSError, ValueError, TypeError):
+            rows.append({"name": comp.name, "status": "not measured"})
+            continue
+        base_ms = base.ms_device if (window == "device" and base.ms_device is not None) \
+            else base.ms
+        if not base_ms:
+            rows.append({"name": comp.name, "status": "not measured in the gate window"})
+            continue
+        rows.append({"name": comp.name, "status": "measured",
+                     "median_ms": base_ms, "speedup": base_ms / best_ms,
+                     "basis": "median-vs-median"})
+    return rows
+
+
+def _slug(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "x"
+
+
 def write_report(run, task, rc: int) -> Path:
     rec = run.record()
     lines = [f"# {run.name}", "", f"- task: {task.name} ({task.mode} mode)",
@@ -644,6 +690,21 @@ def write_report(run, task, rc: int) -> Path:
             kf.parent.mkdir(exist_ok=True)
             kf.write_text(best["kernel"], encoding="utf-8")
             lines.append(f"- kernel: {kf.relative_to(run.dir)}")
+        rows = comparison_rows(run, task, best)
+        if rows:
+            lines += ["", "## Comparison baselines (report only, not gated)", "",
+                      "The reference above is what the loop optimises against and the only "
+                      "same-job ratio. These rows are median-vs-median readings of the extra "
+                      "baselines the task declares, so a competitiveness claim names the "
+                      "library it beats:", "",
+                      "| baseline | reading | speedup vs it | basis |",
+                      "|---|---|---|---|"]
+            for r in rows:
+                if r["status"] != "measured":
+                    lines.append(f"| {r['name']} | — | — | {r['status']} |")
+                else:
+                    lines.append(f"| {r['name']} | {r['median_ms']} ms | "
+                                 f"{r['speedup']:.4f}x | {r['basis']} |")
     lines.append(f"- workspace: {run.ws}")
     kb = kb_changes()
     if kb:

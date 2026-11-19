@@ -104,6 +104,13 @@ class RefBaseline:
     device_window_basis: str = ""      # "" | BASIS_PLAIN | BASIS_GRAPH
     ms_device_plain: float | None = None   # pipelined batch reading, when also reported
     ms_device_graph: float | None = None   # CUDA-graph replay reading (host removed)
+    # The request-driven window (CUDA-L2's server mode), when the ref script reports
+    # one: the per-request reading at a fixed offered rate. `server_qps` is the rate
+    # the number belongs to — a server reading without its rate compares queueing
+    # regimes, not kernels, so `target_ms(gate_window="server:<qps>")` refuses a
+    # mismatch instead of dividing across it.
+    server_median_ms: float | None = None
+    server_qps: float | None = None
     # The device window's precondition check (see forgekernel.timing_audit): how long
     # the host takes to enqueue one call, and that over the device reading. A ratio
     # near 1 means the pipelined window measured python, not the kernel.
@@ -209,6 +216,28 @@ class RefBaseline:
         """
         if not 0 < ratio:
             raise ValueError(f"ratio must be positive, got {ratio}")
+        if gate_window.startswith("server:"):
+            # The request-driven window. A server reading without its offered rate is
+            # not comparable, and the archive stores the rate the reading was taken at:
+            # a target derived across two different rates would chase a queueing
+            # regime, not a kernel. Refuse rather than fall back to another window.
+            from forgekernel.inner.trajectory import SERVER_PREFIX
+            try:
+                wanted = float(gate_window[len(SERVER_PREFIX):])
+            except ValueError:
+                raise ValueError(f"gate_window={gate_window!r}: no offered rate") from None
+            if self.server_median_ms is None:
+                raise ValueError(
+                    f"gate_window={gate_window!r} but the archived {self.role} baseline "
+                    f"for {self.op} has no server-window reading — re-measure with a ref "
+                    f"script that reports the request-driven window")
+            if self.server_qps is not None and abs(self.server_qps - wanted) > 1e-9:
+                raise ValueError(
+                    f"gate_window={gate_window!r} but the archived {self.role} baseline "
+                    f"for {self.op} was measured at {self.server_qps:g} qps — re-measure at "
+                    f"the rate this run gates on (a ratio across two rates is a queueing "
+                    f"comparison, not a kernel one)")
+            return self.server_median_ms / ratio
         if gate_window == "device":
             if self.device_anchor_ms is None:
                 # The prescribed fix differs by role: the library baseline is
@@ -293,6 +322,14 @@ class RefBaseline:
             lines.append("- device median: not measured — this run gates on the device window; any "
                          "number anchored to this baseline may only come from a device reading taken "
                          "afterwards, and must not be substituted with the end-to-end reading")
+        if self.server_median_ms is not None:
+            gating_server = gate_window.startswith("server:")
+            lines.append(f"- server median: **{self.server_median_ms} ms** [MEASURED, "
+                         f"job {self.job or '?'}] (request-driven window, per request "
+                         f"at {self.server_qps:g} qps -- what a served deployment pays: "
+                         f"queueing, launch gaps and tail latency are inside it)"
+                         + ("; the target anchors on this number; " if gating_server
+                            else "the target does not anchor on this number; "))
         if self.n_workloads > 1:
             lines.append(f"- the readings above are the geomean over {self.n_workloads} workloads"
                          + (f" ({', '.join(self.workloads)})" if self.workloads else ""))

@@ -47,6 +47,19 @@ class IterationRecord:
     device_median_ms: float | None = None
     ref_device_ms: float | None = None
     vs_ref_device: float | None = None
+    # THIRD window, opt-in: the same kernel timed under a request-driven load at a
+    # fixed offered rate (CUDA-L2's "server mode"). A one-shot batch latency ignores
+    # what a served deployment pays — queueing behind other requests, tail latency,
+    # launch gaps at low batch — and CUDA-L2's tables are the evidence that the two
+    # diverge: on the same GPU its offline gain over cuBLAS was +19.2% while the
+    # server-mode gain was +26.0% (H100: +17.5% vs +40.5%). A run that gates on this
+    # window is optimising "beats the reference at q requests/s", not "is a faster
+    # kernel", so it is config and never a default. server_qps records the offered
+    # rate, because a server reading without its QPS is not comparable to anything.
+    server_median_ms: float | None = None
+    ref_server_ms: float | None = None
+    vs_ref_server: float | None = None
+    server_qps: float | None = None
     # Precondition of the device window (see EvalResult in loop/parse.py): how long
     # the host alone takes to enqueue one call, and that over the device reading.
     # Recorded per iteration so the criterion lives in the trajectory the meta agent
@@ -144,23 +157,63 @@ _LEGACY_KEYS = {"cublas_median_ms": "ref_median_ms", "vs_cublas": "vs_ref",
 # on the other window.
 GATE_WINDOW_E2E = "e2e"
 GATE_WINDOW_DEVICE = "device"
+# "server": the request-driven window (see server_median_ms on IterationRecord). Not in
+# the default and not selectable through the plain GATE_WINDOWS tuple: it needs an
+# offered rate, so the loop spells it "server:<qps>" and _parse_gate_window below is the
+# only thing that turns a string into this constant.
+GATE_WINDOW_SERVER = "server"
 GATE_WINDOWS = (GATE_WINDOW_E2E, GATE_WINDOW_DEVICE)
 GATE_WINDOW_DEFAULT = GATE_WINDOW_DEVICE
+
+SERVER_PREFIX = f"{GATE_WINDOW_SERVER}:"
+
+
+def parse_gate_window(spec: str) -> tuple[str, float | None]:
+    """``spec`` -> (window, qps). "device" / "e2e" -> (that, None); "server:<qps>" ->
+    ("server", qps). Raises ValueError otherwise.
+
+    The server window carries its offered rate in the NAME rather than in a sibling
+    config key, so a window can never be chosen without the rate it is read at (and a
+    status record's gate_window already says which rate its server_ms belongs to).
+    """
+    if spec in GATE_WINDOWS:
+        return spec, None
+    if isinstance(spec, str) and spec.startswith(SERVER_PREFIX):
+        raw = spec[len(SERVER_PREFIX):].strip()
+        try:
+            qps = float(raw)
+        except ValueError:
+            raise ValueError(f"gate_window {spec!r}: the part after {SERVER_PREFIX!r} must be "
+                             f"a positive number of requests per second, got {raw!r}") from None
+        if not (qps > 0):
+            raise ValueError(f"gate_window {spec!r}: offered rate must be positive, got {qps}")
+        return GATE_WINDOW_SERVER, qps
+    raise ValueError(
+        f"gate_window must be one of {GATE_WINDOWS} or \"{SERVER_PREFIX}<qps>\" "
+        f"(the request-driven server window), got {spec!r}")
+
+
+def gate_window_name(spec: str) -> str:
+    """The window a spec selects, without its rate ("server:100" -> "server")."""
+    return parse_gate_window(spec)[0]
 
 
 def gate_ms(rec, gate_window: str = GATE_WINDOW_DEFAULT) -> float | None:
     """The record's reading in the gate window; None when that window was not measured.
 
-    Works on anything carrying ``bwd_median_ms``/``device_median_ms`` (IterationRecord,
-    EvalResult). None under gate_window="device" is a bench-contract violation for an
-    evaluated KEEP — the driver refuses it loudly rather than letting every verdict
-    silently degrade to "no reading" (a device-gated loop where the bench only times
-    e2e would never hit target and never plateau).
+    Works on anything carrying ``bwd_median_ms``/``device_median_ms``/``server_median_ms``
+    (IterationRecord, EvalResult). None under gate_window="device" is a bench-contract
+    violation for an evaluated KEEP — the driver refuses it loudly rather than letting
+    every verdict silently degrade to "no reading" (a device-gated loop where the bench
+    only times e2e would never hit target and never plateau). The same holds for
+    "server:<qps>": a bench that does not run the request-driven window leaves the
+    gate without a reading, and that is reported, not papered over.
     """
-    if gate_window not in GATE_WINDOWS:
-        raise ValueError(f"gate_window must be one of {GATE_WINDOWS}, got {gate_window!r}")
-    if gate_window == GATE_WINDOW_DEVICE:
+    window, _ = parse_gate_window(gate_window)
+    if window == GATE_WINDOW_DEVICE:
         return rec.device_median_ms
+    if window == GATE_WINDOW_SERVER:
+        return getattr(rec, "server_median_ms", None)
     return rec.bwd_median_ms
 
 

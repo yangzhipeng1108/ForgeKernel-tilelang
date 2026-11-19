@@ -20,6 +20,10 @@ arch     = "sm100"                   # the target GPU (sm90, sm100, ...)
 # [target]
 # ratio  = 1.2                       # x the reference's speed (or ms = <absolute target>)
 # timing = "device"                  # device | e2e
+#                                    # (the gate window — "device" / "e2e" /
+#                                    #  "server:<qps>" — is the card's [loop] gate_window,
+#                                    #  written into <run>/operators/<op>/loop.toml; only
+#                                    #  loop.toml [target].timing is copied from here)
 
 # [agent]                            # both agents; [agent.teacher] / [agent.student] for one
 # model  = "claude-opus-5-5"

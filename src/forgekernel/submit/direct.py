@@ -21,7 +21,6 @@ else is theirs. The lock is what keeps forgekernel's own runs apart.
 
 from __future__ import annotations
 
-import fcntl
 import io
 import lzma
 import os
@@ -33,6 +32,11 @@ import tarfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+try:                      # POSIX GPU locks; on Windows (test-only hosts) the module still
+    import fcntl          # imports and ``gpu_lock`` degrades to a no-op below.
+except ImportError:       # pragma: no cover - exercised on win32
+    fcntl = None
 
 from forgekernel.submit.config import SubmitConfig, is_secret_env
 from forgekernel.submit.jobs import (BEGIN_MARKER, RUN_HEADROOM_S, STATUS_FAILED,
@@ -70,6 +74,8 @@ def gpu_lock(gpu: str, log_file=None, poll_s: float = 30.0):
         waited = 0.0
         while True:
             try:
+                if fcntl is None:      # cannot contend without flock; the GPU host is POSIX
+                    break
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except OSError:
@@ -82,7 +88,8 @@ def gpu_lock(gpu: str, log_file=None, poll_s: float = 30.0):
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def remote_tree(cfg: SubmitConfig) -> str:

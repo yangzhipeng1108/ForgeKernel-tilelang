@@ -87,6 +87,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from forgekernel.inner.trajectory import gate_window_name
 from forgekernel.paths import operators_dir
 
 MODES = ("auto", "always", "off")
@@ -359,7 +360,7 @@ def resolve_bar(cfg: dict, op_dir: Path, *, target_ms: float | None, ratio: floa
                 gate_window: str) -> dict:
     """The speed a candidate must reach for the session to end early (see module doc)."""
     lc = cfg.get("loop") or {}
-    win = "device" if gate_window == "device" else "e2e"
+    win = gate_window_name(gate_window)
     if target_ms:
         return {"kind": "target_ms", "ms": float(target_ms), "window": win,
                 "text": f"{win} reading <= {float(target_ms):.6g} ms (--target-ms)"}

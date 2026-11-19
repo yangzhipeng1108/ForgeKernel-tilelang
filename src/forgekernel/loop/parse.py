@@ -135,6 +135,15 @@ class EvalResult:
     device_median_ms: float | None = None
     ref_device_ms: float | None = None
     vs_ref_device: float | None = None
+    # THIRD window, opt-in: the request-driven reading (CUDA-L2's server mode). The
+    # bench reports it only when it was asked for an offered rate; server_qps says
+    # which rate, so a reading is never separated from the load it was taken under.
+    # See IterationRecord.server_median_ms in inner/trajectory.py for why the run
+    # offers this window at all.
+    server_median_ms: float | None = None
+    ref_server_ms: float | None = None
+    vs_ref_server: float | None = None
+    server_qps: float | None = None
     # The device window's PRECONDITION: it equals device time only while the host can
     # enqueue faster than the device drains. host_enqueue_ms times the host alone (N
     # calls, no synchronize in between); host_bound_ratio is that over the device
@@ -326,6 +335,10 @@ def parse_eval(text: str) -> EvalResult:
         device_median_ms=_opt("device_median_ms"),
         ref_device_ms=_opt("ref_device_ms", "cublas_device_ms"),
         vs_ref_device=_opt("vs_ref_device", "vs_cublas_device"),
+        server_median_ms=_opt("server_median_ms"),
+        ref_server_ms=_opt("ref_server_ms"),
+        vs_ref_server=_opt("vs_ref_server"),
+        server_qps=_opt("server_qps"),
         host_enqueue_ms=_opt_any("host_enqueue_ms", "enqueue_ms"),
         host_bound_ratio=_opt("host_bound_ratio"),
         ref_host_bound_ratio=_opt_any("ref_host_bound_ratio", "cublas_host_bound_ratio"),

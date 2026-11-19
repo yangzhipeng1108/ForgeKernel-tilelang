@@ -49,6 +49,15 @@ performance block as:
     e2e:    "bwd_median_ms"     (+ ref: "ref_median_ms",  ratio "vs_ref")
     device: "device_median_ms"  (+ ref: "ref_device_ms",  ratio "vs_ref_device")
 
+A THIRD window is opt-in (CUDA-L2's server mode; see "the request-driven window"
+below): set ``SERVER_QPS`` at module scope and the same calls also report
+
+    server: "server_median_ms"  (+ ref: "ref_server_ms",  ratio "vs_ref_server",
+                                  offered rate "server_qps")
+
+a per-request QUEUEING + service reading at that offered rate. Leave it None and no
+server key is emitted — an unmeasured window is never reported as a measured zero.
+
 SINGLE-REF CONTRACT: the ref_* keys may carry exactly one thing — THE reference
 this run declares in loop.toml, timed back-to-back in the same job. If the ref
 cannot ride the student job (blackbox runs: the ref package is readable source),
@@ -214,6 +223,105 @@ def host_bound_ratio(host_enqueue_ms, device_median_ms):
     return host_enqueue_ms / device_median_ms
 
 
+# --- the request-driven window (CUDA-L2's "server mode") -----------------------
+#
+# The two windows above are both ONE-SHOT: they say what a call costs when nothing
+# else is queued. A served deployment never sees that. Its calls arrive at some
+# offered rate q and wait behind each other; the queue, the tail, and the launch gaps
+# at a low batch are a real part of what it pays, and none of them appear in either
+# window above.
+#
+# CUDA-L2 measures both and reports both, and the two disagree by a lot: on the same
+# A100 its offline gain over cuBLAS was +19.2% while the server-mode gain was +26.0%,
+# and on H100 +17.5% vs +40.5%. An operator that is deployed behind a request queue
+# and optimised for a one-shot reading is optimised for the wrong number.
+#
+# So this window replays the arrival process instead of a batch: requests are
+# submitted on the schedule the offered rate implies (arrival i is due at i / q),
+# and a request that finds the device busy waits. Each reading is the wall time from
+# a request's due time to its completion — which is its QUEUEING DELAY plus its
+# service time, exactly what a caller at the p-th percentile pays. The reading is the
+# median over requests, so it is comparable to the other windows' medians.
+#
+# What this window is NOT: a claim about a specific serving stack (vLLM, Triton, ...).
+# It replays the arrival process only, with everything else the same. That is the
+# level of fidelity a kernel-vs-kernel ratio needs, and it is the level CUDA-L2 uses.
+#
+# Absent unless the card registers an offered rate. It is opt-in through
+# timing.SERVER_QPS (or the bench passing its own), because a request-driven reading
+# at a rate the card did not choose is not comparable to anything.
+
+SERVER_QPS = None          # offered requests per second; None = the window is off
+SERVER_WARMUP_REQUEST_SECONDS = 1.0
+SERVER_BENCH_REQUEST_SECONDS = 3.0
+
+
+def time_server(fn, *, qps: float, warmup_seconds: float = SERVER_WARMUP_REQUEST_SECONDS,
+                benchmark_seconds: float = SERVER_BENCH_REQUEST_SECONDS) -> list[float]:
+    """Per-request latencies (queueing + service) under an offered rate of ``qps``.
+
+    Arrival i is due at ``i / qps`` seconds after the start; the loop sleeps until
+    that moment (never early — the clock is the offered rate) and then calls ``fn``,
+    recording the wall time from the due moment to the synchronize that completes it.
+    Sleeping past a due time is the backlog this window exists to show, not an
+    artifact to correct away.
+
+    Returns one sample per request in the benchmark phase; the median is the reading.
+    Raises ValueError when ``qps`` is not positive.
+    """
+    if not qps or qps <= 0:
+        raise ValueError(f"server window needs a positive offered rate, got {qps!r}")
+    period = 1.0 / qps
+    if warmup_seconds > 0:
+        _drain_server(fn, period, int(round(warmup_seconds * qps)))
+    n = int(round(benchmark_seconds * qps))
+    samples: list[float] = []
+    t_start = time.perf_counter()
+    for i in range(n):
+        due = t_start + i * period
+        now = time.perf_counter()
+        if due > now:
+            time.sleep(due - now)
+        arrive = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - arrive) * 1e3)
+    return samples
+
+
+def _drain_server(fn, period: float, n: int) -> None:
+    t_start = time.perf_counter()
+    for i in range(n):
+        due = t_start + i * period
+        now = time.perf_counter()
+        if due > now:
+            time.sleep(due - now)
+        fn()
+    torch.cuda.synchronize()
+
+
+def server_window(fn, *, qps: float | None = None) -> dict | None:
+    """The server window's block for an eval JSON, or None when it is off.
+
+    ``qps`` defaults to ``SERVER_QPS``: the card that wants a request-driven reading
+    sets it once at module scope, and every call site below picks it up. None (or a
+    non-positive rate) means this job reports no server keys at all — an unmeasured
+    window must never be reported as a measured zero.
+    """
+    rate = qps if qps is not None else SERVER_QPS
+    if not rate or rate <= 0:
+        return None
+    samples = time_server(fn, qps=rate)
+    return {"server_median_ms": statistics.median(samples), "server_qps": rate,
+            "server_samples_ms": len(samples)}
+
+
+def server_reading(fn, *, qps: float | None = None):
+    """The server window's median for one side, or None when the window is off."""
+    block = server_window(fn, qps=qps)
+    return block["server_median_ms"] if block else None
+
+
 def run_prep(prep) -> dict:
     """Run the window-outside prep step once and hand back what it produced.
 
@@ -322,6 +430,9 @@ def _measure(call) -> dict:
     ratio = host_bound_ratio(host_ms, device_median)
     if ratio is not None:
         out["host_bound_ratio"] = ratio
+    server = server_window(call)
+    if server is not None:
+        out.update(server)
     return out
 
 
@@ -457,6 +568,10 @@ def _mirrored(first: dict, second: dict) -> dict:
     gate window — is the mean of the two, and ``host_bound_ratio`` is recomputed
     against that mean so the precondition check reads the same number the gate
     does. ``device_readings_ms`` keeps both raw readings for the job log.
+
+    The server window, when the card measured one, is mirrored the same way and for
+    the same reason: a queueing reading drifts with the part's thermal state, so the
+    mean of the two positions is what both sides occupy.
     """
     out = dict(first)
     readings = [first["device_median_ms"], second["device_median_ms"]]
@@ -465,6 +580,10 @@ def _mirrored(first: dict, second: dict) -> dict:
     ratio = host_bound_ratio(out.get("host_enqueue_ms"), out["device_median_ms"])
     if ratio is not None:
         out["host_bound_ratio"] = ratio
+    if first.get("server_median_ms") is not None and second.get("server_median_ms") is not None:
+        srv = [first["server_median_ms"], second["server_median_ms"]]
+        out["server_median_ms"] = sum(srv) / 2.0
+        out["server_readings_ms"] = srv
     return out
 
 
@@ -576,6 +695,19 @@ def paired_performance(paired: dict, *, e2e_key: str = "bwd_median_ms",
             "ref_host_bound_ratio": (round(r["host_bound_ratio"], 3)
                                      if r.get("host_bound_ratio") is not None else None),
         })
+    # The request-driven window rides only when the card measured one (SERVER_QPS set),
+    # and its ratio only when the reference produced a mirrored server reading too --
+    # an unmeasured side must never be divided into.
+    if k.get("server_median_ms") is not None:
+        out["server_median_ms"] = round(k["server_median_ms"], ndigits)
+        out["server_qps"] = k.get("server_qps")
+        out["server_readings_ms"] = [round(v, ndigits)
+                                     for v in k.get("server_readings_ms", [])]
+        if r and r.get("server_median_ms") is not None:
+            out["ref_server_ms"] = round(r["server_median_ms"], ndigits)
+            out["ref_server_readings_ms"] = [round(v, ndigits)
+                                             for v in r.get("server_readings_ms", [])]
+            out["vs_ref_server"] = round(r["server_median_ms"] / k["server_median_ms"], ndigits)
     return out
 
 
@@ -759,6 +891,20 @@ def workloads_performance(result: dict, *, e2e_key: str = "bwd_median_ms",
             out["in_job_ref"] = errors[0] if errors else "absent"
         else:
             out["in_job_ref"] = f"partial: no reference pair on {', '.join(missing)}"
+    # The server window aggregates like the device one: the geomean over workloads,
+    # and its ratio only when EVERY workload measured it on both sides. A workload
+    # the card left unset would otherwise re-weight the queueing reading.
+    srv = [k["server_median_ms"] for k in kernels if k.get("server_median_ms") is not None]
+    if len(srv) == len(kernels):
+        out["server_median_ms"] = round(_geomean(srv), ndigits)
+        out["server_qps"] = next((k.get("server_qps") for k in kernels
+                                  if k.get("server_qps") is not None), None)
+        ref_srv = [r["server_median_ms"] for r in refs
+                   if r and r.get("server_median_ms") is not None]
+        if all(refs) and len(ref_srv) == len(refs):
+            ref_srv_ms = _geomean(ref_srv)
+            out["ref_server_ms"] = round(ref_srv_ms, ndigits)
+            out["vs_ref_server"] = round(ref_srv_ms / _geomean(srv), ndigits)
     if (prep := _workloads_prep_block(runs)) is not None:
         out["prep"] = prep
     per = []
