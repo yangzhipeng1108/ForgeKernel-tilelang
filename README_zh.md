@@ -177,6 +177,32 @@ forge run .artifacts/rmsnorm_<id>                       # 中断后续跑
 1.2 倍，内层循环 4 小时，teacher 3 轮，两个 agent 都用 `claude-opus-5-5`（论文的运行里 arch agent 用
 Claude Fable 5.1，coding agent 用 Claude Opus 5）。
 
+**判定读哪个计时窗口**由本次运行的 `loop.toml` 里 `[loop] gate_window` 决定，取决于 kernel 怎么上线：
+
+| `gate_window` | 测的是什么 | 什么时候选它 |
+|---|---|---|
+| `device`（默认） | 流水批处理 ÷ N ≈ 纯 device 时间 | 要声称的是 kernel 质量，或饱和的训练步只付一次 host 开销 |
+| `e2e` | 单次调用延迟，含 host 开销 | 每次调用都是一次独立往返（推理调用方要付 launch + python） |
+| `server:<qps>` | 指定到达率下的单请求耗时：排队 + 服务 | kernel 挂在一个请求队列后面，队列和长尾本身就是它成本的一部分 |
+
+server 窗口回放的是到达过程而不是一个批，所以读到的是按该速率到达的调用方实际要等多久。它的参照必须在
+同一速率下测量——跨两个速率推出的目标比较的是排队状态而不是 kernel，因此会被拒绝，而不是悄悄相除。
+在 card 的 `eval/bench.py` 里设 `SERVER_QPS` 才会测这一窗口；不设则该窗口直接缺席。离线和 server 两个
+读数可能相差很多（这个窗口来自 CUDA-L2，它在同一块 GPU 上相对 cuBLAS 测得离线 +19.2%、server 模式
++26.0%），这正是把它做成配置项而非常量的原因。
+
+**多一列基线**放在参照旁边报告：`task.toml` 里的 `[[comparison]]` 行指定额外的实现，由报告一并计时，
+就像 CUDA-L2 的 GEMM 表格里的 `cuBLASLt-AutoTuning`：
+
+```toml
+[[comparison]]
+name = "cuBLASLt-AutoTuning"
+run  = "reference/cublaslt_at.py:run"
+```
+
+这些只进报告，不进 gate：参照仍是循环唯一判定的对手，也是唯一的同作业比值。这些行以 median-vs-median
+比值落进 `report.md`，这样「超过 cuBLAS」的说法就能说清超的是四个 matmul 基线中的哪一个。
+
 ## 自进化
 
 ```bash
