@@ -18,16 +18,25 @@ from forgekernel.component_cli import main as component_main
 
 def _stage(root: Path, name: str, *, in_shape=("m",), out_shape=("m",),
            in_dtype="float32", out_dtype="float32", resources=None, roles=None,
-           golden="OUT = IN", impl="# impl\n"):
+           golden="OUT = IN", impl="# impl\n", in_handle=None, out_handle=None,
+           out_generation=None):
     d = root / "components" / name
     d.mkdir(parents=True)
     (d / comp.COMPONENT_TOML).write_text(
         f'[component]\nname = "{name}"\nlanguages = ["cutedsl"]\nsummary = "{name}"\n'
         + _tbl("resources", resources) + _tbl("roles", roles), encoding="utf-8")
+    in_spec = {"shape": list(in_shape), "dtype": in_dtype}
+    out_spec = {"shape": list(out_shape), "dtype": out_dtype}
+    if in_handle is not None:
+        in_spec["handle"] = in_handle
+    if out_handle is not None:
+        out_spec["handle"] = out_handle
+    if out_generation is not None:
+        out_spec["generation"] = out_generation
     contract = {
         "axes": list(in_shape) if in_shape == out_shape else sorted(set(in_shape) | set(out_shape)),
-        "inputs": {"x": {"shape": list(in_shape), "dtype": in_dtype}},
-        "outputs": {"y": {"shape": list(out_shape), "dtype": out_dtype}},
+        "inputs": {"x": in_spec},
+        "outputs": {"y": out_spec},
         "semantics": f"{name}",
     }
     (d / comp.CONTRACT_JSON).write_text(json.dumps(contract), encoding="utf-8")
@@ -103,6 +112,35 @@ def test_renamed_axes_still_link(tmp_path):
     assert linkmod.link(["load", "gemm"], root=tmp_path).stages == ["load", "gemm"]
 
 
+def test_a_handle_change_is_not_a_seam_failure(tmp_path):
+    # tmem -> reg is the tensor import the linker generates, so the link must succeed
+    _stage(tmp_path, "gemm", out_handle="tmem")
+    _stage(tmp_path, "epi", in_handle="reg")
+    assert linkmod.link(["gemm", "epi"], root=tmp_path).stages == ["gemm", "epi"]
+
+
+def test_an_unknown_handle_is_refused_with_L_HANDLE(tmp_path):
+    _stage(tmp_path, "gemm", out_handle="reg")
+    _stage(tmp_path, "epi", in_handle="ldsm")       # not a known location
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.link(["gemm", "epi"], root=tmp_path)
+    assert any(d.code == "L-HANDLE" and "ldsm" in d.message for d in ei.value.diagnostics)
+
+
+def test_a_generation_mismatch_is_refused_with_L_PHASE(tmp_path):
+    _stage(tmp_path, "gemm", out_handle="tmem", out_generation=0)
+    _stage(tmp_path, "epi", in_handle="tmem")
+    # consumer expects generation 0 by default; make it explicit and different
+    cdir = tmp_path / "components" / "epi"
+    c = json.loads((cdir / comp.CONTRACT_JSON).read_text())
+    c["inputs"]["x"]["generation"] = 1
+    (cdir / comp.CONTRACT_JSON).write_text(json.dumps(c), encoding="utf-8")
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.link(["gemm", "epi"], root=tmp_path)
+    diag = [d for d in ei.value.diagnostics if d.code == "L-PHASE"]
+    assert diag and "ring of depth >= 2" in diag[0].message
+
+
 def test_an_unknown_stage_is_refused_with_L_STAGE(tmp_path):
     _stage(tmp_path, "load")
     with pytest.raises(linkmod.LinkError) as ei:
@@ -167,8 +205,20 @@ def test_render_fused_embeds_each_stage_and_parses(tmp_path):
     plan = linkmod.link(["load", "gemm"], root=tmp_path)
     src = linkmod.render_fused(plan, root=tmp_path)
     assert "def load(x):" in src and "def gemm(x):" in src
-    assert "load.y -> gemm.x" in src
+    assert "load.y" in src and "gemm.x" in src
+    assert "acc_identity(n_load_y, n_gemm_x)" in src      # generated hand-off call
     ast.parse(src)  # the skeleton is valid Python
+
+
+def test_render_fused_generates_a_move_for_a_handle_change(tmp_path):
+    # producer leaves the accumulator in TMEM; consumer reads it in registers (T4 import)
+    _stage(tmp_path, "gemm", out_handle="tmem", impl="def gemm(x):\n    return x\n")
+    _stage(tmp_path, "epi", in_handle="reg", impl="def epi(x):\n    return x\n")
+    plan = linkmod.link(["gemm", "epi"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "gemm.y (tmem) -> epi.x (reg)" in src
+    assert "acc_tmem_to_reg(n_gemm_y, n_epi_x)" in src
+    ast.parse(src)
 
 
 def test_render_fused_refuses_shadowed_top_level_names(tmp_path):

@@ -10,15 +10,23 @@ GPU, and that is where most link-time decisions actually live:
   link only if the output one produces matches, by name / dtype / shape-over-axes, the
   input the next one consumes. A mismatch is refused with a numbered ``L-*`` diagnostic,
   the same shape as PipeLink's ``L-PROTO`` / ``L-HANDLE``, rather than silently producing
-  a kernel that hangs.
+  a kernel that hangs. Two physical facts are checked too: a port's ``handle`` (where the
+  tensor lives — TMEM / registers / shared memory; a differing kind is bridged by the
+  generated copy, an *unknown* kind is ``L-HANDLE``) and its ``generation`` (which pipeline
+  generation it carries; a mismatch means several in flight, refused with ``L-PHASE`` and
+  the ring depth that would carry them).
 * **resource and role solving** — every stage declares what it consumes (shared memory,
   TMEM, registers, barrier slots, warps) and the caller gives the target's caps; the
-  linker sums the per-stage claims, finds the tightest ring depth, and refuses a plan that
-  exceeds a cap or double-books a role. Pure arithmetic, so it is exact and testable.
+  linker solves the peak simultaneous use (not the sum), finds the tightest ring depth,
+  and refuses a plan that exceeds a cap or double-books a role. Pure arithmetic, so it is
+  exact and testable.
 * **fused-source generation** — the linked plan renders one kernel source skeleton in
   which each stage's body is inlined under its declared role, wired by generated hand-off
-  code. The skeleton is syntactically valid Python (or CUDA-shaped C++), so a downstream
-  step compiles it; here it is checked by ``ast.parse`` (Python) — no GPU, no build.
+  code: for each edge it emits the actual move (``acc_tmem_to_reg`` when a TMEM accumulator
+  is imported into registers, ``acc_reg_to_smem`` to stage a ring slot, ``acc_identity``
+  when the kind is unchanged), chosen from the two ports' handle kinds. The skeleton is
+  syntactically valid Python (or CUDA-shaped C++), so a downstream step compiles it; here it
+  is checked by ``ast.parse`` (Python) — no GPU, no build.
 * **semantic parity, on the CPU** — each stage ships a ``verify.json`` whose ``golden``
   says what it computes (torch source). Chaining those goldens through the same wiring the
   linker solved gives a CPU-torch statement of the fused kernel; running it against a
@@ -58,6 +66,10 @@ DIAG = {
     "L-PROTO": "two linked stages disagree on an interface (name / dtype / shape); a bridge "
                "that would fit is named when one exists",
     "L-WIRE": "the pipeline names a stage, or a port, that does not exist",
+    "L-HANDLE": "a port names a handle kind (tmem/reg/smem) the linker does not understand, "
+                "so it cannot generate the tensor hand-off",
+    "L-PHASE": "producer and consumer disagree on the pipeline generation a port carries; "
+               "tensor import hands off one generation, so several in flight need a ring",
     "L-RES": "a resource's simultaneous peak exceeds the target's cap",
     "L-ROLE": "the warp peak exceeds the block, or a role is malformed",
     "L-RING": "the pipeline asks for a ring depth outside what the stages allow",
@@ -206,15 +218,60 @@ def _seam_for_port(prev_name: str, prev_contract: dict, out_port: str,
         return [Diagnostic("L-WIRE", f"{nxt_name} has no input {in_port!r} "
                                      f"(inputs: {', '.join(n_in) or 'none'})")]
     po_spec, ni_spec = p_out[out_port], n_in[in_port]
-    if _same_port(po_spec, ni_spec, prev_contract, nxt_contract):
-        return []
-    hint = _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec, nxt_contract)
-    msg = (f"{prev_name}.{out_port} ({_desc(po_spec)}) does not match "
-           f"{nxt_name}.{in_port} ({_desc(ni_spec)})")
-    if hint:
-        return [Diagnostic("L-PROTO", msg + f"; a bridge would fit: insert {hint} "
-                                           f"between them ({prev_name} -> {hint} -> {nxt_name})")]
-    return [Diagnostic("L-PROTO", msg)]
+    problems: list[Diagnostic] = []
+    problems += _handle_for_edge(prev_name, out_port, po_spec, nxt_name, in_port, ni_spec)
+    if not _same_port(po_spec, ni_spec, prev_contract, nxt_contract):
+        hint = _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec, nxt_contract)
+        msg = (f"{prev_name}.{out_port} ({_desc(po_spec)}) does not match "
+               f"{nxt_name}.{in_port} ({_desc(ni_spec)})")
+        if hint:
+            problems.append(Diagnostic(
+                "L-PROTO", msg + f"; a bridge would fit: insert {hint} "
+                                   f"between them ({prev_name} -> {hint} -> {nxt_name})"))
+        else:
+            problems.append(Diagnostic("L-PROTO", msg))
+    return problems
+
+
+def _handle_for_edge(prev_name: str, out_port: str, po_spec: dict,
+                     nxt_name: str, in_port: str, ni_spec: dict) -> list[Diagnostic]:
+    """Whether the tensor can actually be handed from ``prev.out`` to ``nxt.in``.
+
+    Two physical facts the seam check above (dtype/shape) does not cover, both from the
+    contract's optional port fields:
+
+    * **handle** — where the tensor lives (``tmem`` / ``reg`` / ``smem``). The linker
+      *generates* the move between any two known kinds (TMEM -> reg, reg -> smem, ...), so a
+      differing kind is expected, not an error. An **unknown** kind is an ``L-HANDLE``: no
+      copy can be emitted for a location the linker does not understand. A kind is only a
+      problem when it cannot be named.
+    * **generation** — which pipeline generation the port carries. Tensor import hands off
+      *one* generation at a time; if the producer emits generation G and the consumer expects
+      a different G', exactly the "multi-generation in flight" case PipeLink says must be an
+      explicit multi-slot ring. So it is ``L-PHASE``, and the message names the ring depth
+      (``|G - G'| + 1``) that would make the hand-off legal instead of dropping data.
+
+    Defaults: a port without ``handle`` or ``generation`` imposes no constraint, so the
+    common one-input stage needs neither field."""
+    diags: list[Diagnostic] = []
+    ph = po_spec.get("handle")
+    nh = ni_spec.get("handle")
+    for which, kind in ((f"{prev_name}.{out_port}", ph), (f"{nxt_name}.{in_port}", nh)):
+        if kind is not None and kind not in comp.HANDLE_KINDS:
+            diags.append(Diagnostic(
+                "L-HANDLE", f"{which} declares handle {kind!r}, not one of "
+                            f"{list(comp.HANDLE_KINDS)} — no hand-off code can move it"))
+    pg = po_spec.get("generation")
+    ng = ni_spec.get("generation")
+    if isinstance(pg, int) and not isinstance(pg, bool) and \
+            isinstance(ng, int) and not isinstance(ng, bool) and pg != ng:
+        depth = abs(pg - ng) + 1
+        move = f"{ph or 'unspecified'} -> {nh or 'unspecified'}"
+        diags.append(Diagnostic(
+            "L-PHASE", f"{prev_name}.{out_port} emits generation {pg}, "
+                       f"{nxt_name}.{in_port} expects {ng} ({move}); tensor import hands "
+                       f"off one generation — carry these in a ring of depth >= {depth}"))
+    return diags
 
 
 def _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec,
@@ -648,8 +705,9 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
         parts.append(f"\n# ==== stage: {name} ({plan.language}) ====\n" + body.rstrip() + "\n")
     if plan.edges:
         parts.append("\n# ==== generated hand-offs ====\n")
+        handles = _port_handles(plan, root)
         for frm, out, to, inp in plan.edges:
-            parts.append(f"# {frm}.{out} -> {to}.{inp}\n")
+            parts.append(_handoff_line_fmt(frm, out, to, inp, handles, plan.language))
     text = "".join(parts)
     if plan.language in ("cutedsl", "tilelang"):
         _reject_symbol_collisions(bodies, plan.language)
@@ -660,6 +718,51 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
                 "L-PROTO", f"the fused {plan.language} source does not parse after linking "
                            f"(a stage body is broken): {e}")]) from e
     return text
+
+
+def _port_handles(plan: LinkPlan, root: str | Path | None) -> dict[tuple[str, str], str]:
+    """The declared handle kind of each (stage, port) the plan wires, defaulting to ``reg``.
+
+    A port that names no handle is treated as living in registers (the most common
+    accumulator home), so a one-input stage that declares nothing still gets a concrete
+    move function rather than an unknown."""
+    handles: dict[tuple[str, str], str] = {}
+    wanted: set[tuple[str, str]] = {(f, o) for f, o, _t, _i in plan.edges}
+    wanted |= {(t, i) for _f, _o, t, i in plan.edges}
+    for name in plan.stages:
+        cdir = comp.components_root(root) / name
+        try:
+            cct = comp.read_contract(cdir)
+        except comp.ComponentError:
+            continue
+        for side in ("inputs", "outputs"):
+            for port, spec in (cct.get(side) or {}).items():
+                if (name, port) in wanted:
+                    handles[(name, port)] = spec.get("handle") or "reg"
+    return handles
+
+
+def _handoff_fn(src_kind: str, dst_kind: str) -> str:
+    """The name of the move that carries an accumulator from one location to another.
+
+    ``acc_tmem_to_reg`` imports a tmgen05 accumulator out of TMEM into registers (T4's
+    tensor import); ``acc_reg_to_smem`` stages registers into a ring slot; identical kinds
+    need no move (``acc_identity``). Unknown kinds were already refused at link time, so
+    every pair here has a function — the skeleton never names a move it cannot emit."""
+    if src_kind == dst_kind:
+        return "acc_identity"
+    return f"acc_{src_kind}_to_{dst_kind}"
+
+
+def _handoff_line_fmt(frm: str, out: str, to: str, inp: str,
+                      handles: dict[tuple[str, str], str], language: str) -> str:
+    """One generated hand-off: the actual call the fused kernel makes to move the tensor."""
+    src = handles.get((frm, out), "reg")
+    dst = handles.get((to, inp), "reg")
+    fn = _handoff_fn(src, dst)
+    call = f"{fn}({_mid(frm)}_{out}, {_mid(to)}_{inp})"
+    return (f"# {frm}.{out} ({src}) -> {to}.{inp} ({dst})\n"
+            f"{call}\n")
 
 
 def _reject_symbol_collisions(bodies: list[tuple[str, str]], language: str) -> None:

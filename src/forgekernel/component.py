@@ -68,6 +68,13 @@ DTYPES = ("float64", "float32", "float16", "bfloat16", "float8_e4m3fn", "float8_
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
+# Where a port's tensor physically lives. A producer may leave an accumulator in TMEM
+# (Blackwell tcgen05), in registers (Hopper WGMMA / consumer-Blackwell mma.sync) or in shared
+# memory (a ring slot). The linker generates the copy between any two, so a handle *kind*
+# mismatch is not by itself a failure — but the kind decides which hand-off code it emits,
+# and an unknown kind cannot be moved, so it is rejected at link time (L-HANDLE).
+HANDLE_KINDS = ("tmem", "reg", "smem")
+
 # component.toml's known top-level tables. An unknown table is a finding, not silently
 # ignored: a typo'd ``[require]`` next to ``[requires]`` must not read as "no requires".
 # ``resources`` and ``roles`` are what a linker solves at link time (forgekernel.link):
@@ -326,6 +333,7 @@ def _contract_problems(contract: object, cdir: Path) -> list[str]:
             if spec.get("dtype") not in DTYPES:
                 out.append(f"{where}: dtype must be one of {list(DTYPES)}, "
                            f"got {spec.get('dtype')!r}")
+            out += _port_handle_problems(spec, where)
             _shape_problems(spec.get("shape"), axis_set, where, side, out)
 
     ins, outs = contract.get("inputs"), contract.get("outputs")
@@ -342,6 +350,21 @@ def _contract_problems(contract: object, cdir: Path) -> list[str]:
     inv = contract.get("invariants", [])
     if not isinstance(inv, list) or not all(isinstance(x, str) and x.strip() for x in inv):
         out.append(f"{CONTRACT_JSON}: invariants must be a list of non-empty strings")
+    return out
+
+
+def _port_handle_problems(spec: dict, where: str) -> list[str]:
+    """A port's optional ``handle`` (where the tensor lives) and ``generation`` (which
+    pipeline generation it carries) must be well-formed, because the linker branches on
+    both: an unknown handle cannot be moved, and a generation mismatch is an L-PHASE."""
+    out: list[str] = []
+    if "handle" in spec and spec["handle"] not in HANDLE_KINDS:
+        out.append(f"{where}: handle must be one of {list(HANDLE_KINDS)}, "
+                   f"got {spec['handle']!r}")
+    if "generation" in spec:
+        g = spec["generation"]
+        if not isinstance(g, int) or isinstance(g, bool) or g < 0:
+            out.append(f"{where}: generation must be a non-negative int, got {g!r}")
     return out
 
 

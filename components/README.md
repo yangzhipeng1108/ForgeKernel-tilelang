@@ -33,6 +33,16 @@ and `verify.json` says how it will be judged before it leaves.
 - `invariants` — what a caller may assume without reading the code,
 - `semantics` — one sentence every implementation must agree on.
 
+A port may also carry two optional physical facts the linker uses to generate the hand-off:
+
+- `handle` — where the tensor lives: `tmem` (Blackwell tcgen05 accumulator), `reg` (Hopper
+  WGMMA / consumer-Blackwell `mma.sync`) or `smem` (a ring slot). Two ports with different
+  handles are *bridged by the copy the linker emits* — that is tensor import — so the kind is
+  not a seam requirement. An unknown kind is `L-HANDLE`.
+- `generation` — which pipeline generation the port carries (default `0`). Tensor import
+  hands off one generation; a producer and consumer that disagree mean several in flight,
+  refused with `L-PHASE` and the ring depth (`|Δ| + 1`) that would carry them.
+
 Anything that satisfies a contract can stand in for anything else that does, **in any
 language**. Swapping a component is choosing a different implementation of the same
 contract; reusing it in a new model or system is importing it by contract, never by name.
@@ -60,9 +70,10 @@ the part that does not need a GPU, which is where most link-time decisions live:
 
 - **seam checking** — two stages link only if the output one produces matches, by name /
   dtype / shape-over-axes, the input the next consumes. A mismatch is refused with a numbered
-  `L-PROTO` / `L-STAGE` / `L-RES` / `L-ROLE` / `L-RING` / `L-ORDER` / `L-WIRE` diagnostic,
-  rather than a kernel that hangs on the GPU. Repeated codes are coalesced into one line each
-  with every site ("L-PROTO [2 sites] …").
+  `L-PROTO` / `L-HANDLE` / `L-PHASE` / `L-STAGE` / `L-RES` / `L-ROLE` / `L-RING` / `L-ORDER` /
+  `L-WIRE` diagnostic, rather than a kernel that hangs on the GPU. `L-HANDLE` is an unknown
+  tensor location; `L-PHASE` is a generation mismatch (several in flight — needs a ring).
+  Repeated codes are coalesced into one line each with every site ("L-PROTO [2 sites] …").
 - **chain or DAG** — by default the pipeline is a chain (each stage's single output feeds the
   next). Pass `--edge FROM.OUT=TO.IN` (repeatable) and the linker treats it as a DAG instead:
   a stage may take several inputs, an output may fan out, and the stages are topologically
@@ -81,10 +92,12 @@ the part that does not need a GPU, which is where most link-time decisions live:
   wants), the `L-PROTO` diagnostic names it: "insert X between them".
 - **fused-source generation** — `--emit DIR` writes `fused_kernel.<ext>` (each stage's body
   inlined under its role, hand-offs generated from the plan; Python skeletons are
-  `ast.parse`-checked). Fusing **refuses two stages that define the same top-level name**
-  (`L-PROTO`, reported with `--emit` as a refusal, not a traceback): inlining would let the
-  later definition silently shadow the earlier one. `link-plan.json` records stages, edges,
-  solved resources and ring depth.
+  `ast.parse`-checked). For each edge it emits the **actual move**, chosen from the two ports'
+  handle kinds — `acc_tmem_to_reg` when a TMEM accumulator is imported into registers,
+  `acc_reg_to_smem` to stage a ring slot, `acc_identity` when unchanged. Fusing **refuses two
+  stages that define the same top-level name** (`L-PROTO`, reported with `--emit` as a
+  refusal, not a traceback): inlining would let the later definition silently shadow the
+  earlier one. `link-plan.json` records stages, edges, solved resources and ring depth.
 - **semantic parity, on the CPU** — `forgekernel.link.run_parity` chains each stage's
   `verify.json` golden through the same wiring the linker solved and checks it against a
   reference on CPU torch. Each reading carries the stage's output shape, so a mismatch points

@@ -86,6 +86,33 @@ def test_semantics_is_required(tmp_path):
     assert any("semantics" in f for f in comp.check_tree(tmp_path / "components" / "bad"))
 
 
+def test_an_unknown_handle_is_reported(tmp_path):
+    bad = {"axes": ["m"], "inputs": {"x": {"shape": ["m"], "dtype": "float32"}},
+           "outputs": {"y": {"shape": ["m"], "dtype": "float32", "handle": "ldsm"}},
+           "semantics": "y = x"}
+    _write(tmp_path, "bad", contract=bad)
+    findings = comp.check_tree(tmp_path / "components" / "bad")
+    assert any("handle" in f and "ldsm" in f for f in findings)
+
+
+def test_a_negative_generation_is_reported(tmp_path):
+    bad = {"axes": ["m"], "inputs": {"x": {"shape": ["m"], "dtype": "float32"}},
+           "outputs": {"y": {"shape": ["m"], "dtype": "float32", "generation": -1}},
+           "semantics": "y = x"}
+    _write(tmp_path, "bad", contract=bad)
+    assert any("generation" in f for f in comp.check_tree(tmp_path / "components" / "bad"))
+
+
+def test_a_valid_handle_and_generation_pass(tmp_path):
+    ok = {"axes": ["m"], "inputs": {"x": {"shape": ["m"], "dtype": "float32", "handle": "reg"}},
+          "outputs": {"y": {"shape": ["m"], "dtype": "float32", "handle": "tmem",
+                            "generation": 2}},
+          "semantics": "y = x"}
+    _write(tmp_path, "good", contract=ok,
+           verify={"shape": {"m": 4}, "tolerance": 0.0, "golden": {"torch": "y = x"}})
+    assert comp.check_tree(tmp_path / "components" / "good") == []
+
+
 def test_missing_contract_is_reported(tmp_path):
     _write(tmp_path, "nocontract", contract=None)
     # delete what _write made (it substitutes a default when None) — make it truly absent
