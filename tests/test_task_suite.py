@@ -12,6 +12,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))]
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
     "fk_template_leaderboard_task", REPO_ROOT / "src" / "forgekernel" / "card_template" / "eval" / "leaderboard.py")
@@ -121,6 +123,53 @@ def test_correctness_fails_past_the_tolerance(tmp_path):
     verdict, _ = lb.task_correctness(p, lambda x, w: _rms(x, w) * 1.01, False, "cpu")
     assert not verdict["pass"] and verdict["status"] == "INCORRECT_NUMERICAL"
     assert "input group plain output y" in verdict["error"]
+
+
+def test_cpu_call_does_not_synchronize_cuda(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def unexpected_sync(_device):
+        pytest.fail("CPU evaluation must not synchronize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", unexpected_sync)
+    x = torch.ones(4, 16)
+    result = lb.call_impl(_problem(tmp_path), lambda value: value, [x], False, "cpu", no_grad=True)
+    torch.testing.assert_close(result[0], x)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize(("returned", "mismatch"), [
+    ("y", "dtype"),
+    ("y[:1].to(x.dtype)", "shape"),
+])
+def test_judge_output_must_match_the_signature(tmp_path, capsys, returned, mismatch, device):
+    p = _problem(tmp_path)
+    p["definition"]["reference"] = JUDGE.replace("return y.to(x.dtype)", f"return {returned}")
+    judge, _ = lb._task_custom(p)
+
+    verdict, _ = lb.task_correctness(p, judge, False, device)
+    assert not verdict["pass"] and verdict["status"] == "JUDGE_ERROR"
+    assert mismatch in verdict["error"]
+
+    lb._task_calibrate(p, judge, False, device)
+    cal = _calibration(capsys)
+    assert not cal["match"] and any(mismatch in problem for problem in cal["problems"])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_every_judge_output_must_match_the_signature(tmp_path, capsys, device):
+    p = _problem(tmp_path)
+    p["definition"]["outputs"]["aux"] = {"shape": ["m", "n"], "dtype": "float32"}
+    p["definition"]["reference"] = JUDGE.replace("return y.to(x.dtype)", "return y.to(x.dtype), y")
+    judge, _ = lb._task_custom(p)
+
+    verdict, _ = lb.task_correctness(p, judge, False, device)
+    assert not verdict["pass"] and verdict["status"] == "JUDGE_ERROR"
+    assert "aux" in verdict["error"] and "dtype" in verdict["error"]
+
+    lb._task_calibrate(p, judge, False, device)
+    cal = _calibration(capsys)
+    assert not cal["match"] and any("aux" in problem for problem in cal["problems"])
 
 
 def test_a_broken_input_generator_is_not_charged_to_the_kernel(tmp_path):

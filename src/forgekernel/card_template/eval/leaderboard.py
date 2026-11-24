@@ -879,7 +879,7 @@ def call_impl(problem: dict, fn, inputs: list, dps: bool, device, *, no_grad: bo
             fn(*inputs, *outs)
         else:
             outs = normalize_outputs(problem, fn(*inputs), device)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
     return outs
 
@@ -2274,6 +2274,29 @@ def task_error(out, ref, dtype: str) -> tuple[float, str | None]:
     return (err / scale if scale > 0 else math.inf), None
 
 
+def _task_judge_error(problem: dict, refs: list) -> str | None:
+    """Check the judge's outputs against the task signature before using them.
+
+    A judge that returns the wrong shape or dtype for an output is broken, not merely
+    approximate: feeding its wrong-typed tensor into the tolerance comparison would either
+    crash deep in ``task_error`` or, worse, compare a differently-typed result and read as a
+    pass. This checks each returned output against the definition's declared shape (over the
+    resolved axes) and dtype up front, so a broken judge is a ``JUDGE_ERROR`` naming the
+    output, not a silent misjudgement of the implementation. ``None`` when every output
+    matches. Only as many refs as the definition has outputs are checked, the same zip the
+    comparison itself uses."""
+    defn = problem["definition"]
+    axes = resolved_axes(defn, problem["workload"].get("axes") or {})
+    shapes = tensor_shapes(defn["outputs"], axes)
+    for (name, spec), ref in zip(defn["outputs"].items(), refs):
+        if tuple(ref.shape) != shapes[name]:
+            return f"judge output {name}: shape {tuple(ref.shape)} != signature {shapes[name]}"
+        dtype = torch_dtype(spec["dtype"])
+        if ref.dtype != dtype:
+            return f"judge output {name}: dtype {ref.dtype} != signature {dtype}"
+    return None
+
+
 def task_tolerance(problem: dict) -> dict:
     """Per output: the calibrated tolerance, never below the dtype floor."""
     cal = (problem.get("tolerance") or {}).get("outputs") or {}
@@ -2310,6 +2333,8 @@ def task_correctness(problem: dict, impl, dps: bool, device, prec=None) -> tuple
         sets.append(inp)
         pristine = _precision_snapshot(prec, inp) if prec is not None and gi < PRECISION_SETS else None
         refs = call_impl(problem, judge, _clone(inp), False, device, no_grad=True)
+        if why := _task_judge_error(problem, refs):
+            return fail("JUDGE_ERROR", f"input group {group['name']}: {why}")
         try:
             outs = call_impl(problem, impl, inp, dps, device, no_grad=True)
         except Exception as exc:  # noqa: BLE001 — the implementation is foreign code
@@ -2463,6 +2488,9 @@ def _task_calibrate(problem: dict, ref_fn, ref_dps: bool, device) -> int:
             try:
                 inp = task_inputs(v, group, device, make_inputs)
                 refs = call_impl(v, judge, _clone(inp), False, device, no_grad=True)
+                if why := _task_judge_error(v, refs):
+                    problems.append(f"{where}: {why}")
+                    continue
                 outs = call_impl(v, ref_fn, inp, ref_dps, device, no_grad=True)
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"{where}: {type(exc).__name__}: {exc}")
