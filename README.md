@@ -283,6 +283,56 @@ attention, RMSNorm) and one CuTe DSL NVFP4 GEMM (`kernel.py`). They are not new 
 winning recipes of `hw_kb/tilelang/sm120/` fixed into reusable modules, each reproducing its
 recipe's numbers with `cos ~ 1.0`. See [kernels/sm120_README.md](kernels/sm120_README.md).
 
+## Component linking (PipeLink-style)
+
+A tuned kernel should be a unit that travels, not lines trapped inside one operator's
+`kernel.py`. Borrowing [PipeLink](https://github.com/alumkal/PipeLink)'s idea — *link GPU
+kernel stages by contract, not by copy* — ForgeKernel makes each stage a **component** and
+adds a linker that fuses components into one kernel, refusing anything whose seams disagree
+**before** a GPU round. It is a **simulation**: it checks what stages *declare*, not the
+opaque code behind it, so a fused kernel still needs its numeric check and sanitizers.
+
+```text
+forge component new <name> [--language tilelang]   # scaffold a component
+forge component check <name> | --all                # deliverable? (static, no GPU)
+forge component plan <a> <b> ... [--graph mermaid]  # dry run: seams, resources, ring
+forge component link <a> <b> ... --emit DIR         # fuse into one kernel
+forge component diff <before...> --then <after...>  # swap a stage, re-link the rest
+```
+
+A component is one directory: `contract.json` (the DSL-neutral interface every implementation
+agrees on — shapes over named axes, dtype, semantics), one slot per language, and a
+`verify.json` that is its own proof. A component is imported and swapped **by contract, not
+by name**.
+
+What the linker does at link time:
+
+- **Seam checking.** Two stages link only if dtype and shape-over-axes match; otherwise a
+  numbered `L-PROTO` diagnostic, and a bridge component is named when one would fit.
+- **Tensor handle & phase.** A port may say where its tensor lives (`tmem` / `reg` / `smem`);
+  a differing handle is bridged by generated copy code (tensor import), an unknown one is
+  `L-HANDLE`. A producer/consumer **generation** mismatch (several in flight) is `L-PHASE`,
+  naming the ring depth that would carry them.
+- **Resource & ring solving.** Peak simultaneous SMEM / TMEM / registers / barriers / warps
+  (not the sum — a chain of eight 64 KB stages fits a 227 KB CTA), and the ring depth from
+  each stage's floor and any producer/consumer rate mismatch (`ceil(prod/cons)`). An over-cap
+  `L-RES` / `L-ROLE` names the stages live at the peak.
+- **Fused source, TileLang first-class.** For TileLang the plan becomes a real `@T.prim_func`:
+  external I/O become `T.Tensor` params, stages run in topological order, the **solved ring
+  depth becomes `T.Pipelined(num_stages=...)`**, and each seam is a `T.copy` between buffers
+  allocated at the port's handle location. TileLang then lowers and runs exactly the pipeline
+  the linker decided — compilation, the ring, and launch are TileLang's, so the single frontend
+  replaces the CUTLASS/CuTe/TK bridge.
+- **CPU semantic parity.** `run_parity` chains each stage's `verify.json` golden through the
+  same wiring and checks it against a reference on CPU torch — the link semantics proved
+  without a GPU.
+
+Remaining PipeLink capabilities need hardware or fall outside TileLang: `.plink` binary
+packaging, cross-GPU comm overlap, and on-GPU performance measurement. The full
+implemented-vs-missing matrix is in
+[docs/pipelink-feature-status.md](docs/pipelink-feature-status.md); usage and the contract
+schema are in [components/README.md](components/README.md).
+
 ## Environment
 
 The paper's experiments ran on the following GPUs and software. Most campaigns used the main
@@ -322,6 +372,7 @@ skills/              the agents' tools, one SKILL.md + scripts each, mirrored in
                      the agent's .claude/skills/ before every turn
 meta/                teacher and student prompts (meta/cuda/: CUDA C++)
 hw_kb/               the hardware knowledge base (cutedsl/, cuda/, tilelang/), by GPU architecture
+components/          PipeLink-style kernel components: contract.json + per-language impl + verify.json
 docs/                design notes, milestone template, leaderboards, KB
 scripts/             agent launcher, /goal driver, self-evolution
 tests/               pytest suite (CPU only)

@@ -253,6 +253,48 @@ forge export .artifacts/rms_<id> --out solution.json
 测赢的配方固化成可复用模块，每个都以 `cos ~ 1.0` 复现了对应配方的数字。见
 [kernels/sm120_README.md](kernels/sm120_README.md)。
 
+## 组件链接（PipeLink 式）
+
+一个调优好的 kernel 应当是一个能带走的单元，而不是困在某个算子 `kernel.py` 里的几行代码。
+借鉴 [PipeLink](https://github.com/alumkal/PipeLink) 的思路——**按契约而非按拷贝来链接 GPU
+kernel 阶段**——ForgeKernel 把每个阶段做成一个**组件**，并加了一个链接器，把组件融合成一个
+kernel，并在**占用 GPU 之前**就拒绝任何接缝不一致的组合。它是**模拟**的：检查的是阶段**声明**
+的接口，而非声明背后的不透明代码，因此融合出的 kernel 仍需要数值检查与 sanitizer。
+
+```text
+forge component new <name> [--language tilelang]   # 脚手架：新建组件
+forge component check <name> | --all                # 是否可交付？(静态，无 GPU)
+forge component plan <a> <b> ... [--graph mermaid]  # 干跑：接缝、资源、环深
+forge component link <a> <b> ... --emit DIR         # 融合成一个 kernel
+forge component diff <before...> --then <after...>  # 换一个阶段，其余重新链接
+```
+
+一个组件就是一个目录：`contract.json`（所有实现都遵守的、与 DSL 无关的接口——按命名轴写的
+shape、dtype、语义）、每个语言一个实现槽位，以及一份作为自身证明的 `verify.json`。组件按
+**契约而非名字**被导入、替换。
+
+链接器在链接期做的事：
+
+- **接缝检查。** 两个阶段只在 dtype 与按轴写的 shape 结构都匹配时才链接；否则给出带编号的
+  `L-PROTO` 诊断，并在有可用的桥接组件时点名它。
+- **张量句柄与代际。** 端口可以声明张量所在位置（`tmem` / `reg` / `smem`）；位置不同由生成的
+  拷贝代码桥接（tensor import），未知位置是 `L-HANDLE`。生产者/消费者的**代际**不一致（多代在途）
+  是 `L-PHASE`，并给出能承载它们的环深。
+- **资源与环深求解。** 峰值并发的 SMEM / TMEM / 寄存器 / barrier / warp（不是求和——链式八个
+  64 KB 阶段可装进 227 KB CTA），以及由每阶段下限与生产者/消费者速率不匹配（`ceil(prod/cons)`）
+  求出的环深。超 caps 的 `L-RES` / `L-ROLE` 会点名峰值时刻存活的阶段。
+- **融合源码，TileLang 一等目标。** 对 TileLang，计划会变成真正的 `@T.prim_func`：外部 I/O 成为
+  `T.Tensor` 参数，阶段按拓扑序运行，**求解出的环深变成 `T.Pipelined(num_stages=...)`**，每个
+  接缝是端口 handle 位置所分配缓冲之间的 `T.copy`。TileLang 随后 lower 并运行的就是链接器决定的
+  流水线——编译、环与 launch 都交给 TileLang，因此单前端替代了 CUTLASS/CuTe/TK 的桥接。
+- **CPU 语义一致性。** `run_parity` 把各阶段 `verify.json` 的 golden 按同一接线串起来，在 CPU torch
+  上与参考比对——无 GPU 即证明了链接语义。
+
+其余 PipeLink 能力需要硬件或落在 TileLang 之外：`.plink` 二进制打包、跨 GPU 通信重叠、以及
+GPU 上的性能实测。完整的「已实现 / 未实现」矩阵见
+[docs/pipelink-feature-status.md](docs/pipelink-feature-status.md)；用法与契约 schema 见
+[components/README.md](components/README.md)。
+
 ## 实验环境
 
 论文实验使用的 GPU 与软件如下。大部分实验用的是每种 GPU 的主镜像：
@@ -289,6 +331,7 @@ skills/              agent 用的工具，每个一份 SKILL.md 加脚本，每�
                      agent 工作目录的 .claude/skills/
 meta/                teacher 与 student 的 prompt（meta/cuda/：CUDA C++）
 hw_kb/               硬件知识库（cutedsl/、cuda/、tilelang/），按 GPU 架构组织
+components/          PipeLink 式 kernel 组件：contract.json + 各语言实现 + verify.json
 docs/                设计说明、milestone 模板、榜单、知识库收割
 scripts/             agent 启动脚本、/goal 驱动、自进化
 tests/               pytest 测试（只需 CPU）
