@@ -255,6 +255,46 @@ def check_tree(cdir: str | Path) -> list[str]:
 
     # requires: each named dependency must exist under the same root
     out += _require_problems(comp, cdir)
+    out += _resource_role_problems(comp)
+    return out
+
+
+_RESOURCE_KEYS = ("smem_bytes", "tmem_cols", "regs_per_thread", "barrier_slots")
+_ROLE_INTS = ("warps", "ring_min", "ring_max")
+_ROLE_RATES = ("producer_rate", "consumer_rate", "expected_ms")
+
+
+def _resource_role_problems(comp: Component) -> list[str]:
+    """The [resources] / [roles] declarations the linker will rely on must be well-formed.
+
+    These tables do not affect whether a component runs alone, but the linker *solves* with
+    them; a string where an int belongs, or a negative claim, would make the resource check
+    silently wrong at link time. Checking them here — where a component is delivered — means
+    the error surfaces before any link, not as a bad number in a plan."""
+    out: list[str] = []
+    for k, v in (comp.resources or {}).items():
+        if k not in _RESOURCE_KEYS:
+            out.append(f"[resources].{k} is not a known resource (known: "
+                       f"{', '.join(_RESOURCE_KEYS)})")
+            continue
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            out.append(f"[resources].{k} must be a non-negative int, got {v!r}")
+    for k, v in (comp.roles or {}).items():
+        if k in _ROLE_INTS:
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                out.append(f"[roles].{k} must be a non-negative int, got {v!r}")
+        elif k in _ROLE_RATES:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+                out.append(f"[roles].{k} must be a positive number (units per step), "
+                           f"got {v!r}")
+        else:
+            out.append(f"[roles].{k} is not a known role (known: "
+                       f"{', '.join(_ROLE_INTS + _ROLE_RATES)})")
+    rlo = (comp.roles or {}).get("ring_min")
+    rhi = (comp.roles or {}).get("ring_max")
+    if isinstance(rlo, int) and isinstance(rhi, int) and rlo > rhi:
+        out.append(f"[roles] ring_min ({rlo}) > ring_max ({rhi}): no ring depth can satisfy "
+                   f"this component")
     return out
 
 

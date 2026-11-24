@@ -55,12 +55,13 @@ DEFAULT_CAPS = {"smem_bytes": 227 * 1024, "tmem_cols": 512, "regs_per_thread": 2
 # can look it up, not just read a sentence.
 DIAG = {
     "L-STAGE": "a stage is missing, unreadable, or is not a component",
-    "L-PROTO": "two linked stages disagree on an interface (name / dtype / shape)",
+    "L-PROTO": "two linked stages disagree on an interface (name / dtype / shape); a bridge "
+               "that would fit is named when one exists",
     "L-WIRE": "the pipeline names a stage, or a port, that does not exist",
-    "L-RES": "the summed per-stage resource claim exceeds the target's cap",
-    "L-ROLE": "the summed warp roles exceed the block, or a role is double-booked",
+    "L-RES": "a resource's simultaneous peak exceeds the target's cap",
+    "L-ROLE": "the warp peak exceeds the block, or a role is malformed",
     "L-RING": "the pipeline asks for a ring depth outside what the stages allow",
-    "L-ORDER": "the pipeline is empty or does not form a single chain",
+    "L-ORDER": "the pipeline is empty, has a cycle, or lists a stage twice",
 }
 
 
@@ -87,14 +88,68 @@ class LinkPlan:
     stages: list[str]                       # component names, in pipeline order
     language: str
     edges: list[tuple[str, str, str, str]]  # (from stage, output port, to stage, input port)
-    resources: dict                         # solved per-resource totals
+    resources: dict                         # solved per-resource (simultaneous peak)
     ring_depth: int
     caps: dict = field(default_factory=dict)
+    reasons: dict = field(default_factory=dict)   # why each rig/ring number came out
 
     def manifest(self) -> dict:
         return {"stages": self.stages, "language": self.language,
                 "edges": [list(e) for e in self.edges], "resources": self.resources,
-                "ring_depth": self.ring_depth, "caps": self.caps}
+                "ring_depth": self.ring_depth, "caps": self.caps, "reasons": self.reasons}
+
+
+def summarize(plan: LinkPlan) -> list[str]:
+    """Human-readable lines explaining a plan: the wiring, the peak, and why.
+
+    The number a plan reports (``smem_bytes: 131072``) is the peak, not the sum; a reader
+    who does not know that will think the linker under-counts. So each resource line says
+    both, and the ring line says whether the floor is a stage's own or a rate mismatch."""
+    lines = [f"language: {plan.language}"]
+    lines.append("stages: " + " -> ".join(plan.stages))
+    if plan.edges:
+        lines.append("wiring:")
+        for frm, out, to, inp in plan.edges:
+            lines.append(f"  {frm}.{out} -> {to}.{inp}")
+    lines.append("resources (peak simultaneous use; each cap named when overridable):")
+    for r in RESOURCES:
+        if r in plan.resources:
+            cap = plan.caps.get(r)
+            tail = f"  cap {cap}" + (" EXCEEDED" if cap is not None and plan.resources[r] > cap
+                                     else "") if cap is not None else ""
+            lines.append(f"  {r}: {plan.resources[r]}{tail}")
+    if "warps" in plan.resources:
+        lines.append(f"  warps: {plan.resources['warps']}")
+    reason = plan.reasons.get("ring")
+    lines.append(f"ring_depth: {plan.ring_depth}" + (f"  ({reason})" if reason else ""))
+    budget = plan.reasons.get("expected_ms")
+    if budget is not None:
+        lines.append(f"expected_ms: {budget}  (summed declared budget, not a measurement)")
+    return lines
+
+
+def diff_plans(before: LinkPlan, after: LinkPlan) -> dict:
+    """What changed when a pipeline was re-linked with a stage swapped (PipeLink's "re-link
+    only the stage that changed" use case).
+
+    Returns the stage set difference, the edge difference, and the per-resource / ring
+    deltas — the numbers a caller checks to be sure swapping one stage did not quietly move
+    everyone else's budget."""
+    bs, as_ = set(before.stages), set(after.stages)
+    be, ae = set(map(tuple, before.edges)), set(map(tuple, after.edges))
+    res = {}
+    for r in sorted(set(before.resources) | set(after.resources)):
+        b, a = before.resources.get(r), after.resources.get(r)
+        if b != a:
+            res[r] = {"before": b, "after": a, "delta": (a or 0) - (b or 0)}
+    return {
+        "stages_added": sorted(as_ - bs), "stages_removed": sorted(bs - as_),
+        "edges_added": sorted(ae - be), "edges_removed": sorted(be - ae),
+        "resources_changed": res,
+        "ring_depth": {"before": before.ring_depth, "after": after.ring_depth,
+                       "delta": after.ring_depth - before.ring_depth},
+        "language": {"before": before.language, "after": after.language},
+    }
 
 
 # --- loading stages -------------------------------------------------------------------
@@ -129,12 +184,19 @@ def _load_stage(spec: str, root: str | Path | None) -> tuple[comp.Component, dic
 # --- seam checking --------------------------------------------------------------------
 
 def _seam_for_port(prev_name: str, prev_contract: dict, out_port: str,
-                   nxt_name: str, nxt_contract: dict, in_port: str) -> list[Diagnostic]:
+                   nxt_name: str, nxt_contract: dict, in_port: str,
+                   root: str | Path | None = None) -> list[Diagnostic]:
     """Whether ``prev``'s ``out_port`` can feed ``nxt``'s ``in_port``.
 
     A seam is well-typed when dtype matches and the shape structure lines up over the
     stages' own axes. This is the per-port form so a DAG can wire any output to any input;
-    the chain case is the special case where each stage has exactly one of each."""
+    the chain case is the special case where each stage has exactly one of each.
+
+    On a mismatch, if a component under ``root`` could sit between the two (its input takes
+    what the producer emits, its output gives what the consumer wants), the diagnostic names
+    it as a bridge rather than only reporting the failure — the difference between "this does
+    not fit" and "this does not fit *directly*, insert X". A bridge that would itself be
+    mismatched is not suggested, so the hint is always a link that would actually pass."""
     p_out = prev_contract.get("outputs") or {}
     n_in = nxt_contract.get("inputs") or {}
     if out_port not in p_out:
@@ -146,9 +208,44 @@ def _seam_for_port(prev_name: str, prev_contract: dict, out_port: str,
     po_spec, ni_spec = p_out[out_port], n_in[in_port]
     if _same_port(po_spec, ni_spec, prev_contract, nxt_contract):
         return []
-    return [Diagnostic(
-        "L-PROTO", f"{prev_name}.{out_port} ({_desc(po_spec)}) does not match "
-                   f"{nxt_name}.{in_port} ({_desc(ni_spec)})")]
+    hint = _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec, nxt_contract)
+    msg = (f"{prev_name}.{out_port} ({_desc(po_spec)}) does not match "
+           f"{nxt_name}.{in_port} ({_desc(ni_spec)})")
+    if hint:
+        return [Diagnostic("L-PROTO", msg + f"; a bridge would fit: insert {hint} "
+                                           f"between them ({prev_name} -> {hint} -> {nxt_name})")]
+    return [Diagnostic("L-PROTO", msg)]
+
+
+def _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec,
+                 nxt_contract) -> str | None:
+    """The first component under ``root`` that takes the producer's output and gives the
+    consumer's input — a candidate adapter stage for a mismatched seam. None if no such
+    component exists (or the caller has no root to search)."""
+    if root is None:
+        return None
+    try:
+        candidates = comp.list_components(root)
+    except Exception:  # noqa: BLE001 — a hint is best-effort, never a hard failure
+        return None
+    for cand in candidates:
+        if cand.name in (prev_name, nxt_name):
+            continue
+        try:
+            cct = comp.read_contract(cand.dir)
+        except comp.ComponentError:
+            continue
+        ins = cct.get("inputs") or {}
+        outs = cct.get("outputs") or {}
+        if len(ins) != 1 or len(outs) != 1:
+            continue
+        (ci_port, ci_spec), = ins.items()
+        (co_port, co_spec), = outs.items()
+        # bridge.in <- producer.out, bridge.out -> consumer.in
+        if _same_port(po_spec, ci_spec, prev_contract, cct) and \
+                _same_port(co_spec, ni_spec, cct, nxt_contract):
+            return cand.name
+    return None
 
 
 def _same_port(a: dict, b: dict, ca: dict, cb: dict) -> bool:
@@ -164,39 +261,101 @@ def _desc(spec: dict) -> str:
 
 # --- resource / role solving ----------------------------------------------------------
 
-def _solve(stages: list[comp.Component], caps: dict, ring_request: int | None) -> tuple[dict, int, list[Diagnostic]]:
-    problems: list[Diagnostic] = []
-    totals = {r: 0 for r in RESOURCES}
-    warps = 0
-    ring_lo, ring_hi = 0, None
-    for c in stages:
-        for r in RESOURCES:
-            v = (c.resources or {}).get(r, 0)
-            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
-                problems.append(Diagnostic("L-RES", f"{c.name}: {r} must be a non-negative int, "
-                                                     f"got {v!r}"))
-                continue
-            totals[r] += v
-        w = (c.roles or {}).get("warps", 0)
-        if not isinstance(w, int) or isinstance(w, bool) or w < 0:
-            problems.append(Diagnostic("L-ROLE", f"{c.name}: warps must be a non-negative int, "
-                                                 f"got {w!r}"))
-        else:
-            warps += w
-        rlo = (c.roles or {}).get("ring_min", 0)
-        rhi = (c.roles or {}).get("ring_max")
-        ring_lo = max(ring_lo, int(rlo) if isinstance(rlo, int) else 0)
-        if isinstance(rhi, int):
-            ring_hi = rhi if ring_hi is None else min(ring_hi, rhi)
+def _resource_claims(c: comp.Component, problems: list[Diagnostic]) -> tuple[dict, int, dict]:
+    """One stage's declared claim: {resource: int}, warps, and its rate/latency roles."""
+    claim = {}
+    for r in RESOURCES:
+        v = (c.resources or {}).get(r, 0)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            problems.append(Diagnostic("L-RES", f"{c.name}: {r} must be a non-negative int, "
+                                                 f"got {v!r}"))
+            v = 0
+        claim[r] = v
+    w = (c.roles or {}).get("warps", 0)
+    if not isinstance(w, int) or isinstance(w, bool) or w < 0:
+        problems.append(Diagnostic("L-ROLE", f"{c.name}: warps must be a non-negative int, "
+                                             f"got {w!r}"))
+        w = 0
+    return claim, w, (c.roles or {})
 
+
+def _peak_residency(order: list[str], succ: dict[str, set],
+                    claims: dict[str, dict]) -> tuple[dict, dict]:
+    """Peak simultaneous resource use over the whole DAG, not the sum of every stage.
+
+    A fused kernel runs its stages as a pipeline: a stage holds its shared memory / TMEM /
+    registers / barrier slots from when it starts until its *last consumer* starts (the
+    hand-off is then done and the buffer can be reused). So the residency at any point of
+    the topological order is the sum over the stages whose live window covers it — an upper
+    bound far below "sum of everything" for a chain (only neighbours overlap) and equal to
+    it only when every stage is live at once (a source fanning into all the sinks).
+
+    This is the resource analogue of PipeLink's link-time SMEM/TMEM planning: not an
+    allocator, but the number the cap check compares against, and the reason a chain of
+    eight 64 KB stages (512 KB summed) can still fit a 227 KB CTA. A sink (no consumers)
+    stays live to the end of the order.
+
+    Returns ``(peak, holders)``: the peak per resource, and for each the set of stages live
+    at the step where that peak first occurred. ``holders`` turns an over-cap reading into
+    "smem_bytes peak 262144 at {a, b}" — the stages a user must look at — instead of a bare
+    number with no lead. It scans the live windows as events (a resource's total rises when
+    a stage opens and falls *after* the last consumer opens), O(stages^2) worst case but
+    with no per-step allocation, and ties are taken at the earliest step for a stable set."""
+    pos = {n: i for i, n in enumerate(order)}
+    last = len(order) - 1
+    end = {}
+    for n in order:
+        consumers = succ.get(n, ())
+        end[n] = max((pos[m] for m in consumers if m in pos), default=last)
+    keys = list(dict.fromkeys(k for c in claims.values() for k in c))
+    peak = {k: 0 for k in keys}
+    holders: dict[str, list[str]] = {k: [] for k in keys}
+    for step in range(len(order)):
+        live = [n for n in order if pos[n] <= step <= end[n]]
+        for k in keys:
+            acc = sum(claims[n].get(k, 0) for n in live)
+            if acc > peak[k]:
+                peak[k] = acc
+                holders[k] = live
+    return peak, holders
+
+
+def _solve(stages: list[comp.Component], order: list[str], succ: dict[str, set],
+           pred: dict[str, set], caps: dict,
+           ring_request: int | None) -> tuple[dict, int, list[Diagnostic]]:
+    """Solve the plan's peak resources, ring depth and warp peak against the caps."""
+    problems: list[Diagnostic] = []
+    claims: dict[str, dict] = {}
+    warps_of: dict[str, int] = {}
+    roles_of: dict[str, dict] = {}
+    for c in stages:
+        claim, w, roles = _resource_claims(c, problems)
+        claims[c.name] = claim
+        warps_of[c.name] = w
+        roles_of[c.name] = roles
+
+    peak, holders = _peak_residency(order, succ, claims)
+    # warps are resident over the same live windows as the buffers
+    claims_w = {n: {"warps": w} for n, w in warps_of.items()}
+    live_warps, warp_holders = _peak_residency(order, succ, claims_w)
+    live_warps = live_warps["warps"]
     for r in RESOURCES:
         cap = caps.get(r)
-        if cap is not None and totals[r] > cap:
-            problems.append(Diagnostic("L-RES", f"{r} {totals[r]} exceeds the cap {cap}"))
+        if cap is not None and peak[r] > cap:
+            at = holders.get(r) or []
+            where = f" at {{{', '.join(at)}}}" if at else ""
+            problems.append(Diagnostic(
+                "L-RES", f"{r} peak {peak[r]}{where} exceeds the cap {cap}"))
     wcap = caps.get("warps")
-    if wcap is not None and warps > wcap:
-        problems.append(Diagnostic("L-ROLE", f"warps {warps} exceeds the block cap {wcap}"))
+    if wcap is not None and live_warps > wcap:
+        at = warp_holders.get("warps") or []
+        where = f" at {{{', '.join(at)}}}" if at else ""
+        problems.append(Diagnostic(
+            "L-ROLE", f"warps peak {live_warps}{where} exceeds the block cap {wcap}"))
 
+    ring_lo, ring_hi = _ring_limits(stages, roles_of, order, succ, pred)
+    reasons = {"ring": _ring_reason(ring_lo, ring_hi, stages, roles_of, order, succ, pred),
+               "expected_ms": _expected_ms(stages, roles_of)}
     if ring_hi is not None and ring_lo > ring_hi:
         problems.append(Diagnostic("L-RING", f"ring depth floor {ring_lo} > ceiling {ring_hi}"))
         ring = ring_lo
@@ -208,8 +367,81 @@ def _solve(stages: list[comp.Component], caps: dict, ring_request: int | None) -
         ring = ring_request
     else:
         ring = ring_lo if ring_lo else (ring_hi or 1)
-    totals["warps"] = warps
-    return totals, ring, problems
+    peak["warps"] = live_warps
+    return peak, ring, problems, reasons
+
+
+def _expected_ms(stages, roles_of) -> float | None:
+    """The summed declared time budget of the stages, or None when none declared one.
+
+    A stage can declare ``roles.expected_ms`` — its own budget on the target. The plan sums
+    them as the fused kernel's budget. It is a *declaration*, not a measurement (this is a
+    simulation), so it is reported as the budget it is, never as a predicted speed."""
+    total, seen = 0.0, False
+    for c in stages:
+        v = (roles_of.get(c.name) or {}).get("expected_ms")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            total += float(v)
+            seen = True
+    return round(total, 6) if seen else None
+
+
+def _ring_reason(ring_lo, ring_hi, stages, roles_of, order, succ, pred) -> str:
+    """One phrase saying what set the ring floor: a stage's own minimum, or a rate need."""
+    floor_from = None
+    for c in stages:
+        rlo = (roles_of.get(c.name) or {}).get("ring_min", 0)
+        if isinstance(rlo, int) and rlo and rlo == ring_lo:
+            floor_from = f"{c.name}.ring_min"
+            break
+    need = _ring_throughput(order, succ, pred, roles_of)
+    if need > 1 and need == ring_lo:
+        return f"floor from a producer/consumer rate mismatch (needs {need} in flight)"
+    if floor_from:
+        return f"floor from {floor_from}"
+    return "minimum depth (no stage or rate requires more)"
+
+
+def _ring_limits(stages, roles_of: dict[str, dict], order: list[str],
+                 succ: dict[str, set], pred: dict[str, set]) -> tuple[int, int | None]:
+    """The ring-depth window a fused kernel may use.
+
+    Each stage may declare ``ring_min`` / ``ring_max`` (an explicit window) and a
+    ``producer_rate`` / ``consumer_rate`` (units per step). Along an edge, a producer faster
+    than its consumer needs ``ceil(producer/consumer)`` slots so it never blocks on a full
+    ring — the same in-flight calculation PipeLink uses to size a mbarrier ring. The plan's
+    floor is the max of every stage's own floor and the throughput need of every edge; the
+    ceiling is the tightest ``ring_max`` any stage declares."""
+    lo, hi = 0, None
+    for c in stages:
+        rlo = (roles_of[c.name] or {}).get("ring_min", 0)
+        lo = max(lo, int(rlo) if isinstance(rlo, int) and not isinstance(rlo, bool) else 0)
+        rhi = (roles_of[c.name] or {}).get("ring_max")
+        if isinstance(rhi, int) and not isinstance(rhi, bool):
+            hi = rhi if hi is None else min(hi, rhi)
+    lo = max(lo, _ring_throughput(order, succ, pred, roles_of))
+    return lo, hi
+
+
+def _ring_throughput(order: list[str], succ: dict[str, set], pred: dict[str, set],
+                     roles_of: dict[str, dict]) -> int:
+    """The largest in-flight requirement along any edge from a rate mismatch (>= 1).
+
+    For each consumer with a declared ``consumer_rate`` and each producer feeding it with a
+    ``producer_rate``, the ring between them needs ``ceil(prod/cons)`` slots. The max over
+    edges is the floor the plan must meet so a fast producer never stalls on a full ring."""
+    import math
+    need = 1
+    for c in order:
+        cons = roles_of.get(c, {}).get("consumer_rate")
+        if not isinstance(cons, (int, float)) or isinstance(cons, bool) or cons <= 0:
+            continue
+        for p in pred.get(c, ()):
+            prod = roles_of.get(p, {}).get("producer_rate")
+            if isinstance(prod, (int, float)) and not isinstance(prod, bool) and prod > 0:
+                need = max(need, math.ceil(prod / cons))
+    return need
+
 
 
 # --- the link ------------------------------------------------------------------------
@@ -256,17 +488,25 @@ def link(pipeline: list[str], *, root: str | Path | None = None, language: str |
     for frm, out, to, inp in wired:
         _, pct = by_name[frm]
         _, nct = by_name[to]
-        problems += _seam_for_port(frm, pct, out, to, nct, inp)
+        problems += _seam_for_port(frm, pct, out, to, nct, inp, root=root)
     problems += _input_coverage(stages, by_name, wired)
 
-    totals, ring_depth, res_problems = _solve(stages, capsule, ring)
+    succ: dict[str, set] = {c.name: set() for c in stages}
+    pred: dict[str, set] = {c.name: set() for c in stages}
+    for frm, _o, to, _i in wired:
+        if frm in succ and to in pred:
+            succ[frm].add(to)
+            pred[to].add(frm)
+
+    totals, ring_depth, res_problems, reasons = _solve(stages, order, succ, pred, capsule, ring)
     problems += res_problems
     if problems:
         raise LinkError(_coalesce(problems))
 
     return LinkPlan(stages=order, language=lang,
                     edges=[(a, b, c, d) for a, b, c, d in wired],
-                    resources=totals, ring_depth=ring_depth, caps=caps or {})
+                    resources=totals, ring_depth=ring_depth, caps=caps or {},
+                    reasons=reasons)
 
 
 def _chain_edges(stages, loaded) -> list[tuple[str, str, str, str]]:
@@ -359,6 +599,34 @@ def _coalesce(problems: list[Diagnostic]) -> list[Diagnostic]:
 
 
 # --- fused-source generation ----------------------------------------------------------
+def render_graph(plan: LinkPlan, fmt: str = "ascii") -> str:
+    """A picture of the plan: stages as nodes, wires as labelled edges, resource peaks noted.
+
+    A chain reads left-to-right; a DAG reads as layered rows in topological order. The point
+    is that a human can see the shape and the seams at a glance before trusting any number —
+    the same reason a linker prints its resolved plan."""
+    if fmt == "mermaid":
+        lines = ["flowchart LR"]
+        for i, name in enumerate(plan.stages):
+            lines.append(f"  {_mid(name)}[\"{name}\"]")
+        for frm, out, to, inp in plan.edges:
+            lines.append(f"  {_mid(frm)} -- \"{out}->{inp}\" --> {_mid(to)}")
+        return "\n".join(lines) + "\n"
+    # ascii
+    lines = [f"plan ({plan.language}), {len(plan.stages)} stage(s):"]
+    pos = {n: i for i, n in enumerate(plan.stages)}
+    for frm, out, to, inp in plan.edges:
+        lines.append(f"  {frm} --[{out}->{inp}]--> {to}")
+    if not plan.edges:
+        lines.append("  (single stage, no seams)")
+    lines.append("  resources: " + ", ".join(f"{r}={plan.resources[r]}" for r in RESOURCES
+                                             if r in plan.resources))
+    return "\n".join(lines) + "\n"
+
+
+def _mid(name: str) -> str:
+    return "n_" + "".join(ch if ch.isalnum() else "_" for ch in name)
+
 
 def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
     """One kernel source that inlines each stage under its role and wires the hand-offs.
@@ -371,10 +639,12 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
     parts: list[str] = [f"# Fused kernel, linked from stages: {' -> '.join(plan.stages)}\n"
                         f"# language: {plan.language}  ring_depth: {plan.ring_depth}  "
                         f"resources: {json.dumps(plan.resources, sort_keys=True)}\n"]
+    bodies: list[tuple[str, str]] = []
     for name in plan.stages:
         cdir = comp.components_root(root) / name
         impl = cdir / plan.language / comp.IMPL_FILE[plan.language]
         body = impl.read_text(encoding="utf-8") if impl.is_file() else ""
+        bodies.append((name, body))
         parts.append(f"\n# ==== stage: {name} ({plan.language}) ====\n" + body.rstrip() + "\n")
     if plan.edges:
         parts.append("\n# ==== generated hand-offs ====\n")
@@ -382,6 +652,7 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
             parts.append(f"# {frm}.{out} -> {to}.{inp}\n")
     text = "".join(parts)
     if plan.language in ("cutedsl", "tilelang"):
+        _reject_symbol_collisions(bodies, plan.language)
         try:
             ast.parse(text)
         except SyntaxError as e:
@@ -389,6 +660,44 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
                 "L-PROTO", f"the fused {plan.language} source does not parse after linking "
                            f"(a stage body is broken): {e}")]) from e
     return text
+
+
+def _reject_symbol_collisions(bodies: list[tuple[str, str]], language: str) -> None:
+    """Refuse a fusion where two stages define the same top-level name.
+
+    Inlining stage bodies into one file silently lets the last definition win — stage A's
+    ``kernel`` is shadowed by stage B's, and the fused kernel computes B twice without any
+    syntax error. So before trusting the skeleton, parse each body and collect its
+    top-level function / class / assigned names; a name defined by two stages is a real
+    link failure (``L-PROTO``), reported with both stages so the fix (rename or namespace)
+    is obvious. A body that does not parse on its own is left to the whole-file parse below,
+    which reports it as the broken stage it is."""
+    owner: dict[str, str] = {}
+    clashes: dict[str, set[str]] = {}
+    for name, body in bodies:
+        try:
+            tree = ast.parse(body)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            syms: set[str] = set()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                syms.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        syms.add(t.id)
+            for s in syms:
+                if s in owner and owner[s] != name:
+                    clashes.setdefault(s, {owner[s]}).add(name)
+                else:
+                    owner.setdefault(s, name)
+    if clashes:
+        detail = "; ".join(f"{s} defined by {sorted(who)}" for s, who in sorted(clashes.items()))
+        raise LinkError([Diagnostic(
+            "L-PROTO", f"fusing these {language} stages would shadow top-level names — "
+                       f"rename or namespace them first: {detail}")])
 
 
 # --- semantic parity on the CPU -------------------------------------------------------
@@ -417,6 +726,7 @@ def chained_golden(plan: LinkPlan, root: str | Path | None = None) -> dict:
             inputs_of[to].append(inp)
 
     steps: list[dict] = []
+    missing: list[str] = []
     out_expr: dict[str, str] = {}
     for i, name in enumerate(plan.stages):
         cdir = comp.components_root(root) / name
@@ -426,6 +736,8 @@ def chained_golden(plan: LinkPlan, root: str | Path | None = None) -> dict:
         except (OSError, json.JSONDecodeError):
             v = {}
         src = ((v.get("golden") or {}).get("torch") or "").strip()
+        if not src:
+            missing.append(name)
         ports = inputs_of[name]
         # each input's source expression: an upstream stage's output, or the pipeline input
         bindings = {p: out_expr.get(feed_of[(name, p)], "IN") for p in ports}
@@ -435,7 +747,8 @@ def chained_golden(plan: LinkPlan, root: str | Path | None = None) -> dict:
                       "output": out_name, "torch": src})
         out_expr[name] = out_name
     expression = " then ".join(f"{s['stage']}({s['input']})->{s['output']}" for s in steps)
-    return {"steps": steps, "expression": expression, "language": plan.language}
+    return {"steps": steps, "expression": expression, "language": plan.language,
+            "missing_golden": missing}
 
 
 def run_parity(plan: LinkPlan, reference, *, root: str | Path | None = None,
@@ -454,8 +767,12 @@ def run_parity(plan: LinkPlan, reference, *, root: str | Path | None = None,
 
     tol = tolerance if tolerance is not None else 1e-4
     chain = chained_golden(plan, root)
-    values: dict = dict(feeds or {})        # name -> tensor (IN plus any wired upstream)
     readings: list[dict] = []
+    if chain["missing_golden"]:
+        readings.append({"parity": "incomplete",
+                         "missing_golden": list(chain["missing_golden"])})
+        return readings
+    values: dict = dict(feeds or {})        # name -> tensor (IN plus any wired upstream)
     result_by_stage: dict[str, object] = {}
     for step in chain["steps"]:
         env: dict = {"torch": torch}
@@ -474,7 +791,8 @@ def run_parity(plan: LinkPlan, reference, *, root: str | Path | None = None,
         out = env.get("OUT", env.get(step["output"]))
         values[step["output"]] = out
         result_by_stage[step["stage"]] = out
-        readings.append({"stage": step["stage"], "output": _as_list(out)})
+        readings.append({"stage": step["stage"], "output": _as_list(out),
+                         "shape": _shape_of(out)})
     final_stage = output_stage or (plan.stages[-1] if plan.stages else None)
     last = result_by_stage.get(final_stage)
     if "IN" in values and last is not None:
@@ -483,8 +801,20 @@ def run_parity(plan: LinkPlan, reference, *, root: str | Path | None = None,
             ok = bool(torch.allclose(last, expected, atol=tol, rtol=tol))
         except Exception:  # noqa: BLE001 — non-tensor readings compare directly
             ok = last == expected
-        readings.append({"parity": "ok" if ok else "mismatch", "tolerance": tol})
+        readings.append({"parity": "ok" if ok else "mismatch", "tolerance": tol,
+                         "final_stage": final_stage})
     return readings
+
+
+def _shape_of(v):
+    """The shape of a tensor reading (or None) so a parity log names each stage's output."""
+    shape = getattr(v, "shape", None)
+    if shape is not None:
+        try:
+            return list(shape)
+        except TypeError:
+            return None
+    return None
 
 
 def _as_list(v):

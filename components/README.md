@@ -41,9 +41,12 @@ contract; reusing it in a new model or system is importing it by contract, never
 
 ```
 forge component new <name> [--language cutedsl,cuda,tilelang] [--summary "..."]
+forge component new <name> --from-run <run>     # contract + verify lifted from the card
 forge component list
 forge component check [<name> | --all]
-forge component link <a> <b> ... [--edge FROM.OUT=TO.IN]... [--emit DIR] [--cap KEY=INT] [--ring N]
+forge component plan <a> <b> ... [--edge ...] [--graph ascii|mermaid] [--format json]
+forge component link <a> <b> ... [--edge FROM.OUT=TO.IN]... [--emit DIR] [--cap KEY=INT] [--ring N] [--format json]
+forge component diff <before...> --then <after...>
 ```
 
 `check` is the static gate a component must pass to be called deliverable — the same role
@@ -66,15 +69,34 @@ the part that does not need a GPU, which is where most link-time decisions live:
   ordered (a cycle, or a non-source input left unwired, is refused with `L-ORDER` / `L-WIRE`).
 - **resource and role solving** — each stage declares its claim (`[resources]`:
   `smem_bytes`, `tmem_cols`, `regs_per_thread`, `barrier_slots`; `[roles]`: `warps`,
-  `ring_min`, `ring_max`). The linker sums the claims against the target's caps (`--cap`) and
-  picks the ring depth, refusing a plan that overruns a cap or a ring window.
+  `ring_min`, `ring_max`, `producer_rate`, `consumer_rate`, `expected_ms`). The linker
+  solves the **peak simultaneous use** (a stage holds its buffers from start until its last
+  consumer starts, so a chain of eight 64 KB stages fits a 227 KB CTA even though it sums to
+  512 KB), the **warp peak** the same way, and the **ring depth** from each stage's floor and
+  any producer/consumer rate mismatch (`ceil(prod/cons)` slots). It refuses a plan that
+  overruns a cap, and the `L-RES` / `L-ROLE` diagnostic names the stages **live at the peak**
+  (`smem_bytes peak 262144 at {a, b}`), so the fix has a lead.
+- **bridge hints** — on a mismatched seam, if a component under the root could sit between
+  the two stages (its input takes what the producer emits, its output gives what the consumer
+  wants), the `L-PROTO` diagnostic names it: "insert X between them".
 - **fused-source generation** — `--emit DIR` writes `fused_kernel.<ext>` (each stage's body
   inlined under its role, hand-offs generated from the plan; Python skeletons are
-  `ast.parse`-checked) and `link-plan.json` (stages, edges, solved resources, ring depth).
+  `ast.parse`-checked). Fusing **refuses two stages that define the same top-level name**
+  (`L-PROTO`, reported with `--emit` as a refusal, not a traceback): inlining would let the
+  later definition silently shadow the earlier one. `link-plan.json` records stages, edges,
+  solved resources and ring depth.
 - **semantic parity, on the CPU** — `forgekernel.link.run_parity` chains each stage's
   `verify.json` golden through the same wiring the linker solved and checks it against a
-  reference on CPU torch. This proves the *link semantics* without a GPU; whether the
+  reference on CPU torch. Each reading carries the stage's output shape, so a mismatch points
+  at the seam; a stage with no `golden.torch` yields `parity: "incomplete"` naming the stage
+  rather than passing silently. This proves the *link semantics* without a GPU; whether the
   generated CUDA is fast still needs the hardware.
+
+`forge component plan` is a dry run of `link`: the same checks and solving, a human summary
+(with `--graph ascii|mermaid`), and per-resource reasoning — no files written. `forge
+component diff <before...> --then <after...>` re-links two pipelines and reports the stage /
+edge / resource / ring changes, the "swap one stage, re-link the rest" check. Both accept
+`--format json` for CI.
 
 It links what stages **declare**, not the opaque code behind the declaration, so every linked
 kernel still needs its numeric check and sanitizers before it is trusted on hardware — the

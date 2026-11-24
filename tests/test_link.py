@@ -131,7 +131,10 @@ def test_a_resource_over_cap_is_refused_with_L_RES(tmp_path):
     _stage(tmp_path, "gemm", resources={"smem_bytes": 200000})
     with pytest.raises(linkmod.LinkError) as ei:
         linkmod.link(["load", "gemm"], root=tmp_path)
-    assert any(d.code == "L-RES" for d in ei.value.diagnostics)
+    diag = [d for d in ei.value.diagnostics if d.code == "L-RES"]
+    assert diag
+    # the diagnostic names the stages live at the peak, so the fix has a lead
+    assert "load" in diag[0].message and "gemm" in diag[0].message
 
 
 def test_warps_over_the_block_are_refused_with_L_ROLE(tmp_path):
@@ -166,6 +169,23 @@ def test_render_fused_embeds_each_stage_and_parses(tmp_path):
     assert "def load(x):" in src and "def gemm(x):" in src
     assert "load.y -> gemm.x" in src
     ast.parse(src)  # the skeleton is valid Python
+
+
+def test_render_fused_refuses_shadowed_top_level_names(tmp_path):
+    # both stages define `step`; inlining would let the second silently win
+    _stage(tmp_path, "a", impl="def step(x):\n    return x\n")
+    _stage(tmp_path, "b", impl="def step(x):\n    return x + 1\n")
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.render_fused(plan, root=tmp_path)
+    assert any(d.code == "L-PROTO" and "step" in d.message for d in ei.value.diagnostics)
+
+
+def test_render_fused_allows_distinct_names(tmp_path):
+    _stage(tmp_path, "a", impl="def step_a(x):\n    return x\n")
+    _stage(tmp_path, "b", impl="def step_b(x):\n    return x + 1\n")
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    linkmod.render_fused(plan, root=tmp_path)   # no collision -> no raise
 
 
 def test_manifest_is_json_serializable(tmp_path):
@@ -207,6 +227,29 @@ def test_parity_reports_a_mismatch(tmp_path):
     assert readings[-1]["parity"] == "mismatch"
 
 
+def test_parity_records_each_stage_output_shape(tmp_path):
+    torch = pytest.importorskip("torch")
+    _stage(tmp_path, "scale", golden="OUT = IN * 2")
+    _stage(tmp_path, "shift", golden="OUT = IN + 1")
+    plan = linkmod.link(["scale", "shift"], root=tmp_path)
+    x = torch.arange(4, dtype=torch.float32)
+    readings = linkmod.run_parity(plan, lambda v: v * 2 + 1, root=tmp_path, feeds={"IN": x})
+    per_stage = [r for r in readings if "stage" in r]
+    assert per_stage[0]["shape"] == [4]
+    assert readings[-1]["final_stage"] == "shift"
+
+
+def test_parity_is_incomplete_without_a_golden(tmp_path):
+    pytest.importorskip("torch")
+    _stage(tmp_path, "scale", golden="")            # no golden.torch
+    plan = linkmod.link(["scale"], root=tmp_path)
+    chain = linkmod.chained_golden(plan, root=tmp_path)
+    assert chain["missing_golden"] == ["scale"]
+    readings = linkmod.run_parity(plan, lambda v: v, root=tmp_path, feeds={"IN": 1})
+    assert readings[0]["parity"] == "incomplete"
+    assert readings[0]["missing_golden"] == ["scale"]
+
+
 # --- CLI -----------------------------------------------------------------------------
 
 def test_cli_link_reports_and_emits(tmp_path, capsys):
@@ -227,6 +270,16 @@ def test_cli_link_exits_1_on_a_refused_link(tmp_path, capsys):
     rc = component_main(["link", "load", "gemm", "--root", str(tmp_path)])
     assert rc == 1
     assert "L-PROTO" in capsys.readouterr().err
+
+
+def test_cli_link_emit_reports_a_fusion_collision(tmp_path, capsys):
+    _stage(tmp_path, "a", impl="def step(x):\n    return x\n")
+    _stage(tmp_path, "b", impl="def step(x):\n    return x\n")
+    out = tmp_path / "build"
+    rc = component_main(["link", "a", "b", "--root", str(tmp_path), "--emit", str(out)])
+    assert rc == 1
+    assert "L-PROTO" in capsys.readouterr().err
+    assert not (out / "fused_kernel.py").is_file()   # nothing half-written
 
 
 # --- DAG wiring (multi-input, fan-out) ----------------------------------------------
@@ -323,5 +376,162 @@ def test_cli_link_accepts_explicit_edges(tmp_path, capsys):
     rc = component_main(["link", "a", "b", "--root", str(tmp_path),
                          "--edge", "a.y=b.x"])
     assert rc == 0
-    assert "linked: a -> b" in capsys.readouterr().out
+    assert "stages: a -> b" in capsys.readouterr().out
+
+
+# --- peak residency vs naive sum -----------------------------------------------------
+
+def test_a_chain_of_resources_peaks_at_two_not_all(tmp_path):
+    # four 64 KB stages in a chain: 256 KB summed, but only neighbours overlap -> 128 KB
+    for nm in ("s1", "s2", "s3", "s4"):
+        _stage(tmp_path, nm, resources={"smem_bytes": 65536})
+    plan = linkmod.link(["s1", "s2", "s3", "s4"], root=tmp_path,
+                        caps={"smem_bytes": 200 * 1024})
+    assert plan.resources["smem_bytes"] == 128 * 1024       # peak, not 256 KB
+
+
+def test_a_full_fanout_peaks_at_the_sum(tmp_path):
+    # one source fanning into three sinks: source live until all sinks start, so the peak
+    # is the source plus all sinks resident together
+    _stage_ports(tmp_path, "src", ins=("x",), outs=("y",))
+    for nm in ("c1", "c2", "c3"):
+        _stage_ports(tmp_path, nm, ins=("x",), outs=("y",))
+    # give each a smem claim by editing resources via a fresh stage helper call
+    for nm, kb in (("src", 10), ("c1", 20), ("c2", 20), ("c3", 20)):
+        d = tmp_path / "components" / nm
+        (d / comp.COMPONENT_TOML).write_text(
+            f'[component]\nname = "{nm}"\nlanguages = ["cutedsl"]\nsummary = "{nm}"\n'
+            f'[resources]\nsmem_bytes = {kb * 1024}\n', encoding="utf-8")
+    edges = [("src", "y", "c1", "x"), ("src", "y", "c2", "x"), ("src", "y", "c3", "x")]
+    plan = linkmod.link(["src", "c1", "c2", "c3"], root=tmp_path, edges=edges)
+    # src(10) live while c1,c2,c3 start; at the last sink-start all four are live
+    assert plan.resources["smem_bytes"] == (10 + 20 + 20 + 20) * 1024
+
+
+# --- ring depth from producer/consumer rates ----------------------------------------
+
+def test_ring_depth_from_a_faster_producer(tmp_path):
+    _stage(tmp_path, "prod", roles={"producer_rate": 8})
+    _stage(tmp_path, "cons", roles={"consumer_rate": 2})
+    plan = linkmod.link(["prod", "cons"], root=tmp_path)
+    assert plan.ring_depth == 4          # ceil(8 / 2), so the producer never stalls
+
+
+def test_ring_depth_is_one_when_rates_match(tmp_path):
+    _stage(tmp_path, "a", roles={"producer_rate": 2, "consumer_rate": 2})
+    _stage(tmp_path, "b", roles={"consumer_rate": 2})
+    assert linkmod.link(["a", "b"], root=tmp_path).ring_depth == 1
+
+
+def test_an_explicit_ring_floor_beats_the_rate_need(tmp_path):
+    _stage(tmp_path, "prod", roles={"producer_rate": 8, "ring_min": 6})
+    _stage(tmp_path, "cons", roles={"consumer_rate": 2})
+    assert linkmod.link(["prod", "cons"], root=tmp_path).ring_depth == 6
+
+
+# --- bridge suggestion on a mismatched seam -----------------------------------------
+
+def test_a_mismatched_seam_names_a_bridge_that_would_fit(tmp_path):
+    _stage(tmp_path, "prod", out_dtype="float32")
+    _stage(tmp_path, "cons", in_dtype="float16")
+    # a bridge that takes float32 and gives float16
+    b = tmp_path / "components" / "cast"
+    b.mkdir(parents=True)
+    (b / comp.COMPONENT_TOML).write_text(
+        '[component]\nname = "cast"\nlanguages = ["cutedsl"]\nsummary = "cast"\n',
+        encoding="utf-8")
+    (b / comp.CONTRACT_JSON).write_text(json.dumps({
+        "axes": ["m"],
+        "inputs": {"x": {"shape": ["m"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["m"], "dtype": "float16"}},
+        "semantics": "cast"}), encoding="utf-8")
+    slot = b / "cutedsl"; slot.mkdir()
+    (slot / "kernel.py").write_text("# impl\n", encoding="utf-8")
+    (slot / comp.VERIFY_JSON).write_text(json.dumps(
+        {"shape": {"m": 4}, "tolerance": 0.0, "golden": {"torch": "OUT = IN"}}),
+        encoding="utf-8")
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.link(["prod", "cons"], root=tmp_path)
+    proto = [d for d in ei.value.diagnostics if d.code == "L-PROTO"][0]
+    assert "insert cast" in proto.message
+
+
+# --- summarize / diff / graph -------------------------------------------------------
+
+def test_summarize_explains_peak_and_ring(tmp_path):
+    _stage(tmp_path, "prod", resources={"smem_bytes": 1024}, roles={"producer_rate": 4})
+    _stage(tmp_path, "cons", roles={"consumer_rate": 2})
+    plan = linkmod.link(["prod", "cons"], root=tmp_path)
+    text = "\n".join(linkmod.summarize(plan))
+    assert "smem_bytes: 1024" in text
+    assert "rate mismatch" in text and "ring_depth: 2" in text
+
+
+def test_diff_reports_a_swapped_stage(tmp_path):
+    _stage(tmp_path, "a", resources={"smem_bytes": 1000})
+    _stage(tmp_path, "b", resources={"smem_bytes": 2000})
+    _stage(tmp_path, "c", resources={"smem_bytes": 4000})
+    before = linkmod.link(["a", "b"], root=tmp_path)
+    after = linkmod.link(["a", "c"], root=tmp_path)
+    d = linkmod.diff_plans(before, after)
+    assert d["stages_added"] == ["c"] and d["stages_removed"] == ["b"]
+    # chain peak: before a+b overlap at 3000; after a+c overlap at 5000
+    assert d["resources_changed"]["smem_bytes"]["delta"] == 2000
+
+
+def test_render_graph_ascii_and_mermaid(tmp_path):
+    _stage(tmp_path, "a")
+    _stage(tmp_path, "b")
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    ascii_g = linkmod.render_graph(plan, "ascii")
+    assert "a --[y->x]--> b" in ascii_g
+    mermaid = linkmod.render_graph(plan, "mermaid")
+    assert mermaid.startswith("flowchart LR") and "n_a" in mermaid
+
+
+def test_expected_ms_budget_is_summed_into_reasons(tmp_path):
+    _stage(tmp_path, "a", roles={"expected_ms": 0.5})
+    _stage(tmp_path, "b", roles={"expected_ms": 0.3})
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    assert abs(plan.reasons["expected_ms"] - 0.8) < 1e-9
+    assert "expected_ms: 0.8" in "\n".join(linkmod.summarize(plan))
+
+
+# --- CLI: plan / diff / json --------------------------------------------------------
+
+def test_cli_plan_prints_summary_and_graph(tmp_path, capsys):
+    _stage(tmp_path, "a")
+    _stage(tmp_path, "b")
+    rc = component_main(["plan", "a", "b", "--root", str(tmp_path), "--graph", "ascii"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "stages: a -> b" in out and "--[y->x]-->" in out
+
+
+def test_cli_link_json_is_machine_readable(tmp_path, capsys):
+    _stage(tmp_path, "a")
+    _stage(tmp_path, "b")
+    rc = component_main(["link", "a", "b", "--root", str(tmp_path), "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["stages"] == ["a", "b"]
+
+
+def test_cli_link_json_reports_refusal(tmp_path, capsys):
+    _stage(tmp_path, "a", out_dtype="float32")
+    _stage(tmp_path, "b", in_dtype="float16")
+    rc = component_main(["link", "a", "b", "--root", str(tmp_path), "--format", "json"])
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["diagnostics"][0]["code"] == "L-PROTO"
+
+
+def test_cli_diff_reports_the_swap(tmp_path, capsys):
+    _stage(tmp_path, "a", resources={"smem_bytes": 1000})
+    _stage(tmp_path, "b", resources={"smem_bytes": 2000})
+    _stage(tmp_path, "c", resources={"smem_bytes": 4000})
+    rc = component_main(["diff", "a", "b", "--then", "a", "c", "--root", str(tmp_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "stages added: c" in out and "stages removed: b" in out
 
