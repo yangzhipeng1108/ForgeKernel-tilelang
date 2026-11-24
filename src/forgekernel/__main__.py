@@ -8,7 +8,8 @@
   forge status [.artifacts/<op>_<id>]  -> where a run is (every run when omitted)
   forge harvest .artifacts/<op>_<id>   -> the knowledge-base write-up of a stopped run
   forge export .artifacts/<op>_<id>    -> the best kernel (a board task's as the board's solution)
-  forge component new|list|check       -> a bounded, swappable, reusable kernel component
+  forge component new|list|check|link -> a bounded, swappable, reusable kernel component
+                                        (link fuses a chain into one plan, on paper)
 
 `forge run` exits 0 when the final confirmation meets the target (and the correctness
 monitor raised no alarm on that kernel), and 2 otherwise.

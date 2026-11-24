@@ -3,6 +3,7 @@
     forge component new <name> [--language cutedsl,cuda,tilelang] [--summary "..."]
     forge component list [--root DIR]
     forge component check [<name> | --all] [--root DIR]
+    forge component link <a> <b> ... [--emit DIR] [--cap KEY=INT] [--ring N]
 
 A component is a bounded unit that ships, swaps and reuses on its own: the interface in
 ``contract.json``, one implementation per language slot, and each implementation's own
@@ -148,6 +149,74 @@ def cmd_list(argv: list[str]) -> int:
     return 0
 
 
+def cmd_link(argv: list[str]) -> int:
+    """Link components into one fused-kernel plan — as a chain, or a DAG via --edge.
+
+    Pure CPU: it checks seams, solves resources/roles against caps, and (with --emit) writes
+    the fused-source skeleton and the plan manifest. It does not compile or run a GPU."""
+    from forgekernel import link as linkmod
+    p = argparse.ArgumentParser(prog="forge component link")
+    p.add_argument("pipeline", nargs="+",
+                   help="components in link order; each may name its language as name@lang")
+    p.add_argument("--root", default=None)
+    p.add_argument("--language", default=None, help="force one language for every stage")
+    p.add_argument("--cap", action="append", default=[], metavar="KEY=INT",
+                   help=f"override a resource cap ({', '.join(linkmod.RESOURCES)} or warps)")
+    p.add_argument("--ring", type=int, default=None, help="requested ring depth")
+    p.add_argument("--edge", action="append", default=[], metavar="FROM.OUT=TO.IN",
+                   help="wire an explicit seam (repeatable); with any --edge the pipeline is "
+                        "treated as a DAG instead of a chain")
+    p.add_argument("--emit", default=None, metavar="DIR",
+                   help="write the fused source and link-plan.json into DIR")
+    a = p.parse_args(argv)
+    caps: dict = {}
+    for spec in a.cap:
+        if "=" not in spec:
+            sys.stderr.write(f"[component] error: --cap expects KEY=INT, got {spec!r}\n")
+            return 2
+        k, v = spec.split("=", 1)
+        try:
+            caps[k.strip()] = int(v)
+        except ValueError:
+            sys.stderr.write(f"[component] error: --cap {spec!r}: value is not an int\n")
+            return 2
+    wiring = None
+    for spec in a.edge:
+        if "=" not in spec or "." not in spec:
+            sys.stderr.write(f"[component] error: --edge expects FROM.OUT=TO.IN, got {spec!r}\n")
+            return 2
+        lhs, rhs = spec.split("=", 1)
+        try:
+            frm, out = lhs.rsplit(".", 1)
+            to, inp = rhs.rsplit(".", 1)
+        except ValueError:
+            sys.stderr.write(f"[component] error: --edge {spec!r}: both sides need NAME.PORT\n")
+            return 2
+        wiring = wiring or []
+        wiring.append((frm.strip(), out.strip(), to.strip(), inp.strip()))
+    try:
+        plan = linkmod.link(a.pipeline, root=a.root, language=a.language, caps=caps or None,
+                            ring=a.ring, edges=wiring)
+    except linkmod.LinkError as e:
+        sys.stderr.write(f"[component] link refused ({len(e.diagnostics)} diagnostic(s)):\n")
+        for d in e.diagnostics:
+            sys.stderr.write(f"  {d}\n")
+        return 1
+    print(f"[component] linked: {' -> '.join(plan.stages)}  (language {plan.language})")
+    print(f"[component] resources: {json.dumps(plan.resources, sort_keys=True)}  "
+          f"ring_depth: {plan.ring_depth}")
+    if a.emit:
+        out = Path(a.emit)
+        out.mkdir(parents=True, exist_ok=True)
+        src = linkmod.render_fused(plan, a.root)
+        ext = comp.IMPL_FILE.get(plan.language, "kernel.txt").split(".")[-1]
+        (out / f"fused_kernel.{ext}").write_text(src, encoding="utf-8", newline="\n")
+        (out / "link-plan.json").write_text(
+            json.dumps(plan.manifest(), indent=2) + "\n", encoding="utf-8", newline="\n")
+        print(f"[component] wrote {out / ('fused_kernel.' + ext)} and {out / 'link-plan.json'}")
+    return 0
+
+
 def cmd_check(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="forge component check")
     p.add_argument("name", nargs="?", default=None)
@@ -185,7 +254,7 @@ def main(argv: list[str]) -> int:
         print(__doc__.strip())
         return 0
     sub = argv[0]
-    table = {"new": cmd_new, "list": cmd_list, "check": cmd_check}
+    table = {"new": cmd_new, "list": cmd_list, "check": cmd_check, "link": cmd_link}
     if sub not in table:
         sys.stderr.write(f"[component] error: unknown subcommand {sub!r}; "
                          f"use one of {list(table)}\n")

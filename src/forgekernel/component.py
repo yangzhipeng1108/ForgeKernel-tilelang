@@ -70,7 +70,10 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # component.toml's known top-level tables. An unknown table is a finding, not silently
 # ignored: a typo'd ``[require]`` next to ``[requires]`` must not read as "no requires".
-_KNOWN_TABLES = {"component", "requires", "provides", "python", "judge"}
+# ``resources`` and ``roles`` are what a linker solves at link time (forgekernel.link):
+# declaring them here lets one static checker and the linker agree on what a component
+# claims to consume.
+_KNOWN_TABLES = {"component", "requires", "provides", "python", "judge", "resources", "roles"}
 
 
 @dataclass
@@ -84,6 +87,8 @@ class Component:
     provides: dict = field(default_factory=dict)          # extra named surfaces it offers
     python: dict = field(default_factory=dict)            # {"package": ..., "module": ...}
     judge: dict = field(default_factory=dict)             # {"reference": ...} optional
+    resources: dict = field(default_factory=dict)         # what the linker must budget
+    roles: dict = field(default_factory=dict)             # {"warps": N, "role": ...}
 
 
 class ComponentError(ValueError):
@@ -148,6 +153,8 @@ def read_component(cdir: str | Path) -> Component:
         provides=(cfg.get("provides") or {}),
         python=(cfg.get("python") or {}),
         judge=(cfg.get("judge") or {}),
+        resources=(cfg.get("resources") or {}),
+        roles=(cfg.get("roles") or {}),
     )
 
 
