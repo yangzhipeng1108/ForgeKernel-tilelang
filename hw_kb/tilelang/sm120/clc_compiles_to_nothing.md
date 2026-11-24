@@ -1,5 +1,8 @@
 # CLC and warp-group cooperation on sm120: CLC compiles to nothing, warp policy is already done
 
+> State: ABSENT — `T.clc_try_cancel` lowers to a no-op on this build, so there is nothing to
+> tune. Use `GemmWarpPolicy.Square` (the default) and do not build a schedule around CLC.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp8 e4m3, tile `(128,128,128)`,
 > `sm_120a`, emitting-source and post-`nvcc` inspection included.
 

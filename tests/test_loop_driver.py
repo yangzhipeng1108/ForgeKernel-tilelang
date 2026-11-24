@@ -2702,6 +2702,51 @@ def test_kb_harvest_one_turn_no_gpu_parses_recipes(tmp_path):
     assert "notes/cheap.py" not in prompt  # below threshold: not billed
 
 
+def test_kb_harvest_deadend_list_feeds_milestone_candidates(tmp_path):
+    # The KB's ABSENT / BROKEN entries reach the harvest prompt as dead-end
+    # candidates, so a mechanism already known not to work on this target can be
+    # moved into the milestone's §4 instead of being re-derived next run. WORKS
+    # entries and entries outside the run's tree stay out of the list.
+    from forgekernel.loop.driver import ProbeBattle, run_kb_harvest
+    be = FakeBackend(["wrote it.\nNO_RECIPE: nothing general"], [])
+    ctx = _ctx(tmp_path, be)
+    tree = tmp_path / "sm90"
+    (tree / "clc_absent.md").write_text(
+        "# CLC\n\n> State: ABSENT — compiles to nothing on this target, route around "
+        "it with a different pipeline and do not retry\n", encoding="utf-8")
+    (tree / "nvfp4_broken.md").write_text(
+        "# NVFP4\n\n> State: BROKEN — reads the wrong byte and produces wrong numbers, "
+        "apply the fix described below before any use\n", encoding="utf-8")
+    (tree / "ok.md").write_text(
+        "# OK\n\n> State: WORKS — measured on hardware and ready to use as written\n",
+        encoding="utf-8")
+    ctx.kb_tripwire_rounds = 2
+    ctx.probe_battles["notes/hard.py"] = ProbeBattle(
+        path="notes/hard.py", rounds=8, passed=True, pass_iter=4)
+    run_kb_harvest(ctx)
+    prompt = be.prompts[0]
+    assert "Dead-end candidate list" in prompt
+    assert "clc_absent.md" in prompt and "nvfp4_broken.md" in prompt
+    assert "⛔" in prompt and "🐛" in prompt
+    assert "ABSENT" in prompt and "BROKEN" in prompt
+    assert "ok.md" not in prompt  # WORKS is not a dead end
+    assert "## 4. Known dead ends" in prompt  # tells the teacher where it lands
+
+
+def test_kb_harvest_no_deadend_block_when_kb_has_none(tmp_path):
+    from forgekernel.loop.driver import ProbeBattle, run_kb_harvest
+    be = FakeBackend(["NO_RECIPE: nothing general"], [])
+    ctx = _ctx(tmp_path, be)
+    (tmp_path / "sm90" / "ok.md").write_text(
+        "# OK\n\n> State: WORKS — measured and ready to use as written\n",
+        encoding="utf-8")
+    ctx.kb_tripwire_rounds = 2
+    ctx.probe_battles["notes/hard.py"] = ProbeBattle(
+        path="notes/hard.py", rounds=8, passed=True, pass_iter=4)
+    run_kb_harvest(ctx)
+    assert "Dead-end candidate list" not in be.prompts[0]
+
+
 def test_kb_harvest_agent_error_degrades_to_status_quo(tmp_path):
     from forgekernel.loop.driver import AgentError, ProbeBattle, run_kb_harvest
 

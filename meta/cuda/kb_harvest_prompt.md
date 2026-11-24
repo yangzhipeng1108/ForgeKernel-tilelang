@@ -36,6 +36,11 @@ probe as its source (probe path + number of rounds + verdict line) counts as ver
   the tail of the winning job log) and/or the **contract-axis change list** (each KEEP that changed a contract axis: iter, decision id,
   sha, the readings of the changed axes in the previous census and in this one, the gate window's before/after ms, the student's change record).
   Only one of the two lists may be present.
+- Also appended (when the KB holds any) is the **dead-end candidate list**: entries this repo already marks `ABSENT` / `BROKEN`
+  (`⛔` / `🐛`). For each, judge whether the operator would reach for that interface; if so, add ONE row to `{MILESTONE_PATH}`'s
+  `## 4. Known dead ends` table at decision granularity (§6: decision / symptom / trigger / retry precondition), naming the KB entry
+  as the symptom's source. If the operator never touches it, leave the milestone alone. Never copy the whole list in, and never
+  restate these as new hw_kb files — they already exist.
 
 ## What you deliver
 

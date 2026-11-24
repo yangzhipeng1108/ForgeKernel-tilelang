@@ -31,6 +31,11 @@ Your task: **measure its architecture** and produce two files for the next step,
 - `MILESTONES_TEMPLATE` = `{MILESTONES_TEMPLATE_PATH}`
 - `POLICY` = `{META_MILESTONE_PATH}`
 - Recon tree = `{RECON_DIR}` — where you write scripts (**teacher-only; it never enters the student's job**)
+- Operator family analysis = `{FAMILY_ANALYSIS}` — this same operator's reconnaissance from earlier runs at
+  this language. If a section's reference matches yours, start from what it already established (its
+  architecture calls, its dead ends, the mechanisms it ruled out) instead of re-deriving them; if none
+  matches, say so and measure afresh. This is teacher-only input — never cite it into anything the
+  student reads.
 - Hardware calculator = `{SIMULATOR_DIR}` — pure Python, no GPU needed, see channel 4
 
 ## Getting the scripts to run

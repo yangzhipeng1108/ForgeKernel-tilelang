@@ -1,5 +1,8 @@
 # NVFP4 blockscaled GEMM on sm120: broken in TileLang 0.1.15, fixed by a 3-line patch
 
+> State: BROKEN as shipped — TileLang 0.1.15 reads one fp8 scale byte where the packed word
+> belongs, so results are silently wrong. Apply the three-edit patch recorded below before use.
+
 > Status: **SOLVED.** The `mma.sync` instruction is real and selectable on this card. TileLang
 > 0.1.15 lowered it incorrectly, and the defect is now located, patched, and verified: with the
 > patch on, cos vs a dequantised fp32 reference is **1.000000** at every shape tried, and the

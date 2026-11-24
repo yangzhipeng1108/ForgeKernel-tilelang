@@ -22,10 +22,18 @@ Two layers, neither relying on the agent sandbox:
   lineage and the recorded shas are unchanged -- the overlay is a child commit, the
   same channel ``[loop] job_env_files`` always was.
 
-What counts as harness: ``HARNESS_PREFIXES`` below, minus the kernel file and
-``notes/`` (the student's tree). ``window.toml`` and README are export-ignored and the
-driver reads the card's copies, so they are not listed; ``.gitattributes`` is, because
-``git archive`` reads its export rules from the archived tree.
+What counts as harness: ``HARNESS_PREFIXES`` below, minus the student's own tree and the
+kernel file. ``STUDENT_PREFIXES`` names that tree explicitly. ``notes/`` holds probes and
+scratch work, and ``components/`` holds the extra source files of a multi-file kernel — a
+kernel split into ``components/gemm.py`` and ``components/softmax.py`` beside its entry file
+is still the student's work to edit, exactly like ``notes/``, and must ride every job tree
+(``git archive`` carries the whole branch, and nothing strips what is not harness). Listing
+them here is what keeps that true if someone later widens ``HARNESS_PREFIXES``: the check is
+"student tree first", so a ``components/`` file can never be read as card-owned.
+
+``window.toml`` and README are export-ignored and the driver reads the card's copies, so they
+are not listed; ``.gitattributes`` is, because ``git archive`` reads its export rules from the
+archived tree.
 """
 from __future__ import annotations
 
@@ -34,6 +42,9 @@ from pathlib import Path
 
 # A prefix ending in "/" names a directory; the others name a file.
 HARNESS_PREFIXES = ("eval/", "gpu_entry.sh", "ref_bin/", ".gitattributes")
+# The student's tree: files here are never card-owned, even under a harness prefix, and are
+# never restored or stripped from a job tree. ``components/`` carries extra kernel sources.
+STUDENT_PREFIXES = ("notes/", "components/")
 # The same set as git pathspecs (directories without the slash).
 HARNESS_PATHSPECS = tuple(p.rstrip("/") for p in HARNESS_PREFIXES)
 
@@ -61,7 +72,11 @@ def is_harness_path(path: str, kernel_file: str = "") -> bool:
     p = str(path).strip()
     if p.startswith("./"):
         p = p[2:]
-    if not p or p == str(kernel_file) or p.split("/")[0] == "notes":
+    if not p or p == str(kernel_file):
+        return False
+    top = p.split("/")[0]
+    if any(top == pre.rstrip("/") or (pre.endswith("/") and p.startswith(pre))
+           for pre in STUDENT_PREFIXES):
         return False
     return any(p == pre.rstrip("/") or (pre.endswith("/") and p.startswith(pre))
                for pre in HARNESS_PREFIXES)

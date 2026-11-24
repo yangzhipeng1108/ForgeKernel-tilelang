@@ -14,6 +14,14 @@ noise floor, or one that ended without a confirmed best. The noise floor is the 
 generation's own same-job confirmation ratios, never below NOISE_FLOOR_MIN (the loop's plateau
 margin). ``--max-gen`` caps the number of generations; there is no cap by default.
 
+A single generation clearing its noise floor is treated as *provisional*, not proof the chain
+is climbing: one generation's ratios are a handful of jobs, and a chain that advances on every
+lone reading follows noise upward just as readily as signal. So promotion is confirmed only
+when ``CONFIRM_STREAK`` (default 2) generations *in a row* each clear their own floor — the
+first such generation is logged as provisional and the next one is what certifies the climb.
+The chain still runs the provisional generation (that is the only way to observe whether the
+gain repeats); a generation that falls back inside its floor ends the chain as before.
+
 The reference has source, so every generation after the first runs in source mode: the
 teacher reads the previous best, the student never does (the run seals it).
 
@@ -40,6 +48,10 @@ REF_DIR = "reference"
 # == forgekernel.loop.parse.detect_plateau's default: below this, two readings of one
 # kernel are not told apart, however tight a handful of confirmation jobs happened to be
 NOISE_FLOOR_MIN = 0.015
+# How many generations in a row must clear their own noise floor before the climb
+# is called confirmed rather than provisional. One generation's ratios are too few
+# jobs to rule out a lucky reading; two in a row is the smallest honest repeat.
+CONFIRM_STREAK = 2
 
 
 def latest_run(task_name: str):
@@ -85,9 +97,16 @@ def main(argv=None) -> int:
                    help="each new generation's target, x its reference's speed")
     p.add_argument("--max-gen", type=int, default=None,
                    help="stop after this many generations (default: no cap)")
+    p.add_argument("--confirm-streak", type=int, default=CONFIRM_STREAK,
+                   help="consecutive generations that must each clear their noise floor "
+                        "before the climb is called confirmed (default: %(default)s)")
     args = p.parse_args(argv)
+    if args.confirm_streak < 1:
+        sys.stderr.write("[self-evolve] --confirm-streak must be >= 1\n")
+        return 2
     task_dir = Path(args.task).resolve()
     base = re.sub(r"-g\d+$", "", task_dir.name)
+    streak = 0
     for gen in itertools.count(1):
         try:
             task = load_task(task_dir)
@@ -113,6 +132,14 @@ def main(argv=None) -> int:
             print(f"[self-evolve] gain within the {floor:.1%} noise floor: the chain stops here",
                   flush=True)
             return 0
+        streak += 1
+        if streak >= args.confirm_streak:
+            print(f"[self-evolve] confirmed: {streak} generation(s) in a row cleared their "
+                  f"noise floor", flush=True)
+        else:
+            print(f"[self-evolve] provisional: {streak}/{args.confirm_streak} generations in a "
+                  f"row cleared their noise floor — the next generation confirms the climb",
+                  flush=True)
         if args.max_gen is not None and gen >= args.max_gen:
             print(f"[self-evolve] reached --max-gen {args.max_gen}", flush=True)
             return 0

@@ -15,7 +15,9 @@ start (whole KB tree, catches manual edits), recipe certification (the file the
 teacher just wrote, before the student can read it), and the harvest (what a run
 writes into the KB when it stops). ``tests/test_kb_lint.py`` keeps the shipped tree clean.
 
-Three checks per file, findings are ``path:line: reason`` strings:
+Four checks per file, findings are ``path:line: reason`` strings (the fourth —
+whether the entry says what to do with its own interface — lives in
+``kb_state.py`` and is appended below):
 
 1. banned words — ``oracle`` / ``teacher`` / ``reference implementation``.
    Recipes have no business mentioning the reference at all; rule text that
@@ -54,6 +56,8 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
+
+from . import kb_state
 
 # Files under hw_kb/ that state the rules rather than teach a mechanism. They
 # legitimately mention the banned words while forbidding them.
@@ -320,6 +324,7 @@ def lint_text(text: str, path: str = "",
                     f"source (official docs / public infra / probe) on the line or "
                     f"its block head")
     findings.extend(lint_narrative_text(text, path, allow_job_ids=True))
+    findings.extend(kb_state.lint_state(text, path))
     return findings
 
 
@@ -347,6 +352,12 @@ def lint_kb_dir(kb_dir: Path,
         if file.name in SKIP_NAMES:
             continue
         findings.extend(lint_file(file, rel_to=kb_dir.parent, extra_tokens=extra_tokens))
+        if file.name == "index.md":
+            findings.extend(kb_state.lint_index_states(
+                file.read_text(encoding="utf-8"),
+                str(file.relative_to(kb_dir.parent)),
+                root=file.parent,
+            ))
     return findings
 
 

@@ -1,5 +1,9 @@
 # MXFP4 / MXFP8 on sm120 in TileLang 0.1.15: source-build state
 
+> State: PARTIAL — MXFP4 launches but its scale values are misplaced (cos 0.59, not 1.0), and
+> MXFP8 is not implemented. Use the CuTeDSL rows in `precision_roofline_all_stacks.md` for MX
+> numbers; do not quote the TileLang MX cells as performance.
+
 > Status: **PARTIAL.** Building TileLang 0.1.15 *from source* on this box works once the exact
 > upstream TVM pair is pinned; MXFP4 then compiles and launches, and the multi-stage crash is
 > fixed — but the per-block scale **values** are still misplaced (**cos ≈ 0.59**, not 1.0), so

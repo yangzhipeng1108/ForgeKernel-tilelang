@@ -677,6 +677,65 @@ def _meta_prompt(ctx: LoopContext, name: str) -> Path:
     return lang_mode.prompt_path(ctx.meta_dir, name, ctx.language)
 
 
+FAMILY_ANALYSIS_DIR = "analysis"
+
+
+def family_analysis_path(ctx: LoopContext) -> Path:
+    """Where this operator's cross-run reconnaissance analysis lives.
+
+    Operators come in families: the same op is run again on another arch, or again
+    after a fix, and every run re-derives the reference's architecture from scratch
+    — the same measurement, the same wrong turns, the same cost. The operator tree
+    (``ctx.workspace``) is shared by every run of that op, so accumulating one
+    analysis file per language there lets a run that is not the first start from
+    what earlier runs already established.
+
+    One file per language (``analysis/<language>.md``): a cutedsl run's readings
+    are not a tilelang run's — the DSL changes what is expressible and what the
+    SASS looks like — so the family is "same op, same language", not "same op".
+    Resolved from the workspace, not a global operators root: the run already
+    holds its own tree, and a path derived from it cannot be written into some
+    other checkout (or a test's real repo) by accident.
+    """
+    return Path(ctx.workspace) / FAMILY_ANALYSIS_DIR / f"{ctx.language}.md"
+
+
+def _write_family_analysis(ctx: LoopContext) -> None:
+    """Append this run's recon report to the operator family's analysis file.
+
+    Best-effort and idempotent: the section is keyed on the run's status path, so a
+    resumed run does not append twice, and any failure (a read-only tree, a missing
+    report) is logged and swallowed — the analysis is a convenience for the next
+    run, never a gate on this one. The body is the report verbatim under a header
+    that says which run wrote it; the reader is a later teacher deciding whether it
+    is looking at the same reference at all, so provenance has to travel with it.
+    """
+    if ctx.recon_path is None or not Path(ctx.recon_path).is_file():
+        return
+    try:
+        dest = family_analysis_path(ctx)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        marker = f"<!-- run: {ctx.status_path} -->"
+        existing = dest.read_text(encoding="utf-8") if dest.is_file() else (
+            f"# {ctx.op} — family reconnaissance analysis ({ctx.language})\n\n"
+            f"Accumulated across runs of this operator at the same language. Each "
+            f"section is one run's reconnaissance report, appended by the driver. A "
+            f"later run reads this to avoid re-deriving what an earlier one measured; "
+            f"read the nearest section whose reference matches yours.\n")
+        if marker in existing:
+            return
+        try:
+            report = Path(ctx.recon_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        block = (f"\n{marker}\n## Reconnaissance report — {Path(ctx.status_path).parent.name}\n\n"
+                 f"{report}\n")
+        dest.write_text(existing.rstrip() + "\n" + block, encoding="utf-8")
+        _log(f"meta/recon: appended this run's report to the family analysis {dest}")
+    except Exception as e:  # noqa: BLE001 — a convenience record never blocks the run
+        _log(f"meta/recon: family analysis not written ({e.__class__.__name__}: {e})")
+
+
 def _is_cuda(ctx: LoopContext) -> bool:
     """A CUDA-mode run: its student edits a .cu the card builds with nvcc."""
     return lang_mode.is_cuda(ctx.language) or lang_mode.is_cuda_kernel_file(ctx.kernel_file)
@@ -692,6 +751,24 @@ def _is_tilelang(ctx: LoopContext) -> bool:
     census / job-env code below can branch on this without ordering it against
     ``_is_cuda``."""
     return lang_mode.is_tilelang(ctx.language) or lang_mode.is_tilelang_kernel_file(ctx.kernel_file)
+
+
+def _family_analysis_binding(ctx: LoopContext) -> str:
+    """The operator family's accumulated analysis, for a teacher prompt.
+
+    A first run gets the honest absence plus the path it would live at, so a teacher
+    that wants to write (or a human reading the prompt) sees where it belongs rather
+    than a dangling token."""
+    try:
+        path = family_analysis_path(ctx)
+    except Exception:  # noqa: BLE001 — a missing operators root is not a run error
+        return "(no operator family analysis available)"
+    if path.is_file():
+        return (f"{path} — earlier runs of this operator at {ctx.language} appended "
+                f"their reconnaissance reports here; read the sections whose reference "
+                f"matches yours before re-deriving its architecture")
+    return (f"(none yet — this is the first {ctx.language} run of {ctx.op}; its report "
+            f"will be appended to {path} for later runs)")
 
 
 def _bindings(ctx: LoopContext) -> dict[str, str]:
@@ -722,6 +799,9 @@ def _bindings(ctx: LoopContext) -> dict[str, str]:
         "{CANDIDATES_PATH}": (str(ctx.recon_path.parent / "candidates.md")
                               if ctx.recon_path else "(no candidates file)"),
         "{RECON_DIR}": str(ctx.recon_dir) if ctx.recon_dir else "(no reconnaissance tree)",
+        # The operator family's accumulated analysis (this op at this language, every
+        # earlier run). Rendered from the path so a first run reads the honest absence.
+        "{FAMILY_ANALYSIS}": _family_analysis_binding(ctx),
         "{SIMULATOR_DIR}": str(ctx.simulator_dir) if ctx.simulator_dir else "(no simulator)",
         "{MAX_RECON_ROUNDS}": str(ctx.max_recon_rounds),
         "{VERDICT_PROBE_BRIEF}": _verdict_probe_brief(ctx, "verdict_probe_brief.md"),
@@ -3795,6 +3875,62 @@ def _harvest_lint_findings(ctx: LoopContext) -> list[str]:
         return []
 
 
+def _kb_deadend_block(ctx: LoopContext) -> str:
+    """The KB's ABSENT / BROKEN entries, handed to the teacher as dead-end candidates.
+
+    A recipe that records "this interface compiles to nothing" or "this one reads
+    the wrong byte" is, for the operator being optimized, a decision-level dead
+    end: an approach that cannot pay no matter how well it is written. Today that
+    knowledge sits only in hw_kb and reaches the milestone's ``## 4 Known dead
+    ends`` only if a human copies it over — so the next run on the same operator
+    re-derives the absence the hard way. This block closes that loop: it lists the
+    entries the KB already marks ABSENT / BROKEN, and asks the teacher to move the
+    ones that bear on this operator's decisions into the milestone's dead-end
+    table (under §6's rules — decision granularity, retry precondition). It is a
+    candidate list, never an instruction to copy wholesale: a mechanism the
+    operator never touches is not its dead end.
+
+    Reads the run's own tree (``kb_read_dir(ctx)``) and its parent's ``_shared/``
+    so an architecture-neutral entry is seen too. Empty string when nothing in the
+    tree is marked absent or broken, so a healthy KB adds nothing to the prompt.
+    """
+    from forgekernel.loop import kb_state
+    roots = [kb_read_dir(ctx)]
+    shared = Path(ctx.kb_dir) / "_shared"
+    if shared.is_dir():
+        roots.append(shared)
+    rows: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.rglob("*.md")):
+            try:
+                declared = kb_state.declared_state(entry.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if declared is None or declared.state not in (kb_state.ABSENT, kb_state.BROKEN):
+                continue
+            try:
+                name = entry.relative_to(Path(ctx.kb_dir))
+            except ValueError:
+                name = entry
+            rows.append(f"- {declared.mark} `{name}` — {declared.state} "
+                        f"({declared.instruction})")
+    if not rows:
+        return ""
+    return (
+        f"\n\n## Dead-end candidate list (KB entries already marked ABSENT / BROKEN)\n\n"
+        f"These interfaces are recorded as not-there or wrong-result on this target. "
+        f"For each one, judge whether it bears on a decision in `{{MILESTONE_PATH}}`:\n"
+        f"if the operator would otherwise reach for it, add ONE row to the milestone's "
+        f"`## 4. Known dead ends` table (decision / symptom / trigger / retry "
+        f"precondition) at decision granularity (§6) naming the KB entry as the "
+        f"symptom's source; if the operator never touches it, leave the milestone "
+        f"alone. Do NOT copy the whole list in, and do NOT restate these as new "
+        f"hw_kb files — they already exist.\n\n" + "\n".join(rows) + "\n"
+    )
+
+
 def run_kb_harvest(ctx: LoopContext) -> list[str]:
     """End-of-run KB write-up for expensive probe victories (the kb-tripwire)
     and for KEEPs that moved a SASS contract axis (kb_axis_debt).
@@ -3842,6 +3978,7 @@ def run_kb_harvest(ctx: LoopContext) -> list[str]:
             extra += (f"\n\n## Contract-axis change list (KEEP patches that changed a SASS contract "
                       f"axis, in iter order; readings = that iter's own eval + the dossier census "
                       f"before and after)\n\n{moves}\n")
+        extra += _kb_deadend_block(ctx)
         prompt = render_prompt(
             _meta_prompt(ctx, "kb_harvest_prompt.md"), _bindings(ctx), extra=extra)
         _log(f"meta/kb-harvest: {len(debt)} expensive probe victor(ies) at threshold "
@@ -8813,6 +8950,7 @@ def run_recon_step(ctx: LoopContext) -> ReconResult:
     if (prior := _load_recon_state(ctx)) is not None:
         _log(f"meta/recon: completed in a previous session ({_RECON_STATE_NAME} "
              "validates against the on-disk write-up) — skipping straight to distillation")
+        _write_family_analysis(ctx)
         return prior
     _seed_sass_tools(ctx, rbe)
     # Freshness floor for the write-up gate: artifacts must have been (re)written
@@ -8879,6 +9017,7 @@ def run_recon_step(ctx: LoopContext) -> ReconResult:
                                          stall_ok, struct_ok, since=session_start,
                                          near_miss=near_miss, launch=launch_facts)
                 _save_recon_state(ctx, rounds=r)
+                _write_family_analysis(ctx)
                 return ReconResult(rounds=r, report=ctx.recon_path, finished=True)
             _log("meta/recon: turn ended with neither a RECON_REQUEST nor the "
                  "write-up artifacts (written this session) — re-prompting")

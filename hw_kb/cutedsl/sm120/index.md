@@ -5,6 +5,11 @@ blocked on that interface, follows `../TEMPLATE.md`, and is marked verified **on
 GPU probe that returned `PROBE PASS` on an sm120 part. This file is a ledger of what has been
 earned on this architecture, not a plan.
 
+> **Readings here have a comparison column elsewhere.** `../../_shared/precision_roofline.md`
+> puts this tree's GEMM throughput beside cuBLAS and TileLang on the same box under the same
+> protocol. Use it before claiming a CuTeDSL result is "the fastest on this card": the NVFP4
+> column on this shape is not, and the fp16 band is 131–143 across all three stacks.
+
 ## Why this tree exists at all, and what it is NOT
 
 The RTX 6000D is **compute capability (12, 0) = sm_120a**. That is *consumer* Blackwell, and

@@ -8,6 +8,23 @@ What hardware-level problem this interface solves (one sentence).
 ## When needed (trigger)
 Which student need / symptom calls for it (profiler symptom / dataflow shape).
 
+## Contract
+What this mechanism promises and what it demands, stated so another stage could be wired to it
+without reading the example. Four lines; every one you omit is a seam a reader has to
+rediscover:
+
+```
+provides:  <what lands where when this is done>   e.g. accumulator f32[128,128] in registers, done-barrier
+requires:  <what must already be true>            e.g. A,B tiles bf16[128,k] in smem, mma-barrier
+resources: <what it occupies>                     e.g. 4 warps, 64 KiB smem, 240 regs/thread
+sync:      <how it hands off>                     e.g. mbarrier arrive/wait, ring depth >= 2
+```
+
+Write down what the measured build does and mark a field `unknown` rather than guessing. This
+is what makes an entry reusable as a *component*: a later operator can ask "can I feed this?"
+instead of reading the source of the thing it is joining. Keep it operator-agnostic — say
+`accumulator`, not "the attention P tile".
+
 ## Minimal runnable example
 ```python
 # Minimal, self-explanatory example. From a verifiable source; nothing invented.

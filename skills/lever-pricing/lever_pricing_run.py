@@ -1340,6 +1340,70 @@ def _emit_table(levers, variants, order, ok, dev, ratio, shas, roles, *, final,
           f"spin_base={role_ns(roles.get('base'), 'spin')} spin_all={role_ns(roles.get('all'), 'spin')} "
           f"tensor_base={(roles.get('base') or {}).get('tensor_active')} "
           f"tensor_all={(roles.get('all') or {}).get('tensor_active')}", flush=True)
+    _write_kb_draft(levers, variants, order, ok, dev, noise, delta)
+
+
+# One draft per pricing pass, into the workspace so the harvest can pick it up.
+# A pricing result is the KB's G3 input: it says which lever pays *under which
+# stack*, which is exactly what a later operator needs and exactly what the log
+# loses when the run ends. Written as a draft (`State: PARTIAL`) because it is
+# one shape on one node, not a certified mechanism.
+KB_DRAFT_DIR = "notes/kb-draft"
+KB_DRAFT_KEEP = ("independent", "coupled", "dependent")
+
+
+def _write_kb_draft(levers, variants, order, ok, dev, noise, delta) -> None:
+    try:
+        out_dir = os.path.join(os.getcwd(), KB_DRAFT_DIR)
+        os.makedirs(out_dir, exist_ok=True)
+        lines = [
+            "# Lever prices, measured in one job",
+            "",
+            "> State: PARTIAL — one shape on one node through this harness's timing protocol.",
+            "> Read the class column, not the percentage: `independent` pays alone and alone",
+            "> moves the stack; `coupled` is ~0 alone but costs when removed; `dependent`",
+            "> only shows once the others are subtracted. A `harmful` or `null` lever is a",
+            "> dead end for this shape and belongs in the operator's Known dead ends.",
+            "",
+            f"Noise floor: {noise:.2f}%. A lever inside it is `null`, not a small win.",
+            "",
+            "## Contract",
+            "",
+            "```",
+            "provides:  a per-lever price under the full stack, plus its removal cost",
+            "requires:  the best kernel and the exact edit text for each lever",
+            "resources: one GPU job (base + each lever alone + each removal)",
+            "sync:      none - levers are independent variants of one kernel",
+            "```",
+            "",
+            "## Prices",
+            "",
+            "| lever | add | remove | class |",
+            "|---|---|---|---|",
+        ]
+        for lv in levers:
+            name = lever_name(lv)
+            add = delta("+" + name, "base")
+            rem = delta("all-" + name, "all") if ("all-" + name) in variants else None
+            cls = lever_class(add, rem, noise=noise, ok_add=bool(ok.get("+" + name)),
+                              same=False, all_in_spec=("all-" + name) in variants,
+                              all_ok=bool(ok.get("all")))
+            lines.append(f"| `{name}` | {_pct(add)} | {_pct(rem)} | `{cls}` |")
+        lines += ["", "## Dead ends (levers that did not pay here)", ""]
+        dead = [lever_name(lv) for lv in levers
+                if lever_class(delta("+" + lever_name(lv), "base"),
+                               delta("all-" + lever_name(lv), "all")
+                               if ("all-" + lever_name(lv)) in variants else None,
+                               noise=noise, ok_add=bool(ok.get("+" + lever_name(lv))),
+                               same=False, all_in_spec=("all-" + lever_name(lv)) in variants,
+                               all_ok=bool(ok.get("all"))) not in KB_DRAFT_KEEP]
+        lines += [f"- `{n}` — measured, did not pay on this shape" for n in dead] or ["- (none)"]
+        path = os.path.join(out_dir, "lever-prices.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        print(f"KB-DRAFT {path} levers={len(levers)} dead={len(dead)}", flush=True)
+    except Exception as exc:  # a draft must never fail the pricing pass
+        print(f"KB-DRAFT skipped reason={exc!r}", flush=True)
 
 
 def _pct(x):

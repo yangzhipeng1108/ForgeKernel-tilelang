@@ -106,6 +106,42 @@ def test_noise_floor():
     assert se.noise_floor({"ratios": [1.0, 1.05, 1.02]}) == pytest.approx(0.05)
 
 
+def test_one_generation_above_the_floor_is_only_provisional(chain, capsys):
+    root, ran, gains, _ = chain
+    # the first generation clears its floor but the second does not: the climb is
+    # never confirmed, and the chain stops where the gain falls back inside noise
+    gains += [1.30, 1.005]
+    assert se.main([str(_task(root))]) == 0
+    out = capsys.readouterr().out
+    assert "provisional: 1/2" in out
+    assert "confirmed:" not in out
+    assert not (root / "tasks" / "rmsnorm-g3").exists()
+
+
+def test_two_generations_above_the_floor_confirm_the_climb(chain, capsys):
+    root, ran, gains, _ = chain
+    gains += [1.30, 1.20, 1.005]
+    assert se.main([str(_task(root))]) == 0
+    out = capsys.readouterr().out
+    assert "provisional: 1/2" in out
+    assert "confirmed: 2 generation(s) in a row cleared their noise floor" in out
+
+
+def test_confirm_streak_is_configurable(chain, capsys):
+    root, ran, gains, _ = chain
+    gains += [1.30, 1.20, 1.10, 1.005]
+    assert se.main([str(_task(root)), "--confirm-streak", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "provisional: 1/3" in out and "provisional: 2/3" in out
+    assert "confirmed: 3 generation(s)" in out
+
+
+def test_confirm_streak_must_be_positive(chain):
+    root, ran, gains, _ = chain
+    assert se.main([str(_task(root)), "--confirm-streak", "0"]) == 2
+    assert ran == []
+
+
 def test_a_generation_without_a_best_ends_the_chain(chain):
     root, ran, gains, _ = chain
     gains += [None]

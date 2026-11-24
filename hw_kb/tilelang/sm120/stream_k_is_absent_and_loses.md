@@ -1,5 +1,8 @@
 # Stream-K on sm120: not in TileLang 0.1.15, and hand-writing it loses to split-K
 
+> State: ABSENT — there is no Stream-K API in this release, and a hand-written version is
+> slower than split-K. Use split-K for a starved grid instead.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp8 e4m3, tile `(128,128,128)`,
 > 156 SMs. Stream-K is hand-written (there is no API). Every row `cos = 1.00000`.
 

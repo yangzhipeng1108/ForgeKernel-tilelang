@@ -22,15 +22,39 @@ from forgekernel.loop.driver import run_inner_iteration  # noqa: E402
     ("ref_bin/binref_x.so", True), (".gitattributes", True), ("./eval/timing.py", True),
     ("kernel.py", False), ("notes/probe.py", False), ("evaluation.py", False),
     ("gpu_entry.sh.bak", False), ("window.toml", False), ("README.md", False),
+    # a multi-file kernel: its component sources are the student's, not the card's
+    ("components/gemm.py", False), ("components/sub/softmax.py", False),
+    ("components", False),
 ])
 def test_harness_paths(path, want):
     assert harness_guard.is_harness_path(path, "kernel.py") is want
+
+
+def test_a_harness_prefix_under_components_is_still_the_students():
+    # the student tree wins over any harness prefix, so a widened HARNESS_PREFIXES can
+    # never read a component source as card-owned eval code
+    assert not harness_guard.is_harness_path("components/eval/timing.py", "kernel.py")
 
 
 def test_the_kernel_file_is_never_harness_even_under_eval():
     assert not harness_guard.is_harness_path("eval/kernel.py", "eval/kernel.py")
     assert harness_guard.harness_only(["eval/kernel.py", "eval/bench.py", "notes/a.py"],
                                       "eval/kernel.py") == ["eval/bench.py"]
+
+
+def test_a_component_source_rides_the_job_tree_and_is_never_reverted(tmp_path):
+    # a kernel split across components/*.py: editing a component is student work (not a
+    # harness change), and the file must survive the job overlay so the build finds it.
+    card, ws = _card(tmp_path)
+    (ws / "components").mkdir()
+    (ws / "components" / "gemm.py").write_text("def tile(): return 1\n")
+    (ws / "kernel.py").write_text("from components.gemm import tile\n\ndef run(): return tile()\n")
+    head = _commit(ws, "student splits the kernel")
+    be = _backend(ws, card)
+    assert be.harness_changes(head, head) == []              # not a harness edit
+    job = be._with_job_env(head)
+    assert _show(ws, job, "components/gemm.py") == b"def tile(): return 1\n"
+    assert "components/gemm.py" in _tree(ws, job)            # overlay did not strip it
 
 
 @pytest.mark.parametrize("raw, mode", [(None, "revert"), ("warn", "warn"), ("OFF", "off"),
