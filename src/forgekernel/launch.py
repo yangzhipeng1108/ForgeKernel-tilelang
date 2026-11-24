@@ -718,6 +718,40 @@ def write_report(run, task, rc: int) -> Path:
     return p
 
 
+def _export_as_component(run, task, best, name: str, component_root) -> int:
+    """Deliver the run's best kernel as a component: contract + verify lifted from the card.
+
+    The interface a component advertises must be one the kernel actually satisfies, and the
+    only such interface is the card's judged definition (``problem.json``). So this reads
+    that definition for the contract, the card's tolerance for the shipped verify, and the
+    confirmed best for the implementation slot — no re-derivation, no guessing."""
+    from forgekernel import component as comp
+    card = run.operators_dir / task.name
+    problem_path = card / taskcard.PROBLEM
+    try:
+        problem = json.loads(problem_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"[forge] cannot export a component: the card's judged definition "
+                         f"({problem_path}) is unreadable: {e}\n")
+        return 2
+    desc = (getattr(task, "description", None) or "").strip()
+    first = next((ln.strip() for ln in desc.splitlines() if ln.strip()), "")
+    semantics = first or f"{task.name} (exported from a finished run)"
+    contract = comp.contract_from_problem(problem, semantics)
+    shape = dict(task.shapes[0].axes) if getattr(task, "shapes", None) else {}
+    verify = comp.verify_from_problem(problem, shape)
+    dest = comp.components_root(component_root) / name
+    try:
+        comp.export_component(dest, name=name, language=task.language,
+                              kernel_src=best["kernel"], contract=contract, verify=verify,
+                              summary=semantics)
+    except comp.ComponentError as e:
+        sys.stderr.write(f"[forge] component export refused: {e}\n")
+        return 2
+    _say(f"component: {dest} (best {best['sha'][:12]}, contract lifted from the card)")
+    return 0
+
+
 def cmd_export(argv) -> int:
     """The run's best kernel: a leaderboard task's as the board's solution JSON, any other
     task's as its source."""
@@ -728,6 +762,11 @@ def cmd_export(argv) -> int:
     p.add_argument("--name", default=None, help="the solution's name")
     p.add_argument("--author", default="forgekernel")
     p.add_argument("--hardware", default="B200")
+    p.add_argument("--as-component", default=None, metavar="NAME",
+                   help="also deliver the best kernel as a reusable component under "
+                        "components/<NAME>/ (contract + verify lifted from the card)")
+    p.add_argument("--component-root", default=None,
+                   help="where components/<NAME>/ is written (default: the repository)")
     args = p.parse_args(argv)
     try:
         run = open_run(args.run)
@@ -739,6 +778,10 @@ def cmd_export(argv) -> int:
     if best is None or not best.get("kernel"):
         sys.stderr.write("[forge] the run has no confirmed best kernel to export yet\n")
         return 2
+    if args.as_component:
+        rc = _export_as_component(run, task, best, args.as_component, args.component_root)
+        if rc != 0:
+            return rc
     if task.mode != MODE_LEADERBOARD:
         # no board to submit to: the kernel source itself
         if args.out:
