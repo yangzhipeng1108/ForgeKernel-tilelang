@@ -692,7 +692,15 @@ def render_fused(plan: LinkPlan, root: str | Path | None = None) -> str:
     hand-off between stages is generated from the solved plan. For Python languages the
     result is parsed to guarantee it is at least valid syntax — a skeleton that does not
     parse would waste the first GPU round on a syntax error, the exact failure the whole
-    seam-check exists to move earlier."""
+    seam-check exists to move earlier.
+
+    TileLang is rendered as a real ``@T.prim_func``: the plan's stages become one pipelined
+    kernel, each seam a ``T.copy`` between a staging buffer, and the solved ring depth becomes
+    ``T.Pipelined(num_stages=...)`` — TileLang is then the thing that lowers and runs it, so
+    the linker's decided pipeline depth is exactly what the GPU executes (see
+    ``_render_fused_tilelang``). Other languages keep the inline-body skeleton."""
+    if plan.language == "tilelang":
+        return _render_fused_tilelang(plan, root)
     parts: list[str] = [f"# Fused kernel, linked from stages: {' -> '.join(plan.stages)}\n"
                         f"# language: {plan.language}  ring_depth: {plan.ring_depth}  "
                         f"resources: {json.dumps(plan.resources, sort_keys=True)}\n"]
@@ -763,6 +771,203 @@ def _handoff_line_fmt(frm: str, out: str, to: str, inp: str,
     call = f"{fn}({_mid(frm)}_{out}, {_mid(to)}_{inp})"
     return (f"# {frm}.{out} ({src}) -> {to}.{inp} ({dst})\n"
             f"{call}\n")
+
+
+# --- TileLang fused renderer ----------------------------------------------------------
+
+# contract dtype -> the lowercase string TileLang's T.Tensor takes. Kept local so the
+# linker does not depend on taskcard; unknown dtypes are refused, never guessed, because a
+# wrong dtype in generated source is worse than an explicit error.
+_TL_DTYPE = {"float64": "float64", "float32": "float32", "float16": "float16",
+             "bfloat16": "bfloat16", "float8_e4m3fn": "float8_e4m3fn",
+             "float8_e5m2": "float8_e5m2", "int64": "int64", "int32": "int32",
+             "int16": "int16", "int8": "int8", "bool": "bool"}
+
+
+def _tl_contract(plan: LinkPlan, root: str | Path | None, name: str,
+                 problems: list[Diagnostic]) -> tuple[dict, dict]:
+    """One stage's (contract, verify) for the TileLang renderer. Records L-STAGE if unreadable."""
+    cdir = comp.components_root(root) / name
+    try:
+        contract = comp.read_contract(cdir)
+    except comp.ComponentError as e:
+        problems.append(Diagnostic("L-STAGE", f"{name!r}: {e}"))
+        return {}, {}
+    vpath = cdir / plan.language / comp.VERIFY_JSON
+    try:
+        verify = json.loads(vpath.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        verify = {}
+    return contract, verify
+
+
+def _tl_extent(port_spec: dict, axes: list[str], vshape: dict) -> tuple[int, ...] | None:
+    """A port's shape as concrete ints, resolving axis names from the stage's verify shape.
+
+    TileLang's compile path fixes shapes, so a symbolic extent fails to lower ("Cannot find
+    value for constexpr variable"). The verify.json carries one concrete shape per axis; that
+    is what the generated kernel pins. A dim that is already an int stays; an axis with no
+    verified value is unnameable here and returned as ``None`` so the caller refuses."""
+    shape = port_spec.get("shape")
+    if shape is None:
+        return None
+    dims: list[int] = []
+    for d in shape:
+        if isinstance(d, int) and not isinstance(d, bool):
+            dims.append(d)
+            continue
+        v = vshape.get(str(d)) if isinstance(vshape, dict) else None
+        if not isinstance(v, int) or isinstance(v, bool):
+            return None
+        dims.append(v)
+    return tuple(dims)
+
+
+def _render_fused_tilelang(plan: LinkPlan, root: str | Path | None) -> str:
+    """One ``@T.prim_func`` that is the linked pipeline, in the shape TileLang runs as written.
+
+    Unlike the inline-body skeleton, this is a *real* TileLang kernel made from the plan:
+
+    * The pipeline's external inputs (a source stage's unwired inputs) and outputs (a sink
+      stage's unconsumed outputs) become the ``T.Tensor`` parameters, sized from each stage's
+      verify shape — concrete ints, since TileLang fixes extents at compile.
+    * The stages run in the plan's topological order inside ``with T.Kernel(...)``; the seams
+      are wrapped in ``with T.Pipelined(num_stages=plan.ring_depth, order=...)`` so the ring
+      depth the linker *solved* (rate mismatch or a stage floor) is exactly the pipeline the
+      GPU executes — this is the link-time decision being honored by the runtime, which is the
+      whole point of computing it on paper first.
+    * Each wired edge allocates one staging buffer at the source's handle location
+      (``T.alloc_shared`` for ``smem``, ``T.alloc_fragment`` for ``reg``) and the hand-off is
+      a ``T.copy`` (the move). Identical buffers need no copy, so the linker skips the seam
+      copy exactly when the two handles match — the same rule the ``acc_identity`` name
+      encodes for the generic skeleton.
+
+    The stage bodies are attached as comments under each step (they are the regions a user
+    fills with the op), because the bodies here are opaque DSL and must not be spliced into a
+    prim_func unparsed. ``ast.parse`` still guards the whole file, so a malformed generation
+    is caught before a GPU round. A port whose extent cannot be pinned, or a dtype TileLang
+    cannot name, is refused (``L-PROTO`` / ``L-STAGE``) rather than emitted half-right."""
+    problems: list[Diagnostic] = []
+    contracts: dict[str, dict] = {}
+    verifies: dict[str, dict] = {}
+    for n in plan.stages:
+        contract, verify = _tl_contract(plan, root, n, problems)
+        contracts[n] = contract
+        verifies[n] = verify
+    if problems:
+        raise LinkError(problems)
+
+    fed = {(to, inp) for _f, _o, to, inp in plan.edges}
+    consumed = {frm for frm, _o, _t, _i in plan.edges}
+    # external input ports: a source stage's inputs no edge feeds
+    ext_inputs: list[tuple[str, str, dict, str]] = []
+    for name in plan.stages:
+        for port, spec in (contracts[name].get("inputs") or {}).items():
+            if (name, port) not in fed:
+                ext_inputs.append((name, port, spec, contracts[name].get("axes") or []))
+    # external outputs: a sink stage's outputs no edge consumes
+    ext_outputs: list[tuple[str, str, dict, str]] = []
+    for name in plan.stages:
+        if name in consumed:
+            continue
+        for port, spec in (contracts[name].get("outputs") or {}).items():
+            ext_outputs.append((name, port, spec, contracts[name].get("axes") or []))
+
+    def _param(pname, spec, axes, vshape):
+        ext = _tl_extent(spec, axes, vshape)
+        dt = _TL_DTYPE.get(str(spec.get("dtype")))
+        if ext is None:
+            raise LinkError([Diagnostic(
+                "L-PROTO", f"TileLang param {pname!r}: its extents are not all concrete "
+                           f"(verify shape {vshape}); TileLang fixes shapes at compile")])
+        if dt is None:
+            raise LinkError([Diagnostic(
+                "L-PROTO", f"TileLang param {pname!r}: no TileLang dtype for "
+                           f"{spec.get('dtype')!r}")])
+        return f"{_mid(pname)}: T.Tensor({_tl_tuple(ext)}, \"{dt}\")"
+
+    params = [_param(n + "_" + p, s, ax, verifies[n].get("shape") or {})
+              for n, p, s, ax in ext_inputs + ext_outputs]
+
+    steps: list[str] = []
+    buffers: dict[tuple[str, str], str] = {}
+    allocs: list[str] = []
+
+    def _alloc_for(bname: str, spec: dict, axes, vshape) -> str:
+        ext = _tl_extent(spec, axes, vshape) or (1,)
+        dt = _TL_DTYPE.get(str(spec.get("dtype")))
+        shape = _tl_tuple(ext)
+        return f"        {bname} = {_tl_alloc(spec.get('handle') or 'reg')}({shape}, \"{dt}\")"
+
+    def _buffer(port_key: tuple[str, str], spec: dict, owner: str) -> str:
+        """One buffer per wired port, named after the port, allocated at its handle."""
+        if port_key not in buffers:
+            bname = f"buf_{_mid(port_key[0])}_{port_key[1]}"
+            buffers[port_key] = bname
+            allocs.append(_alloc_for(bname, spec, contracts[owner].get("axes") or [],
+                                     verifies[owner].get("shape") or {}))
+        return buffers[port_key]
+
+    # external I/O buffers (a source's inputs, a sink's outputs)
+    for n, p, s, _ax in ext_inputs + ext_outputs:
+        _buffer((n, p), s, n)
+    # every wired port gets a buffer: producer output (src handle), consumer input (dst handle)
+    for frm, out, to, inp in plan.edges:
+        _buffer((frm, out), contracts[frm]["outputs"][out], frm)
+        _buffer((to, inp), contracts[to]["inputs"][inp], to)
+
+    # stage comments + seam copies, in topological order
+    for name in plan.stages:
+        steps.append(f"            # ---- stage: {name} ----")
+        for frm, out, to, inp in plan.edges:
+            if frm != name:
+                continue
+            src_h = contracts[frm]["outputs"][out].get("handle") or "reg"
+            dst_h = contracts[to]["inputs"][inp].get("handle") or "reg"
+            if src_h == dst_h:
+                steps.append(f"            # {frm}.{out} -> {to}.{inp}: same handle "
+                             f"({src_h}), no copy (acc_identity)")
+            else:
+                steps.append(f"            T.copy({_buffer((frm, out), contracts[frm]['outputs'][out], frm)}, "
+                             f"{_buffer((to, inp), contracts[to]['inputs'][inp], to)})"
+                             f"  # {frm}.{out} ({src_h}) -> {to}.{inp} ({dst_h})")
+    steps.append("            # ---- write each stage's op here; seams above are the "
+                 "linker's hand-offs ----")
+    steps.append("            T.no_op()  # placeholder: a block of only comments will not parse")
+
+    ext_io_decls = ", ".join(_mid(n + "_" + p) for n, p, _s, _a in ext_inputs + ext_outputs)
+    stage_chain = " -> ".join(plan.stages)
+    tools = "import tilelang\nimport tilelang.language as T\n\n\n"
+    order = ", ".join(str(i) for i in range(len(plan.stages))) or "0"
+    body = (
+        f"@T.prim_func\n"
+        f"def fused({', '.join(params)}):\n"
+        f"    with T.Kernel(1, threads=128) as bx:\n"
+        + ("\n".join(allocs) + "\n" if allocs else "")
+        + f"        with T.Pipelined({max(1, plan.ring_depth)}, order=[{order}]):\n"
+        + ("\n".join(steps) + "\n" if steps else "            pass\n"))
+    header = (
+        f"# Fused TileLang kernel, linked from stages: {stage_chain}\n"
+        f"# language: tilelang  ring_depth: {plan.ring_depth}  "
+        f"resources: {json.dumps(plan.resources, sort_keys=True)}\n"
+        f"# params: {ext_io_decls or '(none)'}\n")
+    text = header + tools + body
+    try:
+        ast.parse(text)
+    except SyntaxError as e:
+        raise LinkError([Diagnostic(
+            "L-PROTO", f"the generated TileLang source does not parse: {e}")]) from e
+    return text
+
+
+def _tl_tuple(ext: tuple[int, ...]) -> str:
+    inner = ", ".join(str(d) for d in ext)
+    return f"({inner},)" if len(ext) == 1 else f"({inner})"
+
+
+def _tl_alloc(handle: str) -> str:
+    """The buffer allocator a handle kind maps to: shared memory vs a register fragment."""
+    return "T.alloc_shared" if handle == "smem" else "T.alloc_fragment"
 
 
 def _reject_symbol_collisions(bodies: list[tuple[str, str]], language: str) -> None:

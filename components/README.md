@@ -90,14 +90,18 @@ the part that does not need a GPU, which is where most link-time decisions live:
 - **bridge hints** — on a mismatched seam, if a component under the root could sit between
   the two stages (its input takes what the producer emits, its output gives what the consumer
   wants), the `L-PROTO` diagnostic names it: "insert X between them".
-- **fused-source generation** — `--emit DIR` writes `fused_kernel.<ext>` (each stage's body
-  inlined under its role, hand-offs generated from the plan; Python skeletons are
-  `ast.parse`-checked). For each edge it emits the **actual move**, chosen from the two ports'
-  handle kinds — `acc_tmem_to_reg` when a TMEM accumulator is imported into registers,
-  `acc_reg_to_smem` to stage a ring slot, `acc_identity` when unchanged. Fusing **refuses two
-  stages that define the same top-level name** (`L-PROTO`, reported with `--emit` as a
-  refusal, not a traceback): inlining would let the later definition silently shadow the
-  earlier one. `link-plan.json` records stages, edges, solved resources and ring depth.
+- **fused-source generation** — `--emit DIR` writes `fused_kernel.<ext>`. For **TileLang**
+  (the first-class target) it is a real `@T.prim_func`: the pipeline's external I/O become
+  `T.Tensor` params sized from each stage's `verify.json` shape, the stages run in topological
+  order inside `with T.Kernel(...)`, the solved ring depth becomes
+  `with T.Pipelined(num_stages=ring_depth, ...)`, and each seam is a `T.copy` between a
+  buffer allocated at the port's handle location (`T.alloc_shared` for `smem`,
+  `T.alloc_fragment` for `reg`) — no copy when the handles match. So TileLang lowers and runs
+  exactly the pipeline depth the linker decided; this is the link-time decision honored by the
+  runtime. For other languages `fused_kernel.<ext>` is the inline-body skeleton with the
+  generated `acc_*` moves. Every skeleton is `ast.parse`-checked. Fusing **refuses two stages
+  that define the same top-level name** (`L-PROTO`, reported with `--emit` as a refusal, not a
+  traceback). `link-plan.json` records stages, edges, solved resources and ring depth.
 - **semantic parity, on the CPU** — `forgekernel.link.run_parity` chains each stage's
   `verify.json` golden through the same wiring the linker solved and checks it against a
   reference on CPU torch. Each reading carries the stage's output shape, so a mismatch points

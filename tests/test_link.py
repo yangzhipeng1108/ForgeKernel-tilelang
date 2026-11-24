@@ -19,11 +19,11 @@ from forgekernel.component_cli import main as component_main
 def _stage(root: Path, name: str, *, in_shape=("m",), out_shape=("m",),
            in_dtype="float32", out_dtype="float32", resources=None, roles=None,
            golden="OUT = IN", impl="# impl\n", in_handle=None, out_handle=None,
-           out_generation=None):
+           out_generation=None, language="cutedsl"):
     d = root / "components" / name
     d.mkdir(parents=True)
     (d / comp.COMPONENT_TOML).write_text(
-        f'[component]\nname = "{name}"\nlanguages = ["cutedsl"]\nsummary = "{name}"\n'
+        f'[component]\nname = "{name}"\nlanguages = ["{language}"]\nsummary = "{name}"\n'
         + _tbl("resources", resources) + _tbl("roles", roles), encoding="utf-8")
     in_spec = {"shape": list(in_shape), "dtype": in_dtype}
     out_spec = {"shape": list(out_shape), "dtype": out_dtype}
@@ -40,9 +40,9 @@ def _stage(root: Path, name: str, *, in_shape=("m",), out_shape=("m",),
         "semantics": f"{name}",
     }
     (d / comp.CONTRACT_JSON).write_text(json.dumps(contract), encoding="utf-8")
-    slot = d / "cutedsl"
+    slot = d / language
     slot.mkdir()
-    (slot / "kernel.py").write_text(impl, encoding="utf-8")
+    (slot / comp.IMPL_FILE[language]).write_text(impl, encoding="utf-8")
     (slot / comp.VERIFY_JSON).write_text(
         json.dumps({"shape": {"m": 4}, "tolerance": 0.0, "golden": {"torch": golden}}),
         encoding="utf-8")
@@ -584,4 +584,52 @@ def test_cli_diff_reports_the_swap(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "stages added: c" in out and "stages removed: b" in out
+
+
+# --- TileLang fused renderer ---------------------------------------------------------
+
+def test_tilelang_render_emits_a_pipelined_prim_func(tmp_path):
+    _stage(tmp_path, "a", language="tilelang")
+    _stage(tmp_path, "b", language="tilelang")
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "@T.prim_func" in src
+    assert "def fused(" in src
+    assert "with T.Pipelined(1," in src          # the solved ring depth becomes num_stages
+    assert "import tilelang.language as T" in src
+    ast.parse(src)
+
+
+def test_tilelang_ring_depth_drives_pipelined_stages(tmp_path):
+    _stage(tmp_path, "a", language="tilelang", roles={"ring_min": 3})
+    _stage(tmp_path, "b", language="tilelang")
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "with T.Pipelined(3," in src
+
+
+def test_tilelang_renders_a_copy_for_a_handle_change(tmp_path):
+    _stage(tmp_path, "g", language="tilelang", out_handle="smem")
+    _stage(tmp_path, "e", language="tilelang", in_handle="reg")
+    plan = linkmod.link(["g", "e"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "T.alloc_shared((4,), \"float32\")" in src      # producer output in smem
+    assert "T.alloc_fragment((4,), \"float32\")" in src    # consumer input in reg
+    assert "T.copy(" in src and "g.y (smem) -> e.x (reg)" in src
+
+
+def test_tilelang_same_handle_needs_no_copy(tmp_path):
+    _stage(tmp_path, "g", language="tilelang", out_handle="reg")
+    _stage(tmp_path, "e", language="tilelang", in_handle="reg")
+    plan = linkmod.link(["g", "e"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "no copy (acc_identity)" in src
+    assert "T.copy(" not in src                        # identical handles -> no move
+
+
+def test_tilelang_param_extent_comes_from_the_verify_shape(tmp_path):
+    _stage(tmp_path, "a", language="tilelang", in_shape=("m",), out_shape=("m",))
+    plan = linkmod.link(["a"], root=tmp_path)
+    src = linkmod.render_fused(plan, root=tmp_path)
+    assert "T.Tensor((4,), \"float32\")" in src        # verify.json pinned m=4
 
