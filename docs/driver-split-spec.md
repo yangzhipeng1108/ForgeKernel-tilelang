@@ -55,15 +55,16 @@ matters: extract leaves first, then the nodes once their leaves are out.
 
 The order is leaf-ish → central. Suggested target modules under `loop/`:
 
-> **Progress:** steps 2, 3, 4 are DONE and gated (no new failures vs baseline):
-> `loop/harness_section.py`, `loop/placeholder.py`, `loop/pricing.py` (dossier + price).
-> `driver.py` is down from 327 to 287 top-level defs. Steps 1 and 5–9 remain.
+> **Progress:** steps 1, 2, 3, 4 are DONE and gated (no new failures vs baseline):
+> `loop/prompt.py`, `loop/harness_section.py`, `loop/placeholder.py`,
+> `loop/pricing.py` (dossier + price). `driver.py` is down from 327 to 287 top-level
+> defs. Steps 5–9 remain (and are not clean leaves — see the status section below).
 
-1. **`loop/prompt.py`** ← "prompt rendering" (15/21 referenced outside; the render
-   functions like `render_prompt`, `_student_prompt`, `_meta_prompt`). Largest
-   inbound ref count, so do it once the two below prove the pattern — or do it first
-   and accept a big re-export block. **Start here only if willing to carry ~15
-   re-exports.**
+1. ✅ **`loop/prompt.py`** ← "prompt rendering" (23 defs + 2 consts). DONE. A real
+   leaf on a closer look: only 5 driver helpers are needed (`LoopContext` [annotation
+   only], `_log`, `_orch_summary`, `_read_ref_orch_dossier`, `_timeline_student_note`)
+   and they go through lazy shims; `_placeholder_note`/`_price_revision_note` come
+   from the placeholder/pricing modules (which do not import prompt). 23 re-exports.
 2. ✅ **`loop/harness_section.py`** ← "card-owned harness" (`_harness_hygiene` +
    `_harness_edit_revert`). DONE. `run_inner_iteration` stays in `driver` (it is the
    orchestrator, not a leaf).

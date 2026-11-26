@@ -211,6 +211,7 @@ EXTRACTED_MODULES = (
     "forgekernel.loop.harness_section",
     "forgekernel.loop.placeholder",
     "forgekernel.loop.pricing",
+    "forgekernel.loop.prompt",
 )
 
 
