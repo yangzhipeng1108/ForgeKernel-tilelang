@@ -724,6 +724,53 @@ def _slug(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name).strip("_") or "x"
 
 
+def save_comparison_baseline(op_dir, name: str, baseline) -> Path:
+    """Archive one comparison baseline so ``comparison_rows`` can report it later.
+
+    The counterpart of :func:`comparison_rows`' reader: it writes
+    ``comparison_<slug>.json`` in the exact field shape that reader reconstructs a
+    ``RefBaseline`` from (``dataclasses.asdict``), so the two ends cannot drift. A
+    comparison is not the reference and never rides the eval jobs — it is measured once
+    (the caller times the run callable through the card's clock) and frozen here, and the
+    report turns it into a median-vs-median row against the run's best kernel.
+
+    ``op_dir`` is the run's operator directory (``run.operators_dir / task.name``);
+    ``baseline`` is any ``RefBaseline`` (or duck-typed object with its fields)."""
+    from dataclasses import asdict
+    from pathlib import Path
+    op_dir = Path(op_dir)
+    op_dir.mkdir(parents=True, exist_ok=True)
+    path = op_dir / f"comparison_{_slug(name)}.json"
+    try:
+        data = asdict(baseline)
+    except TypeError:
+        # a duck-typed baseline: keep only the RefBaseline fields
+        from forgekernel.baseline import RefBaseline
+        data = {k: getattr(baseline, k) for k in RefBaseline.__dataclass_fields__
+                if hasattr(baseline, k)}
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def render_comparison_table(rows: list[dict]) -> list[str]:
+    """Markdown lines for the comparison rows (shared by the report and any digest).
+
+    A row is what ``comparison_rows`` returns: ``{"name", "status"}`` and, when measured,
+    ``median_ms`` / ``speedup`` / ``basis``. Unmeasured rows print the reason in the basis
+    column so a missing number reads as "not measured" (with why) rather than a silent
+    blank that looks like zero."""
+    if not rows:
+        return []
+    lines = ["| baseline | reading | speedup vs it | basis |", "|---|---|---|---|"]
+    for r in rows:
+        if r.get("status") != "measured":
+            lines.append(f"| {r['name']} | — | — | {r.get('status', 'unknown')} |")
+        else:
+            lines.append(f"| {r['name']} | {r['median_ms']} ms | "
+                         f"{r['speedup']:.4f}x | {r.get('basis', '')} |")
+    return lines
+
+
 def write_report(run, task, rc: int) -> Path:
     rec = run.record()
     lines = [f"# {run.name}", "", f"- task: {task.name} ({task.mode} mode)",
@@ -746,15 +793,8 @@ def write_report(run, task, rc: int) -> Path:
                       "The reference above is what the loop optimises against and the only "
                       "same-job ratio. These rows are median-vs-median readings of the extra "
                       "baselines the task declares, so a competitiveness claim names the "
-                      "library it beats:", "",
-                      "| baseline | reading | speedup vs it | basis |",
-                      "|---|---|---|---|"]
-            for r in rows:
-                if r["status"] != "measured":
-                    lines.append(f"| {r['name']} | — | — | {r['status']} |")
-                else:
-                    lines.append(f"| {r['name']} | {r['median_ms']} ms | "
-                                 f"{r['speedup']:.4f}x | {r['basis']} |")
+                      "library it beats:", ""]
+            lines += render_comparison_table(rows)
     lines.append(f"- workspace: {run.ws}")
     kb = kb_changes()
     if kb:
