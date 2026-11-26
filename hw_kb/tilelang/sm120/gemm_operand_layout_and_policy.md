@@ -1,5 +1,7 @@
 # `T.gemm` on sm120: `mma.sync`, and a warp policy that actually changes something
 
+> State: WORKS — T.gemm mma.sync and the GemmWarpPolicy sweep are measured on hardware with NCU; Square reads shared ~25% less, use the default policy.
+
 > Status: **measured on hardware, NCU axis included.** Every number below is from an RTX 6000D,
 > and the counter columns come from Nsight Compute rather than being inferred from wall clock.
 

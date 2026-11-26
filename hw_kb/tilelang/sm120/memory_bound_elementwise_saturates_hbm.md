@@ -1,5 +1,7 @@
 # Memory-bound elementwise (RMSNorm, RoPE): the one regime that saturates HBM — tile-small, and scheduling STILL ties
 
+> State: WORKS — RMSNorm/RoPE are measured at the HBM wall with a small tile, cosine~1.0 on hardware; use the small-tile, scheduling-ties recipe as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` (RMSNorm) /
 > `0.99993` (RoPE) against float32 references.
 

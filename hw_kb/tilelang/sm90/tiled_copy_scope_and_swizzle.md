@@ -1,5 +1,7 @@
 # `T.copy` between scopes, and what `T.annotate_layout` does and does not pin
 
+> State: PARTIAL — the T.copy/annotate_layout mechanism is documented but the readings are not taken on this card; read it for the API, not yet as measured evidence.
+
 > Status: **skeleton — the mechanism is documented, the readings are not taken yet.**
 > Every `[to be measured]` below must be produced on a real box before this counts as
 > evidence. The API surface and its parameters are read off the installed 0.1.15 source.

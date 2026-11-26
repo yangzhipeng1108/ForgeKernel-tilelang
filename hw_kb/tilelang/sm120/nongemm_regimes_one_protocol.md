@@ -1,5 +1,7 @@
 # The non-GEMM regimes on sm120: two HBM walls, one kernel at each
 
+> State: WORKS — RMSNorm/RoPE/attention/LM-head are measured against their HBM/compute walls on hardware with one cosine-gated protocol; use the per-regime verdicts as written.
+
 > Status: **measured on hardware**, RTX 6000D (`sm_120a`, 156 SMs), free-running clocks.
 > Same wall-clock protocol and cosine gate as `precision_roofline_all_stacks.md`, so the
 > numbers are directly comparable across regimes.

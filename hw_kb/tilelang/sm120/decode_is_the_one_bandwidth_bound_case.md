@@ -1,5 +1,7 @@
 # Decode (MHA, q = 16) is the one bandwidth-bound case — and the scheduling axes still tie
 
+> State: WORKS — decode (q=16) is measured as the one bandwidth-bound case with NCU and cosine=1.0; scheduling ties and fp8-KV is slower, use the verdicts as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, NCU census included.
 > Correctness `cos = 1.00000` against `torch.nn.functional.scaled_dot_product_attention`.
 

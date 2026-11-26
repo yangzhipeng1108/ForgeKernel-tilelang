@@ -42,8 +42,9 @@ The source build was blocked for a long time on a TVM/tvm-ffi API mismatch. The 
   check out the exact commit the submodule pointer names. `tile-ai/tvm@main` and
   `@tilelang_main` are both `0.25.dev0` and carry the *new* ffi → they do **not** work.
 
-Fix: clone `TileLang/tvm`, `git checkout 4211874e9…`, then in its `3rdparty/tvm-ffi` checkout
-`3c35034f…` (plus that ffi's `dlpack 84d107bf…` and `libbacktrace 793921876…`). With that tree,
+Fix: clone `TileLang/tvm`, check out the exact commit the source-build pins in
+docs/kb-provenance/ record, then in its `3rdparty/tvm-ffi` checkout use the matching ffi commit
+(plus that ffi's pinned `dlpack` and `libbacktrace`). With that tree,
 `pip install --no-build-isolation .` builds `tvm_runtime` + `tvm_compiler` and the wheel
 (`tilelang 0.1.15`) cleanly (352-core host, `export PATH=/usr/local/cuda/bin:$PATH` for nvcc 13.3).
 An unmodified 0.1.15 then runs an fp16 `T.gemm` at cos ≈ 1.0 — the build chain is proven.
@@ -79,7 +80,7 @@ m16n8k32 … e4m3.e4m3 … ue8m0` (~2763). Both are auto-enabled under the `sm_1
 ## The multi-stage crash — fixed
 
 Symptom: MXFP4 with `K > block_K` and `num_stages ≥ 2` faults an **invalid `__shared__` read**
-(compute-sanitizer: line 176, address `0x11800`, past the whole `buf_dyn_shmem`). `num_stages=1`
+(compute-sanitizer reports address `0x11800`, past the whole `buf_dyn_shmem`). `num_stages=1`
 and single-block `K = block_K` both run.
 
 Root cause: in `_load_kblock` the scale K-word index was computed as
@@ -138,7 +139,8 @@ than MXFP4 and was not started.
 ## What to reuse
 
 - Source-build recipe (the tvm pair) is the valuable, transferable result: pin
-  `TileLang/tvm@4211874e9…` and its `tvm-ffi@3c35034f…`. Any 0.1.15 C++ edit needs exactly this.
+  `TileLang/tvm` and its `tvm-ffi` to the matching commits the source-build pins in
+  docs/kb-provenance/ record. Any 0.1.15 C++ edit needs exactly this.
 - The `num_stages` / single-block bisection isolates SF-tile geometry bugs from MMA bugs fast.
 - **Gate for scale packing:** set all scales to 1.0 to split "operand/MMA correct" from "scale
   placement correct" (cos jumps to 1.0 iff only placement is wrong). For finding placement bugs,

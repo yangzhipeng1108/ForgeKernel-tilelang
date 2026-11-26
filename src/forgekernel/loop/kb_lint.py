@@ -403,7 +403,7 @@ def lint_exam_surfaces(repo_root: Path) -> list[str]:
             files.extend(f for f in sorted(base.rglob("*")) if f.suffix in _SURFACE_EXTS)
     files.extend(root / f for f in EXAM_SURFACE_FILES if (root / f).is_file())
     for file in files:
-        label = str(file.relative_to(root))
+        label = file.relative_to(root).as_posix()
         try:
             text = file.read_text(encoding="utf-8")
         except OSError as e:
@@ -415,7 +415,7 @@ def lint_exam_surfaces(repo_root: Path) -> list[str]:
         if not base.is_dir():
             continue
         for file in sorted(base.rglob("*.py")):
-            label = str(file.relative_to(root))
+            label = file.relative_to(root).as_posix()
             if any(label.startswith(s + "/") for s in EXAM_SURFACE_PY_SKIP):
                 continue
             try:

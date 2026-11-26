@@ -1,5 +1,7 @@
 # Head dim decides the pipeline-stage verdict: `stages=2` fits at `D=64`, not at `D=128`
 
+> State: WORKS — the head-dim stage budget is measured clock-locked and cosine=1.0: stages=2 fits D=64 not D=128; choose stages by head dim as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` on every runnable cell.
 > Correctness `cos = 1.00000` against `torch.nn.functional.scaled_dot_product_attention(is_causal=True)`.
 

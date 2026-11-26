@@ -1,5 +1,7 @@
 # Software pipeline: `T.Pipelined(num_stages=...)` and what it actually stages
 
+> State: PARTIAL — the mechanism is documented but every reading is still [to be measured] on this card; read the mechanism but do not treat any number as evidence yet.
+
 > Status: **skeleton — the mechanism is documented, the readings are not taken yet.**
 > Every `[to be measured]` below is a number this card must produce on a real box before the
 > entry counts as evidence. Everything else is read off the installed 0.1.15 source and its

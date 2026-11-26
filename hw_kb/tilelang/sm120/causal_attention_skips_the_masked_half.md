@@ -1,5 +1,7 @@
 # Causal attention: skipping the masked half is a 1.95× win on hardware, and closes the SDPA gap
 
+> State: WORKS — skipping the masked upper tiles is a measured 1.95x win, cosine=1.0 at every length; use the diagonal-bounded k-loop as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` at every length.
 > Correctness `cos = 1.00000` against `torch.nn.functional.scaled_dot_product_attention(is_causal=True)`.
 

@@ -1,5 +1,7 @@
 # Sparse GEMM on sm120: 2:4 `mma.sp` runs (≈2×) and block-tile skipping works (≈linear)
 
+> State: WORKS — 2:4 mma.sp (1.95x) and block-tile skipping both run and are verified against a dense reference on hardware; use either as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, TileLang `0.1.15`, `sm_120a`.
 > Both sparse mechanisms verified against a dense reference (`cos = 1.0` / tile-exact match).
 

@@ -1,5 +1,7 @@
 # `T.gemm` input dtype on sm120: f16/bf16 are equal, fp8 is 2.1× — and fp8 wants a bigger BK
 
+> State: WORKS — f16/bf16 equal and fp8 ~2.1x with BK=128, all clock-locked and cosine-gated on hardware; the dtype/BK choice is ready to use.
+
 > Status: **measured on hardware.** Every number is a clock-locked RTX 6000D reading, with
 > CUDA-event timing. The correctness column is a cosine similarity against an fp32 reference, so a
 > fast-but-wrong configuration cannot pass silently.

@@ -1,5 +1,7 @@
 # Thread-block clusters on sm120: launch is free, TMA multicast is 60,000× slower
 
+> State: BROKEN — cluster launch ties plain but T.copy_cluster TMA multicast is ~60,000x slower on sm120/0.1.15; do not use multicast, and do not form a cluster as a speed move.
+
 > Status: **measured on hardware, clock-locked**, fp8 e4m3, tile `(128,128,128)`, 4096³.
 > Correctness `md = 0.125` (= fp16 ulp at |C|≈140, i.e. exact) in every row below.
 

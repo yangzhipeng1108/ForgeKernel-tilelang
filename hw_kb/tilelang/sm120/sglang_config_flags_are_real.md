@@ -1,5 +1,7 @@
 # The Qwen3.8 sglang config is real: every flag parses and the flashinfer GDN kernel binds on sm120
 
+> State: WORKS — every sglang --mamba-*/--linear-attn-* flag parses and flashinfer GDN binds on sm120, verified on hardware; treat the config flags as real.
+
 ## Purpose
 
 The deployment config for `Qwen3.8-Flash-Next-NVFP4` carries a long tail of `--mamba-*` and

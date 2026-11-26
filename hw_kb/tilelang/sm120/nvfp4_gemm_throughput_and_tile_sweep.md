@@ -1,5 +1,7 @@
 # NVFP4 blockscaled GEMM on sm120: 836-865 TF/s while L2 holds the operands, 545 when it does not
 
+> State: WORKS — NVFP4 blockscaled GEMM is measured 836-865 TF/s while L2 holds the operands and the tile axis is closed at 128/128/128 st3; use as written.
+
 ## Purpose
 
 Measure the fixed TileLang NVFP4 blockscaled GEMM (see

@@ -26,10 +26,10 @@ evidence has to go. A row becomes certified only when its `## Measured on` block
 
 | Interface | Entry | Evidence |
 |---|---|---|
-| `T.Pipelined(num_stages=)` — stage budget, what it does and does not stage | `software_pipeline_stage_budget.md` | `[to be measured]` |
-| `T.copy` across scopes; `T.annotate_layout` only pins the buffers it names | `tiled_copy_scope_and_swizzle.md` | `[to be measured]` |
-| `T.gemm` operand orientation and `GemmWarpPolicy` | `gemm_operand_layout_and_policy.md` | `[to be measured]` |
-| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | `[to be measured]` |
+| `T.Pipelined(num_stages=)` — stage budget, what it does and does not stage | `software_pipeline_stage_budget.md` | ⚠️ PARTIAL — mechanism documented, readings [to be measured] on this card |
+| `T.copy` across scopes; `T.annotate_layout` only pins the buffers it names | `tiled_copy_scope_and_swizzle.md` | ⚠️ PARTIAL — mechanism documented, readings [to be measured] on this card |
+| `T.gemm` operand orientation and `GemmWarpPolicy` | `gemm_operand_layout_and_policy.md` | ⚠️ PARTIAL — mechanism documented, readings [to be measured] on this card |
+| Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | ⚠️ PARTIAL — mechanism documented, readings [to be measured] on this card |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 

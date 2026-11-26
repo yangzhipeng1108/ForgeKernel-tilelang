@@ -1,5 +1,7 @@
 # Porting GEMM levers to attention: split-K ties, but fp8 QK^T ports at 1.2–1.4× (do not upcast V)
 
+> State: WORKS — porting GEMM levers to attention is measured on hardware: split-K ties, fp8 QK ports at 1.2-1.4x, do not upcast V; use as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16/fp8, `cos = 1.00000` (f16) and
 > `0.9994` (fp8 QK) against `torch.nn.functional.scaled_dot_product_attention`.
 

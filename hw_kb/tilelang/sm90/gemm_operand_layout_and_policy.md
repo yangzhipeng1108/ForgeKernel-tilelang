@@ -1,5 +1,7 @@
 # `T.gemm`: the operand layouts it accepts and the warp policy that splits the work
 
+> State: PARTIAL — the T.gemm layout/policy mechanism is documented but unmeasured on this card; read it for the API surface, not yet for numbers.
+
 > Status: **skeleton — the mechanism is documented, the readings are not taken yet.**
 > Every `[to be measured]` below must be produced on a real box before this counts as
 > evidence. The signature and the enum members are read off the installed 0.1.15 package.

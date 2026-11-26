@@ -1,5 +1,7 @@
 # Software pipeline on sm120: `num_stages`, the producer warpgroup, and the `a`-suffix gate
 
+> State: WORKS — the num_stages budget and producer-warpgroup behaviour are measured on an RTX 6000D with an NCU census; stage 2 is the plateau, use it as written.
+
 > Status: **measured on hardware, NCU axis included.** Every number below is a real reading
 > from an RTX 6000D — lower-level counts from the emitted source, and the stall/pipe-utilization
 > columns from Nsight Compute.

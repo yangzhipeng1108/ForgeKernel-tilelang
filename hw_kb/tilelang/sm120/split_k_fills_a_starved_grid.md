@@ -1,5 +1,7 @@
 # Split-K on sm120: the one scheduling axis that pays — when the tile grid is starved
 
+> State: WORKS — split-K is measured clock-locked on hardware and pays only on a tile-starved grid, cosine=1.0; use it exactly there and not on a full grid.
+
 > Status: **measured on hardware, clock-locked**, fp8 e4m3, tile `(128,128,128)`, `num_stages=2`,
 > `do_bench(warmup=20, rep=60)`. Correctness checked with `cosine = 1.000000` on every row
 > (`md ≤ 1e-3`, fp32 accumulate).

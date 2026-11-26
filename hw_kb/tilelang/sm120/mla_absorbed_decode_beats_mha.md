@@ -1,5 +1,7 @@
 # MLA (absorbed) decode: 256× less KV traffic, 3.8× faster than MHA (1.16× over GQA/MQA), back on the tensor cores
 
+> State: WORKS — absorbed MLA decode is measured 3.8x over MHA and cosine=1.0 on every cell; use the absorbed-cache recipe as written, noting it reverses at HQ=32.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` on every cell.
 > Correctness `cos = 1.00000` (`md = 5.9e-7`) against a float32 absorbed-attention reference.
 

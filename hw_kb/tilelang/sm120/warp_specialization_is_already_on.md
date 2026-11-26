@@ -1,5 +1,7 @@
 # Warp specialization on sm120: already on by default, and the explicit schedule makes it slower
 
+> State: WORKS — warp specialisation is on by default and the explicit schedule is 2-3x slower, measured clock-locked on hardware; leave the default on.
+
 > Status: **measured on hardware, clock-locked, CUDA-graph-free `do_bench` (events over many
 > iterations).** Every number is a real reading from an RTX 6000D.
 

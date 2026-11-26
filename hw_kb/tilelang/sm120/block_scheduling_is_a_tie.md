@@ -1,5 +1,7 @@
 # Block scheduling on sm120: Raster / Swizzle / Persistent are all the same speed
 
+> State: WORKS — Raster/Swizzle/Persistent are within +-2% across 24 clock-locked cells on hardware; do not spend effort on the block schedule for compute-bound shapes.
+
 > Status: **measured on hardware, clock-locked**, 24 cells (4 problem shapes × 6 scheduling
 > variants), fp8 e4m3, tile `(128,128,128)`, `num_stages=2`, `do_bench(warmup=20, rep=60)`.
 

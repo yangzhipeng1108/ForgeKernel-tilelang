@@ -1,5 +1,7 @@
 # Every precision on this box, three stacks, one protocol
 
+> State: WORKS — the every-precision three-stack TF/s table is measured on hardware and cosine-gated; read the numbers and the nameplate caveats as written.
+
 > Status: **measured on hardware**, RTX 6000D (`sm_120a`, 156 SMs), free-running clocks.
 > Every number is a 4096³ matmul unless the shape column says otherwise, timed with a plain
 > wall-clock loop (warmup 5, 40 iterations, one `synchronize` at each end). The correctness
@@ -266,7 +268,8 @@ only when a quantiser already emits UE8M0 scales.
 
 The table above is **CuTeDSL**. TileLang's own MX is a source-level extension still in progress
 and must not be counted as a working MX path on this box. Built from source (requires pinning
-`TileLang/tvm@4211874e9…` + `tvm-ffi@3c35034f…` — the only TVM pair matching 0.1.15's old ffi
+`TileLang/tvm` and `tvm-ffi` to the matching commits the source-build pins in
+docs/kb-provenance/ record — the only TVM pair matching 0.1.15's old ffi
 API), MXFP4 compiles and launches, and the multi-stage crash is fixed, but per-block scale values
 are still misplaced (**cos ≈ 0.59**; cos jumps to 1.0 with all scales set to 1.0, proving the MMA
 itself is right). MXFP8 is wired at the config/PTX/enum level but needs a new 8-bit `m16n8k32`

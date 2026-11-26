@@ -1,5 +1,7 @@
 # Writing a TileLang GPU probe on sm120: one rung per process, verdicts off the log tail
 
+> State: WORKS — the probe harness ran on an RTX 6000D and returned four verdicts, with timing, precision and timeline verified on hardware; use the one-rung-per-process pattern as written.
+
 > Status: **measured on hardware.** The harness described here ran on an RTX 6000D and returned
 > four verdicts. The failures it produced along the way are recorded below because each one is
 > a failure mode worth recognising.

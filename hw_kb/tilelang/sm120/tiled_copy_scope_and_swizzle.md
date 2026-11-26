@@ -1,5 +1,7 @@
 # `T.copy` across scopes on sm120, and the 99 KiB shared-memory ceiling
 
+> State: WORKS — T.copy across scopes and the 99 KiB smem ceiling are measured on hardware with NCU; the tile-vs-bank-conflict guidance is ready to use.
+
 > Status: **measured on hardware, NCU axis included.** Numbers from an RTX 6000D, with the
 > counter columns read from Nsight Compute.
 

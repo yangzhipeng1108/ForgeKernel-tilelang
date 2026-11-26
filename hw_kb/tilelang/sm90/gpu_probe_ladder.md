@@ -1,5 +1,7 @@
 # Writing a TileLang GPU probe: one rung per process, verdicts off the log tail
 
+> State: PARTIAL — the probe-ladder shape is documented but its readings are not taken on this card; read the method but fill the [to be measured] cells before citing.
+
 > Status: **skeleton — the shape is documented, the readings are not taken yet.**
 > `[to be measured]` marks what this card must produce on a real box. The mechanism below is
 > the reason the main variant of this entry exists in the other two trees; here it is restated

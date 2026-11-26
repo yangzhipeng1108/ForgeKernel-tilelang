@@ -1,5 +1,7 @@
 # FlashAttention on sm120: compute-bound too, and the GEMM lessons do (and do not) transfer
 
+> State: WORKS — FA-2 forward is measured clock-locked with NCU and cosine=1.0 on hardware; the GEMM-lesson transfers and beats SDPA at SEQ=512, use as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16/fp8, NCU census included.
 > Correctness `cos = 1.00000` (f16) against `torch.nn.functional.scaled_dot_product_attention`.
 

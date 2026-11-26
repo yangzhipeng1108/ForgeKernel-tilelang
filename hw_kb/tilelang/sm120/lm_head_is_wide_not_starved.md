@@ -1,5 +1,7 @@
 # LM head (skinny GEMM): split-K does not help, block-sparsity would — it is the wide-N case, not the starved case
 
+> State: WORKS — the skinny LM-head is measured as wide-N not starved (split-K loses, fp8 wins 1.67-5x) on hardware; use the wide-N handling as written.
+
 > Status: **measured on hardware, clock-locked at 1995 MHz**, fp16, `cos = 1.00000` on every cell.
 > Correctness `cos = 1.00000` against a float32 `X @ W^T` reference.
 
