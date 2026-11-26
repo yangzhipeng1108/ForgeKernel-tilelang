@@ -53,6 +53,8 @@ __all__ = [
     "_PREP_ERROR_PREFIX",
     "_prep_structural_stop",
     "_best_keep_record",
+    "_search_loop_note",
+    "_dual_eval_note",
     "render_prompt",
     "_student_prompt",
 ]
@@ -518,6 +520,45 @@ def _best_keep_record(records, gate_window: str):
     return min(kept, key=lambda r: gate_ms(r, gate_window)) if kept else None
 
 
+def _search_loop_note(ctx: LoopContext) -> str:
+    """The search-loop advisory block: which techniques to try next, from measured reward.
+
+    CUDA-L2 frames optimisation as a search steered by *measured* speedup; search_loop folds
+    the run's IterationRecords into per-technique reward and ranks the next moves by UCB. This
+    is advisory text, not an order — the student owns the decision (a stale table must never
+    overrule a fresh measurement). Silent until there is at least one evaluated record, so a
+    fresh run's first turn is not told to "try occupancy" before anything was measured."""
+    try:
+        records = load_records(ctx.status_path)
+    except OSError:
+        return ""
+    evaluated = [r for r in records if r.verdict in ("KEEP", "REVERT")]
+    if not evaluated:
+        return ""
+    from forgekernel.loop import search_loop
+    prop = search_loop.propose(records, ctx.gate_window)
+    return "\n\n## Search-loop advisory (measured technique reward)\n" \
+           + search_loop.render_advice(prop) + "\n"
+
+
+def _dual_eval_note(ctx: LoopContext) -> str:
+    """The offline/server divergence warning, when both windows were measured.
+
+    Where the run measured the server window too (a ``server:<qps>`` gate, or a bench that
+    reports it), a kernel that wins offline but loses at the served rate is a deployment
+    regression the offline gate cannot see. Surfaced once per its own reading; silent when only
+    one mode ran (the common case) so it never nags."""
+    try:
+        records = load_records(ctx.status_path)
+    except OSError:
+        return ""
+    from forgekernel import timing_audit
+    note = timing_audit.dual_eval_note(timing_audit.offline_vs_server(records))
+    if not note:
+        return ""
+    return "\n\n## Dual-evaluation reading (offline vs server)\n" + note + "\n"
+
+
 def render_prompt(template_path: Path, bindings: dict[str, str], extra: str = "") -> str:
     text = template_path.read_text(encoding="utf-8")
     for token, value in bindings.items():
@@ -546,6 +587,11 @@ def _student_prompt(ctx: LoopContext, iter_no: int, probe_feedback: str = "") ->
         # current best; read from the evidence file, so a driver restart keeps it.
         extra += note
     if note := _timeline_student_note(ctx):
+        extra += note
+    if note := _search_loop_note(ctx):
+        # Standing: it re-reads the records each turn, so it reflects the latest reward.
+        extra += note
+    if note := _dual_eval_note(ctx):
         extra += note
     if ctx.sass_serial_note:
         # Re-prompted verbatim, un-anchored: the compiler's whole-function verdict
