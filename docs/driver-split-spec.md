@@ -111,8 +111,16 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    was in this module — so the internal call goes through `_call_ncu_profiler` →
    `driver._ncu_profiler` so the patch still takes effect. Any name a test patches on
    `driver` must be reached through `driver`, not a local copy.
-7. **`loop/timeline.py`** ← "timeline probe" (37/70 — 3,028 lines; the biggest single
-   win once its leaves are out).
+7. ✅ **`loop/timeline.py`** — **first slice DONE** (the timeline probe proper).
+   The "timeline probe" section was a misnomer: line 2539–3225 is the real timeline
+   probe (33 names: `_TIMELINE_CMD`, `_run_timeline`, `_bank_timeline`,
+   `_latest_timeline`, `_timeline_tables`/`_timeline_block`, the cuda/tilelang student
+   notes, `_timeline_feedback`, ...), while 3246+ is `run_meta_step` (736 lines) and
+   the whole meta-patch/resume/reopen/gate/recon engine. Only the probe proper moved.
+   It is a clean leaf: 5 driver deps — `BackendError` (load), `LoopContext`
+   (annotation), `_bank_evidence`/`_evidence_dir`/`_read_milestone` (lazy shims, no
+   back-reference). **Deferred:** `run_meta_step` + the meta engine stays in driver
+   (the orchestration core, not a leaf).
 8. **`loop/gap_queue.py`** ← "out-of-run gap queue" (23/89 — 3,629 lines; extract
    last, it sits on top of most of the above).
 9. What remains in `driver.py` after 1–8 is the orchestration core
