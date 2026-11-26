@@ -434,3 +434,106 @@ def dual_eval_note(dual: DualEval) -> str:
             f"gain is {direction} than offline. The offline gate cannot see this; confirm the "
             f"kernel's deployed claim in server mode before citing the offline number.")
 
+
+
+# --- server-mode queue estimation (F4) -------------------------------------------------
+#
+# The server window times a kernel under a *fixed offered request rate* (server_qps), so its
+# reading is service + queueing: a request that waits behind others before it starts. The
+# device window times the same kernel back-to-back with no offered load, so it is close to pure
+# service time. Little's law turns the two into the queueing split: with offered rate lambda =
+# server_qps (req/s) and service time S = device_median_ms/1000 (s per request), the offered
+# utilisation is rho = lambda * S. rho >= 1 means the device cannot keep up at that rate (the
+# queue grows without bound — the server median would drift up over a long run); rho < 1 means
+# the device has headroom and the server median exceeding S is queueing that a faster kernel
+# would *shrink* (higher throughput -> lower rho -> shorter wait). This is why a kernel can win
+# offline but lose in server mode: the offline gate reads S, the served deployment pays S+wait.
+
+
+@dataclass(frozen=True)
+class QueueEstimate:
+    """Little's-law split of a server-mode reading into service vs queueing."""
+
+    service_ms: float | None        # device-window median (no offered load)
+    server_median_ms: float | None  # served latency = service + wait (per request)
+    server_qps: float | None        # the offered rate the server reading was taken at
+    utilization: float | None       # rho = lambda * service (device load fraction)
+    queue_wait_ms: float | None     # server_median - service (>= 0 when both known)
+
+    @property
+    def measured(self) -> bool:
+        return (self.service_ms is not None and self.server_median_ms is not None
+                and self.server_qps is not None)
+
+    @property
+    def saturated(self) -> bool:
+        """Offered load at or above one — the device cannot keep up with the rate."""
+        return self.utilization is not None and self.utilization >= 1.0
+
+    @property
+    def queue_bound(self) -> bool:
+        """The served latency is dominated by queueing (wait exceeds service)."""
+        return (self.queue_wait_ms is not None and self.service_ms is not None
+                and self.service_ms > 0 and self.queue_wait_ms > self.service_ms)
+
+
+def estimate_queue(service_ms, server_median_ms, server_qps) -> QueueEstimate:
+    """Compute the service/queueing split from a device reading and a server reading.
+
+    Any missing input leaves its derived field None (never a fabricated zero — an unmeasured
+    split must not read as "no queue"). ``queue_wait_ms`` is clamped at 0: a server median below
+    the device median is measurement noise across two windows, not a negative wait."""
+    util = None
+    wait = None
+    if service_ms is not None and server_qps is not None:
+        util = server_qps * (service_ms / 1000.0)
+    if service_ms is not None and server_median_ms is not None:
+        wait = max(0.0, server_median_ms - service_ms)
+    return QueueEstimate(service_ms=service_ms, server_median_ms=server_median_ms,
+                         server_qps=server_qps, utilization=util, queue_wait_ms=wait)
+
+
+def queue_estimate_of(records) -> QueueEstimate:
+    """The queue split off a run's best KEPT server-mode record.
+
+    Reads the record that carried the best server KEEP (the deployed claim), and pairs it with
+    that *same record's* device median and offered rate — pairing a service time from one
+    iteration with a served rate from another would divide two unrelated readings."""
+    best = None
+    for r in records:
+        if getattr(r, "vs_ref_server", None) is not None and r.verdict == "KEEP":
+            if best is None or r.vs_ref_server > best.vs_ref_server:
+                best = r
+    if best is None:
+        return QueueEstimate(None, None, None, None, None)
+    return estimate_queue(getattr(best, "device_median_ms", None),
+                          getattr(best, "server_median_ms", None),
+                          getattr(best, "server_qps", None))
+
+
+def queue_note(est: QueueEstimate) -> str:
+    """A reader-facing line about the queue split, or "" when the split is unmeasured.
+
+    Grounds the server number in *why* it reads what it reads: a high served latency with low
+    utilisation is service time (optimise the kernel); a served latency dominated by wait at
+    high utilisation is queueing (the kernel is fast enough — add capacity or batch). Never a
+    stop; it is a second reading the offline gate cannot see."""
+    if not est.measured:
+        return ""
+    qps_tag = f"{est.server_qps:g} req/s"
+    svc = f"{est.service_ms:.4g} ms"
+    srv = f"{est.server_median_ms:.4g} ms"
+    if est.saturated:
+        return (f"QUEUE SATURATED at {qps_tag}: offered load rho={est.utilization:.2f} >= 1 — "
+                f"the device cannot drain this rate; served latency ({srv}) will grow, not "
+                f"steady. Raise throughput (higher rho headroom) or batch the offered load.")
+    wait_pct = (100.0 * est.queue_wait_ms / est.server_median_ms
+                if est.server_median_ms and est.server_median_ms > 0 else 0.0)
+    if est.queue_bound:
+        return (f"queue-bound at {qps_tag}: rho={est.utilization:.2f}, served {srv} is mostly "
+                f"wait ({est.queue_wait_ms:.4g} ms, {wait_pct:.0f}%) over service {svc} — "
+                f"optimising the kernel buys little here; the wait is the lever.")
+    return (f"service-bound at {qps_tag}: rho={est.utilization:.2f}, served {srv} vs service "
+            f"{svc} (wait {est.queue_wait_ms:.4g} ms, {wait_pct:.0f}%) — throughput headroom "
+            f"exists; this kernel's own speed is what the served latency tracks.")
+
