@@ -8,6 +8,8 @@ __pycache__/
 
 # Runs: one directory per run, never repo content.
 .artifacts/
+# The student's scratch notes the loop seeds; a run artifact, never repo content.
+/notes/
 # Operator trees made by hand (`forge init <op> --kernel-file ...`); a run keeps its own.
 /operators/
 # This machine: GPU, ssh host, credentials. Never committed.

@@ -35,12 +35,14 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+from forgekernel import arch as arch_mod
 from forgekernel import judge as judge_mod
 from forgekernel import runs as runs_mod
 from forgekernel import taskcard
@@ -69,7 +71,7 @@ BOARD_TASK_TOML = """# {op} -- one {suite} problem, frozen from the board (`forg
 
 [task]
 language = "{language}"
-arch     = "sm100"
+arch     = "{arch}"
 
 [leaderboard]
 suite = "{suite}"
@@ -101,9 +103,51 @@ def cmd_init(argv) -> int:
         sys.stderr.write(f"[forge] {d} already exists\n")
         return 2
     shutil.copytree(repo_root() / TASKS_DIR / TEMPLATE_TASK, d)
-    _say(f"wrote {d}/: fill in description.md and shapes.json, adjust task.toml, add "
-         f"reference/ if you have one, then `forge new {TASKS_DIR}/{args.op}`")
+    chosen = _apply_detected_arch(d / "task.toml")
+    _say(f"wrote {d}/: fill in description.md and shapes.json, adjust task.toml"
+         + (f" (arch set to {chosen} from this GPU)" if chosen else "")
+         + f", add reference/ if you have one, then `forge new {TASKS_DIR}/{args.op}`")
     return 0
+
+
+def _apply_detected_arch(task_toml) -> str | None:
+    """Rewrite ``[task].arch`` in a freshly-copied task.toml to the GPU on this box.
+
+    The template ships ``arch = "sm100"``. ``forge init <op>`` on a real GPU (an RTX
+    3090 at sm86, say) should not hand back a Blackwell task the machine cannot build:
+    ``arch.detect_arch()`` reads the compute capability and, when it finds a GPU, this
+    rewrites the single ``arch = "..."`` line to it. No GPU (or torch) -> the template
+    value is left untouched and None is returned (the caller just prints the plain
+    message). Only the one ``arch`` key is touched; every comment and other line stays."""
+    token = arch_mod.detect_arch()
+    if not token:
+        return None
+    p = Path(task_toml)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    new_text, n = re.subn(r'(?m)^(\s*arch\s*=\s*)"[^"]*"', rf'\g<1>"{token}"', text)
+    if n:
+        p.write_text(new_text, encoding="utf-8")
+        return token
+    return None
+
+
+def _board_arch(problem: dict) -> str:
+    """The [task].arch a board task should start with.
+
+    A board problem may name its target hardware; otherwise the leaderboard suite
+    (SOL-ExecBench) runs on Blackwell, so ``sm100`` is the honest default. This is only
+    the starting value in the generated task.toml -- the user edits it to their card,
+    and a non-Blackwell card (say an RTX 3090 at ``sm86``) sets it there."""
+    raw = problem.get("arch") or problem.get("kb_arch") or problem.get("hardware")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return arch_mod.parse(raw).token
+        except ValueError:
+            pass
+    return "sm100"
 
 
 def new_board_task(argv) -> int:
@@ -132,8 +176,10 @@ def new_board_task(argv) -> int:
     problem = json.loads((d / taskcard.BOARD_DIR / "card" / taskcard.PROBLEM).read_text())
     language = "cuda" if str(problem.get("kernel_file", "")).endswith(".cu") else "cutedsl"
     ref_line = '\nref   = "leaderboard/ref"' if (d / taskcard.BOARD_DIR / "ref").is_dir() else ""
+    arch = _board_arch(problem)
     (d / "task.toml").write_text(BOARD_TASK_TOML.format(
-        op=op, suite=problem["suite"], language=language, ref_line=ref_line), encoding="utf-8")
+        op=op, suite=problem["suite"], language=language, arch=arch, ref_line=ref_line),
+        encoding="utf-8")
     _say(f"wrote {d}/ ({problem['suite']} {problem['definition']['name']}): adjust task.toml, "
          f"then `forge new {TASKS_DIR}/{op}`")
     return 0
@@ -165,6 +211,10 @@ def describe(task, machine) -> str:
               + (f", {task.budget.reference_hours:g} h to write the reference"
                  if task.mode == MODE_GENERATE else ""),
               f"  GPU: {machine.describe()}"]
+    missing = arch_mod.unsupported(task.arch, ("wgmma", "tma", "cluster", "tcgen05", "tmem"))
+    if missing:
+        lines.append(f"  arch: {task.arch} lacks {', '.join(missing)} (a kernel must not "
+                     f"emit them; use cp.async / mma.sync)")
     lines += [f"  note: {n}" for n in task.notes]
     return "\n".join(lines)
 

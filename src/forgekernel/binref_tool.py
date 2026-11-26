@@ -29,6 +29,13 @@ SO = HERE / "ref_bin" / f"{META['module']}.so"
 BUILD = Path(os.environ.get("BINREF_BUILD_DIR", "/workspace/binref_build")) / META["module"]
 CPP_SUFFIXES = (".cu", ".cpp", ".cc", ".cxx", ".c")
 BLACKWELL_GENCODE = "-gencode=arch=compute_100a,code=sm_100a"
+# A build that names no gencode of its own gets the Blackwell one, because the leaderboard
+# suite runs on B200. A card that is not Blackwell (an RTX 3090 at sm_86, say) sets
+# BINREF_GENCODE to its own -gencode so the sealed reference builds for the right engine;
+# unset keeps the old behaviour.
+def _default_gencode() -> str:
+    override = os.environ.get("BINREF_GENCODE", "").strip()
+    return override or BLACKWELL_GENCODE
 # SOL-ExecBench CompileOptions defaults (core/data/solution.py): a solution that gives
 # compile_options but leaves a key out gets these. -lcuda is what lets driver-API calls
 # (cuTensorMapEncodeTiled for TMA descriptors) resolve; without it the .so fails to import.
@@ -103,7 +110,7 @@ def _build() -> int:
         shutil.copy2(HERE / "src" / rel, dst)
     cuda, cflags, ldflags = compile_flags(META.get("compile_options"))
     if not any("-gencode" in f or "-arch" in f for f in cuda):
-        cuda = [BLACKWELL_GENCODE] + cuda
+        cuda = [_default_gencode()] + cuda
     cutlass, missing = cutlass_dir()
     if missing:  # a source that includes CUTLASS / CuTe fails below on this node: say why up front
         print(f"[binref] WARNING {missing}: a source that includes cutlass/ or cute/ "

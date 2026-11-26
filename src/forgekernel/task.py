@@ -71,6 +71,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from forgekernel import arch as arch_mod
 from forgekernel import provider as provider_mod
 from forgekernel.paths import global_config_dir, repo_root
 
@@ -277,14 +278,22 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
     if language not in LANGUAGES:
         problems.append(f"[task] language must be one of {list(LANGUAGES)}, got {language!r}")
     arch = t.get("arch")
-    if not isinstance(arch, str) or not re.match(r"^sm\d+[a-z]?$", arch or ""):
+    try:
+        arch_tok = arch_mod.parse(arch).token if isinstance(arch, str) else None
+    except ValueError:
+        arch_tok = None
+    if arch_tok is None:
         problems.append(f"[task] arch must name a GPU architecture such as \"sm90\" or "
                         f"\"sm100\", got {arch!r}")
     elif language in LANGUAGES:
-        kb = _kb_dir(kb_root, language, arch)
+        kb = _kb_dir(kb_root, language, arch_tok)
         if not kb.is_dir():
-            problems.append(f"[task] arch = {arch!r}: there is no hardware knowledge base for "
-                            f"{language} on it ({kb} is missing)")
+            known = arch_mod.available_arches(
+                kb_root if kb_root is not None else repo_root(), language)
+            problems.append(
+                f"[task] arch = {arch!r}: there is no hardware knowledge base for "
+                f"{language} on it ({kb} is missing)"
+                + (f"; this tree has {', '.join(known)}" if known else ""))
 
     board = _read_leaderboard(d, cfg, problems) if "leaderboard" in cfg else None
     if board is None:
@@ -319,7 +328,7 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
         if s.groups_to_add:
             notes.append(f"shape {s.name}: {len(s.inputs)} input group(s) given, the teacher "
                          f"adds {s.groups_to_add}")
-    return Task(name=name, dir=d, language=language, arch=arch, description=description,
+    return Task(name=name, dir=d, language=language, arch=arch_tok, description=description,
                 shapes=tuple(shapes), reference=reference, target=target, teacher=teacher,
                 student=student, budget=budget, notes=tuple(notes), leaderboard=board,
                 comparisons=tuple(comparisons))

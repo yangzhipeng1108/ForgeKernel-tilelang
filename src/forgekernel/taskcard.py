@@ -38,7 +38,20 @@ KERNEL_FILE = {"cutedsl": "kernel.py", "cuda": "kernel.cu", "tilelang": "kernel_
 # (loop/lang_mode.py) before its stub exists: the mode reads the right prompts and KB,
 # the student just starts from an empty file instead of a skeleton that teaches the
 # wrong one.
-CUTE_ARCH = {"sm90": "sm_90a", "sm100": "sm_100a", "sm103": "sm_103a", "sm120": "sm_120a"}
+CUTE_ARCH = {"sm80": "sm_80", "sm86": "sm_86", "sm89": "sm_89", "sm90": "sm_90a",
+             "sm100": "sm_100a", "sm103": "sm_103a", "sm120": "sm_120a"}
+
+
+def _cute_arch(arch: str) -> str:
+    """The CuTe DSL ``CUTE_DSL_ARCH`` spelling for a task arch token.
+
+    Arch-specific profiles (Hopper/Blackwell ``sm90a``/``sm100a``) carry the ``a``;
+    Ampere (sm80/sm86/sm89) does **not** -- there is no ``sm_86a``. Unknown tokens keep
+    the old ``<arch>a`` guess so nothing that worked before changes meaning, but the
+    known Ampere/Ada parts map to their true ``sm_XX`` form."""
+    if arch in CUTE_ARCH:
+        return CUTE_ARCH[arch]
+    return arch + "a"
 EVAL_FILES = ("leaderboard.py", "timing.py", "precision.py", "closed_ref.py", "ncu_probe.py")
 NCU_PROBE_MODE = "cmd:ncu --csv --metrics gpu__time_active.sum python3 eval/ncu_probe.py"
 JOB_TIMEOUT_S = 1800
@@ -153,7 +166,7 @@ def write_card(run, task, check, machine) -> Path:
     (op_dir / "eval" / "ncu_run.py").write_text(lbmod.NCU_TEMPLATE.format(**fmt), encoding="utf-8")
     entry = op_dir / "gpu_entry.sh"
     text = lbmod.GPU_ENTRY_TEMPLATE.format(
-        name=task.name, suite=SUITE, arch=CUTE_ARCH.get(task.arch, task.arch + "a"),
+        name=task.name, suite=SUITE, arch=_cute_arch(task.arch),
         clock="", mem_clock="", require_lock="0",
         clock_note="A task runs at the GPU's own clocks unless LB_SM_CLOCK_MHZ / "
                    "LB_MEM_CLOCK_MHZ pin one (that needs permission to lock); the eval JSON "
@@ -285,7 +298,7 @@ def write_submit(tree: Path, task, machine, timeout: int = JOB_TIMEOUT_S) -> Pat
         f'workdir = {json.dumps(machine.remote_workdir)}',
         f'env_file = {json.dumps(machine.remote_env_file)}', f'gpu = "{machine.gpu}"',
         "[env]", 'PYTHONUNBUFFERED = "1"',
-        f'CUTE_DSL_ARCH = "{CUTE_ARCH.get(task.arch, task.arch + "a")}"',
+        f'CUTE_DSL_ARCH = "{_cute_arch(task.arch)}"',
     ]
     p = Path(tree) / "submit.toml"
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")

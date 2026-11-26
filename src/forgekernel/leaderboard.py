@@ -1147,11 +1147,31 @@ SUITE_CLOCK = {
                              "LB_MEM_CLOCK_MHZ) to pin one for steadier readings."),
 }
 
+# The arch a suggested loop.toml's kb_arch starts at, per board hardware. The board
+# suites run on B200 (Blackwell, sm100), so that is the default; a problem that names a
+# different board hardware picks its own entry, and a card that is not the board (an RTX
+# 3090 at sm86) edits kb_arch after `forge init` like every other suggested value.
+_KB_ARCH_NOTE = {"sm100": "B200", "sm90": "H100", "sm120": "RTX 5090", "sm86": "RTX 3090"}
+_BOARD_HARDWARE_TO_ARCH = {"B200": "sm100", "H100": "sm90", "H200": "sm90"}
+
+
+def _problem_kb_arch(problem: Problem) -> str:
+    """The ``kb_arch`` a board card's suggested loop.toml starts with (B200 by default)."""
+    hw = getattr(problem, "hardware", None)
+    if not isinstance(hw, str):
+        board = getattr(problem, "board", None)
+        if isinstance(board, dict):
+            hw = board.get("hardware")
+    if isinstance(hw, str) and hw in _BOARD_HARDWARE_TO_ARCH:
+        return _BOARD_HARDWARE_TO_ARCH[hw]
+    return "sm100"
+
 
 def render_gpu_entry(problem: Problem) -> str:
     clock, mem_clock, require_lock, clock_note = SUITE_CLOCK[problem.suite]
+    arch = _problem_kb_arch(problem)
     return GPU_ENTRY_TEMPLATE.format(
-        name=problem.name, suite=problem.suite, arch="sm_100a", clock=clock,
+        name=problem.name, suite=problem.suite, arch=arch.replace("sm", "sm_", 1), clock=clock,
         mem_clock=mem_clock, require_lock=require_lock, clock_note=clock_note)
 
 
@@ -1208,9 +1228,10 @@ def render_loop_toml_example(problem: Problem, op: str, kernel_file: str = "kern
                      f"({', '.join(g['name'] for g in problem.group)}; geomean)")
     head = "# Suggested loop.toml for this leaderboard card — copy to loop.toml and review.\n"
     language = kernel_language(kernel_file)
+    kb_arch = _problem_kb_arch(problem)
     common = f"""[loop]
 language    = "{language}"{' ' * (17 - len(language))}# what the student writes the kernel in
-kb_arch     = "sm100"            # B200
+kb_arch     = "{kb_arch}"{' ' * max(0, 17 - len(kb_arch))}# {_KB_ARCH_NOTE.get(kb_arch, 'target GPU')}
 gate_window = "device"           # = the leaderboard reading (per-call span, cold L2)
 """
     if ref.get("kind") in SEALED_KINDS:
