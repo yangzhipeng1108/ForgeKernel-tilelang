@@ -592,11 +592,15 @@ def render_kernel_stub(task, check) -> str:
         # `def run(...): raise NotImplementedError` for a TileLang file is taught to write
         # CuTe DSL in a file the mode reads as TileLang -- the exact silent mismatch
         # lang_mode exists to prevent.
-        raise ValueError(
-            f"no kernel stub for language {task.language!r} yet (have: "
-            f"{', '.join(sorted(STUB_RENDERER))}). Add its renderer to taskcard.STUB_RENDERER "
-            f"and leaderboard.STUB_RENDERER, or write "
-            f"{KERNEL_FILE.get(task.language, 'the kernel file')} by hand.")
+        from forgekernel.loop import lang_mode
+        key = lang_mode.mode_of(task.language)
+        renderer = STUB_RENDERER.get(key)
+        if renderer is None:
+            raise ValueError(
+                f"no kernel stub for language {task.language!r} yet (have: "
+                f"{', '.join(sorted(STUB_RENDERER))}). Add its renderer to taskcard.STUB_RENDERER "
+                f"and leaderboard.STUB_RENDERER, or write "
+                f"{KERNEL_FILE.get(key, KERNEL_FILE.get(task.language, 'the kernel file'))} by hand.")
     return renderer(task, check)
 
 

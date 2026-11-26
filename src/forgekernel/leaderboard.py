@@ -1465,7 +1465,9 @@ def write_card(op_dir: Path, problem: Problem, template_eval: Path, *,
     ``kernel_language``, the same rule the loop uses, so the stub written here and the
     ``loop.toml.example`` beside it can never disagree."""
     language = kernel_language_or_none(kernel_file)
-    if language is None or language not in STUB_RENDERER:
+    from forgekernel.loop import lang_mode
+    renderer_key = lang_mode.mode_of(language) if language is not None else None
+    if renderer_key is None or renderer_key not in STUB_RENDERER:
         raise ValueError(
             f"no leaderboard card stub for {kernel_file!r} (language {language!r}): "
             f"have {', '.join(sorted(STUB_RENDERER))}. Add its renderer to "
@@ -1508,7 +1510,7 @@ def write_card(op_dir: Path, problem: Problem, template_eval: Path, *,
     put("eval/ncu_run.py", NCU_TEMPLATE.format(**fmt))
     put("gpu_entry.sh", render_gpu_entry(problem))
     (op_dir / "gpu_entry.sh").chmod(0o755)
-    put(kernel_file, STUB_RENDERER[language](problem, dps=dps))
+    put(kernel_file, STUB_RENDERER[renderer_key](problem, dps=dps))
     put("window.toml", render_window_toml(problem))
     put("loop.toml.example", render_loop_toml_example(problem, op_dir.name, kernel_file))
     readme = op_dir / "README.md"
