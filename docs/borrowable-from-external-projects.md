@@ -183,24 +183,24 @@ CUDA-L2 是 LLM + **强化学习**优化 HGEMM 的系统。要借鉴的是它的
 
 ## 4. 跨项目合并后的落地优先级总表
 
-| 优先级 | 借鉴项 | 来源 | 成本 | 前置 | 推荐 |
-|---|---|---|---|---|---|
-| **P0** | F1 停顿时清单三桶归类 + 占比 | ForeSight | 低 | 无 GPU，纯改 `stall_tools.py` | ✅ |
-| **P0** | F2 二分作选杠杆分类器（诊断模板） | ForeSight | 低 | 无 GPU，改 prompt | ✅ |
-| **P0** | F3 桶内周期 = 理论上限，标注杠杆差距 | ForeSight | 低 | 无 GPU | ✅ |
-| **P1** | A1 RL/进化式候选群体搜索环（reward=实测加速） | CUDA-L2 | 中高 | 需 GPU | ✅（补广度轴） |
-| **P1** | A2 offline/server 双评测口径 | CUDA-L2 | 中 | 需 GPU | ✅ |
-| **P1** | A5 sm86/3090 HGEMM 入 hw_kb + 当基线 | CUDA-L2 | 低 | kernel 现成 | ✅ |
-| **P2** | A3 MNK 配置矩阵 → tasks/ | CUDA-L2 | 低 | — | ✅ |
-| **P2** | A4 acc_precise 精度开关 + 分报 | CUDA-L2 | 低 | — | ✅ |
-| **P2** | A6 多基线对比（cuBLAS/cuBLASLt/Triton/torch） | CUDA-L2 | 中 | — | ✅ |
-| **P2** | A7 每 run 存 candidates/ 池 + 每候选指标 | CUDA-L2 | 低 | — | ✅ |
-| **P2** | 链接器产出沉淀为 KB recipe | PipeLink | 中 | — | ⬜ |
-| **P2** | 跨 GPU 通信声明级建模（静态校验） | PipeLink | 中 | 仅静态可做，运行需 GPU | ⬜ |
-| **P3** | PipeLink `.plink` 包 / CUDA graph / persistent | PipeLink | 中 | 需 GPU / 方向非必需 | 观望 |
-| **P3** | F4 粗排队估计反推压力 | ForeSight | 中 | 需 GPU | 观望 |
-| **✗** | F5 逐单元计数器 / F6 外推 / F7 CTA 重放 | ForeSight | 高 | 需 GPU + 定位不符 | 不做 |
-| **✗** | PipeLink 多前端交叉链接 / CUDA-L2 纯 GEMM 写死 / 照搬 CUTLASS 依赖 | 三者 | — | — | 不做 |
+| 优先级 | 借鉴项 | 来源 | 成本 | 前置 | 推荐 | 落地状态 |
+|---|---|---|---|---|---|---|
+| **P0** | F1 停顿时清单三桶归类 + 占比 | ForeSight | 低 | 无 GPU，纯改 `stall_tools.py` | ✅ | ✅ 已完成（`stall_tools.py` + 单测） |
+| **P0** | F2 二分作选杠杆分类器（诊断模板） | ForeSight | 低 | 无 GPU，改 prompt | ✅ | ✅ 已完成（`diagnose_prompt.md` + drift-guard） |
+| **P0** | F3 桶内周期 = 理论上限，标注杠杆差距 | ForeSight | 低 | 无 GPU | ✅ | ✅ 已完成 | 
+| **P1** | A1 RL/进化式候选群体搜索环（reward=实测加速） | CUDA-L2 | 中高 | 需 GPU | ✅（补广度轴） | ✅ 已完成（`search_loop.evolve` + 14 单测，fake backend） |
+| **P1** | A2 offline/server 双评测口径 | CUDA-L2 | 中 | 需 GPU | ✅ | ✅ 已完成（`timing_audit` + `server_bench`，3090 真跑烟测通过） |
+| **P1** | A5 sm86/3090 HGEMM 入 hw_kb + 当基线 | CUDA-L2 | 低 | kernel 现成 | ✅ | ✅ 机制完成；基线已 3090 实测（69.6 TF=98% 峰值 @8192³，PROBE PASS 计时），仍标 PARTIAL 待 NCU 计数器 |
+| **P2** | A3 MNK 配置矩阵 → tasks/ | CUDA-L2 | 低 | — | ✅ | ✅ 已完成（`tasks/gemm-mnk/` 6 config） |
+| **P2** | A4 acc_precise 精度开关 + 分报 | CUDA-L2 | 低 | — | ✅ | ✅ 已完成（`task.acc_precise` + 单测） |
+| **P2** | A6 多基线对比（cuBLAS/cuBLASLt/Triton/torch） | CUDA-L2 | 中 | — | ✅ | ✅ 已完成（`launch.save_comparison_baseline`/`render_comparison_table` + 单测） |
+| **P2** | A7 每 run 存 candidates/ 池 + 每候选指标 | CUDA-L2 | 低 | — | ✅ | ✅ 已完成（`goal_ref` `candidates/NNN`） |
+| **P2** | 链接器产出沉淀为 KB recipe | PipeLink | 中 | — | ⬜ | ✅ 已完成（`link.render_kb_recipe`/`render_kb_recipe_for` + 单测） |
+| **P2** | 跨 GPU 通信声明级建模（静态校验） | PipeLink | 中 | 仅静态可做，运行需 GPU | ⬜ | ✅ 已完成（`link.L-XGPU`/`cross_gpu` + `component.TRANSPORTS` + 单测） |
+| **P3** | PipeLink `.plink` 包 / CUDA graph / persistent | PipeLink | 中 | 需 GPU / 方向非必需 | 观望 | 观望（非必需） |
+| **P3** | F4 粗排队估计反推压力 | ForeSight | 中 | 需 GPU | 观望 | ✅ 已完成（`timing_audit.estimate_queue` Little 定律 + 单测） |
+| **✗** | F5 逐单元计数器 / F6 外推 / F7 CTA 重放 | ForeSight | 高 | 需 GPU + 定位不符 | 不做 | 不做 |
+| **✗** | PipeLink 多前端交叉链接 / CUDA-L2 纯 GEMM 写死 / 照搬 CUTLASS 依赖 | 三者 | — | — | 不做 | 不做 |
 
 ---
 

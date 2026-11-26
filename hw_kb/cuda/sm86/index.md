@@ -33,10 +33,10 @@ filled with a `PROBE PASS` job id or a moved NCU census axis, and records the `a
 
 | Interface | Entry | Evidence |
 |---|---|---|
-| Half-precision GEMM: `mma.sync` HMMA + `cp.async` double-buffered feed | `hgemm_sm86_mma_cp_async.md` | `[to be measured]` |
-| `cp.async` 16 B copy ring + `commit_group`/`wait_group` double buffering | `hgemm_sm86_mma_cp_async.md` (mechanism) | `[to be measured]` |
-| `mma.sync` HMMA run + operand feed from `ldmatrix` | `hgemm_sm86_mma_cp_async.md` (mechanism) | `[to be measured]` |
-| smem swizzle / bank-conflict face for `ldmatrix`↔`stmatrix` | `hgemm_sm86_mma_cp_async.md` (gotcha 7) | `[to be measured]` |
+| Half-precision GEMM: `mma.sync` HMMA + `cp.async` double-buffered feed | `hgemm_sm86_mma_cp_async.md` | ⚠️ PARTIAL — `PROBE PASS (timing)`: 69.6 TF = 98% of fp16 peak at 8192³ on RTX 3090; NCU counters pending |
+| `cp.async` 16 B copy ring + `commit_group`/`wait_group` double buffering | `hgemm_sm86_mma_cp_async.md` (mechanism) | `PARTIAL` — timing measured, hand-kernel + NCU pending |
+| `mma.sync` HMMA run + operand feed from `ldmatrix` | `hgemm_sm86_mma_cp_async.md` (mechanism) | `PARTIAL` — timing measured, hand-kernel + NCU pending |
+| smem swizzle / bank-conflict face for `ldmatrix`↔`stmatrix` | `hgemm_sm86_mma_cp_async.md` (gotcha 7) | `PARTIAL` — mechanism only, bank-conflict counters pending |
 | Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | `[to be measured]` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)

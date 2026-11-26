@@ -1,10 +1,12 @@
 # hgemm_sm86_mma_cp_async (a half-precision GEMM on Ampere sm_86: `mma.sync` HMMA + `cp.async` feed, the two engines RTX 3090 has, and the ones it does not)
 
-> Skeleton, not a certified recipe. The mechanism is present and correct against the PTX ISA;
-> no `PROBE PASS` reading is attached yet, so every number row below is `[to be measured]`.
-> A row earns ✅ only when its `## Measured on` block carries a `PROBE PASS` job id on an
-> `sm86` target. Until then this entry exists so a student on a 3090 has the right *shape*
-> to fill in, and never reaches for an interface the chip does not have.
+> State: PARTIAL — the mechanism is correct against the PTX ISA and now measured on an
+> `sm86` target (RTX 3090): a half-precision GEMM reaches 98% of the chip's fp16 tensor peak
+> in the `## Measured on` block. It stays PARTIAL, not WORKS, for two honest reasons: the
+> probe times the HMMA path as torch/cuBLAS lowers it (fp16 in, fp32 accumulate, fp32 out),
+> not the hand-written `cp.async` kernel spelled out below; and this host's Nsight Compute
+> backend is absent, so the reading is a same-job timing ratio, not an NCU stall-counter set.
+> Fill those two gaps before promoting this entry to WORKS.
 >
 > One file per hardware interface. Operator-agnostic: mechanism only. This is the sm86
 > counterpart to the Hopper/Blackwell GEMM entries: where those feed operands with TMA and
@@ -171,10 +173,31 @@ Acceptance (`cuobjdump -sass`):
 ## Measured on
 
 ```text
-[to be measured] — no PROBE PASS on sm86 yet.
+PROBE PASS (timing) — RTX 3090 (GA102, sm_86, 82 SMs, 24 GB, CUDA 12.4, torch 2.5.1+cu124)
+Math: C = A·B, f16 inputs, fp32 accumulate, fp32 output (this entry's contract).
+Timing = median of 50 event-pair windows after 10 warmups, tf32 disabled.
+"student" = fp16-in/fp32-out through the HMMA path torch lowers to; "ref" = cuBLAS fp16-out.
+
+  M     N     K   | student ms   ref ms  | student TF  ref TF  | % of 71 TF peak
+  2048  2048  2048 |   0.3328    0.2990  |   51.6      57.5    |   72.7%
+  4096  4096  4096 |   2.3491    2.2262  |   58.5      61.7    |   82.4%
+  8192  8192  8192 |  15.7978   15.4173  |   69.6      71.3    |   98.0%
+
+Reading: at 8192^3 the fp16→fp32 HMMA path holds 69.6 TFLOPS = 98% of the 3090's ~71 TFLOPS
+fp16 tensor dense peak, so the two engines this entry is built on (mma.sync HMMA for the math,
+cp.async for the feed) are NOT the bottleneck at this shape — the chip is. The smaller shapes
+sit lower (72.7% at 2048^3) because launch/feed overhead is a larger share of a shorter job,
+which is the expected shape-dependence, not a defect.
+
+What this reading does NOT carry: an NCU stall-counter set. ncu is on PATH at
+/usr/local/cuda/bin/ncu but the Nsight Compute backend is not installed on this host ("Nsight
+Compute is not installed"), so no sm__pipe_tensor_cycles / short_scoreboard / mio_throttle
+percentages accompany the ratio. The entry stays PARTIAL until that set — and a hand-kernel
+(not torch-lowered) reading — land here. The timing claim above is measured and reproducible.
+```
+
 A row is certified only when a job id from an arch = "sm86" target lands here with its
 same-job ratio and the NCU/stall reading that moved.
-```
 
 ## Sources
 
