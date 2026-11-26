@@ -78,8 +78,21 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    thin lazy shims (imported at call time) to keep the graph acyclic; `BackendError`
    is imported at module load (driver defines it before it imports pricing). Also needs
    `JOB_END_KILLED`/`job_abend` (loop.parse) and `meta_shapes`.
-5. **`loop/reopen.py`** ← "reopen budget" + "phase exhaustion" (6/17 and 17/21; phase
-   exhaustion depends on reopen, extract together).
+5. ◑ **`loop/reopen.py`** — **first slice DONE** (reopen-budget core). The
+   self-contained reopen-budget part moved: the patch-class enums,
+   `_fruitless_reopen_streak`, `_reopen_capped_block`, `_INFEASIBLE_MENTION_BLOCK`,
+   `_CAUSE_ENUM`/`_CAUSE_ENUM_AUDIT`/`_INFEASIBLE_MENTION`, `_parse_cause_class`, and
+   `_teacher_prompt` (10 names). Only driver dep is `LoopContext` (annotation); the
+   rest come from prompt (`render_prompt`/`_meta_prompt`/`_bindings`) — a true leaf.
+   **Deferred:** the certify/harvest/axis-battle cluster (`run_kb_certify`,
+   `run_kb_harvest`, `kb_axis_debt`, `AxisBattle`, ...) and the whole "phase
+   exhaustion" section (`_phase_exhaustion`, `_run_lever_pricing` [245 lines],
+   `_lever_price_block`, `_persist_lever_table`, ...). Those are NOT leaves: they pull
+   16 driver helpers plus three constants defined *after* the reopen import point
+   (`_DECISION_ID`@4885, `_LEVER_DESIGN_BLOCK`@4004/4108, `TRUNCATION_STORM_BUDGET`@6555),
+   and `phase_exhaustion` is exactly where the pricing.py lazy shims point back. Moving
+   them needs those constants relocated first and is a separate, bigger change — not
+   worth the risk now.
 6. ✅ **`loop/comparisons.py`** ← "machine-aware comparisons" (53 defs/consts). DONE.
    Only 9 driver helpers needed (`BackendError` [load, like pricing], `LoopContext`
    [annotation], `_ablation_block`, `_best_good_ref`, `_lever_spec_refused`,
