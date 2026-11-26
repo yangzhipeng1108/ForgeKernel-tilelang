@@ -1,5 +1,7 @@
 """Tests for forge loop CLI oracle resolution + bounded GPU poll."""
 
+import sys
+
 import pytest
 
 from forgekernel.baseline import RefBaseline
@@ -1211,8 +1213,10 @@ def test_a_long_turn_prints_a_heartbeat(monkeypatch, tmp_path, capsys):
     b.workspace = tmp_path      # the turn really runs; it needs a real cwd
     b.agent_cmd = "fake-agent"
     b.agent_heartbeat_s = 0.05
-    # A command that outlives several heartbeats, then answers.
-    out = b._agent_turn("sleep 0.35; echo done", "prompt", "teacher")
+    # A command that outlives several heartbeats, then answers. Portable across
+    # shells (Windows has no `sleep`; use the same interpreter to pause and print).
+    cmd = f'"{sys.executable}" -c "import time; time.sleep(0.35); print(\'done\')"'
+    out = b._agent_turn(cmd, "prompt", "teacher")
     assert out[0] == 0 and out[1].strip() == "done"
     beats = [ln for ln in capsys.readouterr().out.splitlines()
              if "agent turn (teacher) in progress" in ln]
@@ -1224,7 +1228,8 @@ def test_the_heartbeat_can_be_switched_off(monkeypatch, tmp_path, capsys):
     b.workspace = tmp_path
     b.agent_cmd = "fake-agent"
     b.agent_heartbeat_s = 0
-    assert b._agent_turn("echo done", "prompt", "student")[1].strip() == "done"
+    cmd = f'"{sys.executable}" -c "print(\'done\')"'
+    assert b._agent_turn(cmd, "prompt", "student")[1].strip() == "done"
     assert "in progress" not in capsys.readouterr().out
 
 

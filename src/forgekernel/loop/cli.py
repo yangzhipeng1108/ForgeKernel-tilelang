@@ -350,7 +350,8 @@ class RealBackend:
         """
         proc = subprocess.Popen(
             cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, cwd=self.workspace,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            cwd=self.workspace,
         )
         box: dict = {}
 

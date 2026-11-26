@@ -2590,8 +2590,11 @@ def test_recon_completion_marker_is_distrusted_when_artifacts_change(tmp_path):
     _save_recon_state(ctx, rounds=12)
 
     marker = tmp_path / "recon_complete.json"
-    state = marker.read_text().replace(str(report), str(tmp_path / "other.md"))
-    marker.write_text(state)  # a foreign tree's marker
+    # A foreign tree's marker: rewrite the stored path through JSON (a raw str.replace is a
+    # no-op on Windows, where the stored path is JSON-escaped with doubled backslashes).
+    state = json.loads(marker.read_text())
+    state["report"] = str(tmp_path / "other.md")
+    marker.write_text(json.dumps(state, indent=2))  # a foreign tree's marker
     assert _load_recon_state(ctx) is None
 
     marker.write_text("{not json")

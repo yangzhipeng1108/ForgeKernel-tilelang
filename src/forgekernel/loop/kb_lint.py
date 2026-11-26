@@ -330,7 +330,9 @@ def lint_text(text: str, path: str = "",
 
 def lint_file(file: Path, rel_to: Path | None = None,
               extra_tokens: list[str] | None = None) -> list[str]:
-    label = str(file.relative_to(rel_to)) if rel_to else str(file)
+    # as_posix(): findings are paths a reader (and a prompt) sees; a backslash separator on
+    # Windows would render inconsistently with Linux and break path substrings in prompts.
+    label = file.relative_to(rel_to).as_posix() if rel_to else file.as_posix()
     try:
         text = file.read_text(encoding="utf-8")
     except OSError as e:
@@ -355,7 +357,7 @@ def lint_kb_dir(kb_dir: Path,
         if file.name == "index.md":
             findings.extend(kb_state.lint_index_states(
                 file.read_text(encoding="utf-8"),
-                str(file.relative_to(kb_dir.parent)),
+                file.relative_to(kb_dir.parent).as_posix(),
                 root=file.parent,
             ))
     return findings
