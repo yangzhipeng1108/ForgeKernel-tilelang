@@ -17,10 +17,15 @@ Ledger contract (the machine gate downstream drivers grep for):
   * the tables sit between `=== STALL LEDGER BEGIN ===` / `=== STALL LEDGER END ===`
     marker lines so a driver can lift them into a prompt verbatim;
   * exactly one machine verdict line ends the run:
-        STALL-OK kernel=<name> samples=<N> rows=<R> coverage=<pct>
+        STALL-OK kernel=<name> samples=<N> rows=<R> coverage=<pct> \
+                 fixed=<pct> queued=<pct> other=<pct> dominant=<bucket>
         STALL-FAIL reason=<enum> ...
     printed only by this tool after its self-checks (samples floor, duration
     floor against mis-aim, coverage floor). Prose cannot open the gate.
+
+  * the ledger also splits every true-stall sample into fixed-latency vs queued
+    (ForeSight two-class split) and names the dominant bucket + its lever axis,
+    so "which stall dominates" reads as "dependency problem vs resource pressure".
 
 Collection recipe (proven on the job image):
     export CUTE_DSL_LINEINFO=1          # student side: per-line mapping
@@ -101,6 +106,87 @@ STALL_METRICS = [
     "smsp__pcsamp_warps_issue_stalled_misc",
     "smsp__pcsamp_warps_issue_stalled_membar",
 ]
+
+# --- fixed-latency vs queued-stall split (ForeSight) --------------------------
+# ForeSight (arXiv 2611.04989-style) splits a warp's issue-interval stalls into two
+# classes that behave differently across pressure: FIXED-LATENCY stalls (waiting for a
+# result / a fixed instruction / a sync event) stay ~constant, while QUEUED stalls
+# (waiting in a busy hardware unit's queue) grow with that unit's pressure. The ledger
+# already carries a per-instruction stall breakdown; grouping those metrics into these
+# three buckets turns "which stall dominates" into "is this a dependency problem (fixed)
+# or a shared-resource-pressure problem (queued)", which is exactly the axis a lever
+# choice needs: attack fixed -> shorten deps / deepen the pipeline / prefetch; attack
+# queued -> raise occupancy / retile / de-conflict banks / relieve L2. See
+# docs/borrowable-from-external-projects.md (ForeSight, F1/F2/F3).
+_FIXED_LATENCY_STALLS = frozenset({
+    "smsp__pcsamp_warps_issue_stalled_long_scoreboard",
+    "smsp__pcsamp_warps_issue_stalled_short_scoreboard",
+    "smsp__pcsamp_warps_issue_stalled_wait",
+    "smsp__pcsamp_warps_issue_stalled_barrier",
+    "smsp__pcsamp_warps_issue_stalled_membar",
+})
+_QUEUED_STALLS = frozenset({
+    "smsp__pcsamp_warps_issue_stalled_math_pipe_throttle",
+    "smsp__pcsamp_warps_issue_stalled_mio_throttle",
+    "smsp__pcsamp_warps_issue_stalled_lg_throttle",
+    "smsp__pcsamp_warps_issue_stalled_tex_throttle",
+    "smsp__pcsamp_warps_issue_stalled_dispatch_stall",
+})
+
+
+def stall_bucket(metric_full: str) -> str:
+    """fixed / queued / other for one stall-metric name (ForeSight two-class split)."""
+    if metric_full in _FIXED_LATENCY_STALLS:
+        return "fixed"
+    if metric_full in _QUEUED_STALLS:
+        return "queued"
+    return "other"
+
+
+def bucket_totals(per_pc: dict) -> dict:
+    """Sum true-stall samples into {fixed, queued, other} across all PCs."""
+    tot = {"fixed": 0, "queued": 0, "other": 0}
+    for stalls in per_pc.values():
+        for metric, v in stalls.items():
+            tot[stall_bucket(metric)] += v
+    return tot
+
+
+def bucket_line(totals: dict) -> str:
+    """`fixed=38% queued=51% other=11%` — shares of true-stall samples, rounded."""
+    n = totals["fixed"] + totals["queued"] + totals["other"]
+    if n <= 0:
+        return "fixed=? queued=? other=? (no true-stall samples)"
+    return (f"fixed={100 * totals['fixed'] / n:.0f}% "
+            f"queued={100 * totals['queued'] / n:.0f}% "
+            f"other={100 * totals['other'] / n:.0f}%")
+
+
+# The lever-direction rule keyed by the dominant bucket (ForeSight F2): what a high
+# share in each bucket says the next lever should attack. Consumed by the teacher
+# diagnosis prompt; kept here so the rule lives next to the metric→bucket mapping.
+BUCKET_DIRECTIONS = {
+    "fixed": ("dependency / latency-bound: shorten the dependency chain, deepen the "
+              "software pipeline, prefetch the operand, or widen the ring (fixed-latency "
+              "stalls do not shrink with occupancy)"),
+    "queued": ("shared-resource pressure: raise occupancy (more warps to hide queue "
+               "wait), retile to relieve the saturated unit, de-conflict shared/L1 bank "
+               "access, or cut the request rate / L2 pressure"),
+    "other": ("neither pure dependency nor unit pressure (scheduler/branch/drain): "
+              "inspect the dominant opcode rows before choosing a lever"),
+}
+
+
+def dominant_bucket(totals: dict) -> str:
+    """The bucket with the most true-stall samples (ties -> fixed > queued > other)."""
+    return max(("fixed", "queued", "other"), key=lambda b: totals[b])
+
+
+def bucket_direction(totals: dict) -> str:
+    """The lever-direction advice for the dominant bucket (ForeSight F2/F3)."""
+    dom = dominant_bucket(totals)
+    return f"{dom}: {BUCKET_DIRECTIONS[dom]} (upper bound ~{totals[dom]} stall samples)"
+
 
 MIN_SAMPLES = 500          # below this the sampler was effectively off / mis-aimed
 MIN_DURATION_NS = 20_000   # a "dominant" kernel shorter than this is a mis-aim -- unless
@@ -425,6 +511,10 @@ def build_ledger(per_pc: dict, pc2sass: dict, loc_of, out=print):
         top = ", ".join(f"{short_stall(k)}={100 * v / tot:.0f}%" for k, v in
                         sorted(stalls.items(), key=lambda x: -x[1])[:3])
         out(f"{tot:8d} {100 * tot / total:5.2f}%  {op:22s} | {top}")
+
+    bt = bucket_totals(per_pc)
+    out(f"\n--- fixed-latency vs queued split (ForeSight) ---\n"
+        f"{bucket_line(bt)}  -> {bucket_direction(bt)}")
     return total, rows, coverage
 
 
@@ -495,8 +585,9 @@ def price_report(report_path, ir=None, kernel_substr: str = "",
         out(f"STALL-FAIL reason=coverage ({coverage:.1f}% < {COVERAGE_FLOOR:.0f}% "
             f"— the ledger does not sum; distribution too flat for {MAX_ROWS} rows)")
         return False
+    bt = bucket_totals(per_pc)
     out(f"STALL-OK kernel={_sanitize(action.name())} samples={total} rows={rows} "
-        f"coverage={coverage:.1f}")
+        f"coverage={coverage:.1f} {bucket_line(bt)} dominant={dominant_bucket(bt)}")
     return True
 
 

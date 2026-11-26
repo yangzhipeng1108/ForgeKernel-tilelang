@@ -69,3 +69,55 @@ def test_price_report_fails_closed_without_the_ncu_report_module(monkeypatch, tm
     assert ok is False
     assert any(line.startswith("STALL-FAIL") for line in out)
     assert not any(_STALL_OK.search(line) for line in out)
+
+
+def test_stall_bucket_classifies_every_catalogued_metric():
+    for m in stall_tools.STALL_METRICS:
+        assert stall_tools.stall_bucket(m) in ("fixed", "queued", "other")
+    short = "smsp__pcsamp_warps_issue_stalled_"
+    assert stall_tools.stall_bucket(short + "long_scoreboard") == "fixed"
+    assert stall_tools.stall_bucket(short + "wait") == "fixed"
+    assert stall_tools.stall_bucket(short + "barrier") == "fixed"
+    assert stall_tools.stall_bucket(short + "math_pipe_throttle") == "queued"
+    assert stall_tools.stall_bucket(short + "mio_throttle") == "queued"
+    assert stall_tools.stall_bucket(short + "lg_throttle") == "queued"
+    assert stall_tools.stall_bucket(short + "not_selected") == "other"
+
+
+def test_bucket_totals_and_line_bucket_every_sample_exactly_once():
+    LS = "smsp__pcsamp_warps_issue_stalled_long_scoreboard"
+    MIO = "smsp__pcsamp_warps_issue_stalled_mio_throttle"
+    NS = "smsp__pcsamp_warps_issue_stalled_not_selected"
+    per_pc = {0x10: {LS: 60, MIO: 30, NS: 10}, 0x20: {LS: 40}}
+    bt = stall_tools.bucket_totals(per_pc)
+    assert bt == {"fixed": 100, "queued": 30, "other": 10}
+    # the split is a partition: every sample lands in exactly one bucket
+    assert sum(bt.values()) == 140
+    line = stall_tools.bucket_line(bt)
+    assert "fixed=71%" in line and "queued=21%" in line and "other=7%" in line
+
+
+def test_dominant_bucket_and_direction_pick_the_lever_axis():
+    bt = {"fixed": 10, "queued": 90, "other": 0}
+    assert stall_tools.dominant_bucket(bt) == "queued"
+    d = stall_tools.bucket_direction(bt)
+    assert d.startswith("queued:") and "occupancy" in d
+    assert "upper bound ~90" in d
+    # an all-fixed kernel is told to attack dependencies, not occupancy
+    d_fixed = stall_tools.bucket_direction({"fixed": 5, "queued": 1, "other": 0})
+    assert d_fixed.startswith("fixed:") and "dependency" in d_fixed
+
+
+def test_build_ledger_emits_the_fixed_queued_split_section():
+    per_pc = _per_pc({0x100: 1000})
+    out = []
+    stall_tools.build_ledger(per_pc, {}, lambda pc: "", out=out.append)
+    text = "\n".join(out)
+    assert "fixed-latency vs queued split" in text
+    assert "fixed=" in text and "queued=" in text and "->" in text
+
+
+def test_bucket_line_is_safe_on_empty_samples():
+    line = stall_tools.bucket_line({"fixed": 0, "queued": 0, "other": 0})
+    assert "no true-stall samples" in line
+
