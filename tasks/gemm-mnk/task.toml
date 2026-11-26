@@ -1,0 +1,19 @@
+# What to optimize. Everything here is the problem; nothing on the command line changes it.
+# A key left out takes its value from global_config/ (models.toml: [agent]; loop.toml:
+# [target], [budget]); write only what changes.
+
+[task]
+language    = "cuda"                 # cutedsl | cuda | tilelang
+arch        = "sm86"                 # RTX 3090 / GA10x
+acc_precise = "fp32"                 # fp32 accumulate (CUDA-L2's F32F16F16F32): the GPU's
+                                     # default and what the reference below also uses. Changing
+                                     # it (fp16/tf32) changes numerics AND speed, so it is pinned.
+
+# The reference: the implementation to learn from and to beat.
+[reference]
+run    = "reference/run.py:run"      # the callable timed beside the kernel; same signature
+source = "reference"                 # the agent may read this (source mode)
+
+[target]
+ratio  = 1.05                        # x the reference's speed on the same GPU
+timing = "device"

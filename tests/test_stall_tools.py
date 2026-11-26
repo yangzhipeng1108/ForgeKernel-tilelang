@@ -121,3 +121,20 @@ def test_bucket_line_is_safe_on_empty_samples():
     line = stall_tools.bucket_line({"fixed": 0, "queued": 0, "other": 0})
     assert "no true-stall samples" in line
 
+def test_diagnose_prompt_carries_the_bucket_to_lever_rule_table():
+    """F2: the teacher's diagnosis template must teach the fixed/queued -> lever mapping,
+    and its lever vocabulary must match BUCKET_DIRECTIONS (so the two cannot drift)."""
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[1]
+    text = (repo / "meta" / "diagnose_prompt.md").read_text(encoding="utf-8")
+    # the rule table is present and names the three buckets and the "upper bound" caveat
+    assert "fixed-latency vs queued split" in text
+    assert "dominant bucket" in text and "lever axis" in text
+    assert "upper bound" in text
+    # each bucket direction's core lever words appear in the template (drift guard)
+    low = text.lower()
+    for bucket, direction in stall_tools.BUCKET_DIRECTIONS.items():
+        # take a distinctive word from the code's direction for each bucket
+        marker = {"fixed": "dependency", "queued": "occupancy", "other": "opcode"}[bucket]
+        assert marker in direction.lower(), f"code direction for {bucket} lost its marker"
+        assert marker in low, f"diagnose template no longer teaches the {bucket} lever axis"

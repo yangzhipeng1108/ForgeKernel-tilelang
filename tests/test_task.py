@@ -226,3 +226,21 @@ def test_bad_deny_urls_and_modules_are_refused(tmp_path, line, msg):
     toml = WITH_REF + line + "\n"
     with pytest.raises(TaskError, match=msg):
         load_task(_task(tmp_path, toml, files=REF_FILES), kb_root=_kb(tmp_path))
+
+def test_acc_precise_is_optional_and_stored_when_valid(tmp_path):
+    kb = _kb(tmp_path)
+    # omitted -> None (the common non-matmul case)
+    d = _task(tmp_path, MINIMAL)
+    assert load_task(d, kb_root=kb).acc_precise is None
+    # set -> stored verbatim
+    d2 = _task(tmp_path, '[task]\nlanguage = "cutedsl"\narch = "sm100"\nacc_precise = "fp32"\n',
+               name="hgemm")
+    assert load_task(d2, kb_root=kb).acc_precise == "fp32"
+
+
+def test_acc_precise_rejects_an_unknown_value(tmp_path):
+    kb = _kb(tmp_path)
+    d = _task(tmp_path, '[task]\nlanguage = "cutedsl"\narch = "sm100"\nacc_precise = "fp32x"\n')
+    with pytest.raises(TaskError) as ei:
+        load_task(d, kb_root=kb)
+    assert any("acc_precise" in p for p in ei.value.problems)

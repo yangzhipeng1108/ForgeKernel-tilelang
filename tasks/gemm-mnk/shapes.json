@@ -1,0 +1,8 @@
+[
+  {"name": "tiny", "axes": {"m": 256, "n": 256, "k": 256}},
+  {"name": "square", "axes": {"m": 4096, "n": 4096, "k": 4096}},
+  {"name": "llm-prefill", "axes": {"m": 8192, "n": 8192, "k": 8192}},
+  {"name": "tall-skinny", "axes": {"m": 16384, "n": 1024, "k": 1024}},
+  {"name": "wide", "axes": {"m": 1024, "n": 16384, "k": 1024}},
+  {"name": "decode", "axes": {"m": 64, "n": 4096, "k": 4096}}
+]

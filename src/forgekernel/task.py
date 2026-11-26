@@ -87,6 +87,12 @@ TIMINGS = ("device", "e2e")
 BACKENDS = ("claude",)
 ROLES = ("teacher", "student")
 MIN_INPUT_GROUPS = 3
+# Optional [task] acc_precise: the accumulator precision a matmul-shaped kernel must
+# accumulate in (CUDA-L2's --acc_precise). It changes both numerics and speed (fp16 accumulate
+# is faster but loses range), so a task that fixes it pins the comparison and the judge must
+# honour it; a task that omits it leaves the accumulator to the kernel/judge. Values mirror
+# the tensor-core accumulate modes: fp16 / tf32 / fp32. None = unspecified.
+ACC_PRECISE = ("fp16", "tf32", "fp32")
 
 MODE_SOURCE = "source"
 MODE_BLACKBOX = "blackbox"
@@ -108,7 +114,7 @@ _MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 # Every key each table may hold; anything else is a mistake, not an extension point.
 _KEYS = {
-    "task": {"language", "arch"},
+    "task": {"language", "arch", "acc_precise"},
     "reference": {"run", "source", "blackbox", "deny", "deny_urls", "deny_modules"},
     "comparison": {"name", "run"},
     "target": {"ratio", "ms", "timing"},
@@ -235,6 +241,7 @@ class Task:
     notes: tuple = field(default=())   # non-fatal remarks worth printing at launch
     leaderboard: Leaderboard | None = None
     comparisons: tuple = field(default=())   # Comparison, in task.toml order
+    acc_precise: str | None = None           # [task] acc_precise: fp16 / tf32 / fp32 or None
 
     @property
     def mode(self) -> str:
@@ -295,6 +302,7 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
                 f"{language} on it ({kb} is missing)"
                 + (f"; this tree has {', '.join(known)}" if known else ""))
 
+    acc_precise = _read_acc_precise(t, problems)
     board = _read_leaderboard(d, cfg, problems) if "leaderboard" in cfg else None
     if board is None:
         description = _read_description(d, problems)
@@ -331,7 +339,7 @@ def load_task(task_dir: str | Path, *, kb_root: Path | None = None,
     return Task(name=name, dir=d, language=language, arch=arch_tok, description=description,
                 shapes=tuple(shapes), reference=reference, target=target, teacher=teacher,
                 student=student, budget=budget, notes=tuple(notes), leaderboard=board,
-                comparisons=tuple(comparisons))
+                comparisons=tuple(comparisons), acc_precise=acc_precise)
 
 
 BOARD_SUITES = ("flashinfer-bench", "sol-execbench")
@@ -521,6 +529,23 @@ def _unknown_keys(cfg: dict, problems: list[str], where: str = TASK_FILE) -> Non
 def _table(cfg: dict, key: str, problems: list[str]) -> dict:
     val = cfg.get(key, {})
     return val if isinstance(val, dict) else {}
+
+
+def _read_acc_precise(t: dict, problems: list[str]) -> str | None:
+    """``[task] acc_precise`` — the accumulator precision a matmul kernel must use.
+
+    Optional; omitted means the accumulator is left to the kernel and the judge (the common
+    case for a non-matmul operator). When present it must name one of ``ACC_PRECISE`` — a
+    typo'd ``fp32x`` would otherwise silently disable the pin and let a fast fp16-accumulate
+    kernel win a comparison that assumed fp32."""
+    val = t.get("acc_precise")
+    if val is None:
+        return None
+    if val not in ACC_PRECISE:
+        problems.append(f"[task] acc_precise must be one of {list(ACC_PRECISE)} or omitted, "
+                        f"got {val!r}")
+        return None
+    return val
 
 
 def _kb_dir(kb_root: Path | None, language: str, arch: str) -> Path:
