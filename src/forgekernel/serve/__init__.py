@@ -23,6 +23,7 @@ from .e2e_record import (
     compare_to_baseline,
     serving_reading_from_bench,
 )
+from . import runtime
 
 __all__ = [
     "GATE_GRAPH",
@@ -33,4 +34,5 @@ __all__ = [
     "ServingReading",
     "serving_reading_from_bench",
     "compare_to_baseline",
+    "runtime",
 ]

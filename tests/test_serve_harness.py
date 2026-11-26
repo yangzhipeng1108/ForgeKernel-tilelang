@@ -205,3 +205,17 @@ def test_sweep_starts_server_once_and_benches_each_concurrency():
     assert bench_calls == [16, 32, 64]
     assert [r.concurrency for r in readings] == [16, 32, 64]
     assert [r.tok_s for r in readings] == [16.0, 32.0, 64.0]
+
+
+# ---------------------------------------------------------------- CLI dry-run
+
+def test_cli_dry_run_prints_commands_without_running(capsys):
+    from forgekernel.serve.__main__ import main
+    rc = main(["--model-path", "/m", "--serve-flag=--tp", "--serve-flag=2",
+               "--concurrency", "16", "--concurrency", "32", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sglang serve --model-path /m" in out
+    assert out.count("sglang.bench_serving") == 2
+    assert "--max-concurrency 32" in out
+
