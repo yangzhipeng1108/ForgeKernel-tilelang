@@ -316,3 +316,210 @@ def render_advice(prop: Proposal, *, top: int = 3) -> str:
     if not parts:
         return "Search loop: no evaluated iterations yet — every technique is untried."
     return " ".join(parts)
+
+
+# --- evolutionary population search (CUDA-L2's RL/evolution loop, on paper) -------------
+#
+# The bandit above steers ONE trajectory: it says which technique to try next given what has
+# been measured. CUDA-L2 runs a population instead — it generates a batch of kernel variants,
+# measures each, keeps the best, and breeds the next batch from them (selection + mutation),
+# which escapes the local optimum a single greedy path walks into. This layer is that loop,
+# with the GPU kept at arm's length: a ``Genome`` is a candidate strategy (an ordered set of
+# technique arms to apply), and ``evaluate(genome) -> reward`` is the ONLY thing that needs a
+# GPU. In production ``evaluate`` builds the genome's kernel, times it against the reference,
+# and returns the measured speedup; in tests it is a plain function, so the whole
+# generate -> evaluate -> select -> mutate cycle is verified deterministically with no GPU.
+
+
+@dataclass(frozen=True)
+class Genome:
+    """One candidate strategy: the ordered technique arms it applies.
+
+    A genome is just an ordered tuple of arm names from ``TECHNIQUES`` (plus possibly
+    ``other``). Order matters the way application order matters on a real kernel (retile then
+    pipeline is a different kernel than pipeline then retile), but for selection purposes two
+    genomes with the same arm *set* in a different order are still distinct candidates — the
+    search may find one ordering pays and the other does not."""
+
+    arms: tuple[str, ...]
+
+    def key(self) -> tuple[str, ...]:
+        return self.arms
+
+    def describe(self) -> str:
+        return " -> ".join(self.arms) if self.arms else "(empty)"
+
+
+def _all_arms() -> list[str]:
+    return list(TECHNIQUES) + [_OTHER]
+
+
+def random_genome(rng, *, length: int | None = None) -> Genome:
+    """A random genome of distinct arms (no repeats — applying one technique twice is noise).
+
+    ``length`` picks how many arms; None draws a length in 1..len(arms). Distinct arms keep a
+    genome a *set-in-an-order*, so mutation (which swaps one arm) always changes the strategy."""
+    arms = _all_arms()
+    n = length if length is not None else rng.randint(1, len(arms))
+    n = max(1, min(n, len(arms)))
+    picked = rng.sample(arms, n)
+    return Genome(tuple(picked))
+
+
+def mutate(genome: Genome, rng, *, rate: float = 1.0) -> Genome:
+    """A child genome: with probability ``rate`` swap one arm for an unused one.
+
+    Mutation is the exploration operator: it replaces one arm with an arm the genome does not
+    already carry, so it cannot produce a duplicate (which would evaluate the same kernel
+    twice). With probability ``1 - rate`` the genome passes through unchanged (a clone), which
+    keeps a good parent representable without a gratuitous perturbation. If every arm is
+    already used, there is nothing to swap in and the genome is returned as-is."""
+    if rng.random() >= rate:
+        return genome
+    used = set(genome.arms)
+    unused = [a for a in _all_arms() if a not in used]
+    if not unused:
+        return genome
+    i = rng.randrange(len(genome.arms))
+    new_arm = rng.choice(unused)
+    arms = list(genome.arms)
+    arms[i] = new_arm
+    return Genome(tuple(arms))
+
+
+@dataclass
+class EvolutionConfig:
+    population: int = 8          # candidates per generation
+    elite: int = 2               # top-K carried to the next generation unchanged
+    generations: int = 3         # number of evaluate/select/mutate rounds
+    mutation_rate: float = 0.7   # per-child probability of a swap
+    genome_length: int | None = None   # fixed arm count, or None = random per genome
+
+
+@dataclass
+class GenerationRecord:
+    index: int
+    genomes: list[Genome]
+    rewards: list[float]
+
+    def ranked(self) -> list[tuple[Genome, float]]:
+        """(genome, reward) best-first; ties keep generation order (stable)."""
+        pairs = list(zip(self.genomes, self.rewards))
+        return sorted(pairs, key=lambda gr: gr[1], reverse=True)
+
+
+@dataclass
+class EvolutionResult:
+    history: list[GenerationRecord]
+    best: Genome | None
+    best_reward: float
+    evaluations: int             # total evaluate() calls — the GPU budget the loop spent
+
+    @property
+    def improved(self) -> bool:
+        """Whether the best reward rose above the first generation's best."""
+        if len(self.history) < 2:
+            return False
+        first = self.history[0].ranked()
+        return bool(first) and self.best_reward > first[0][1]
+
+
+def evolve(evaluate, *, config: EvolutionConfig | None = None, seed: int = 0) -> EvolutionResult:
+    """Run the generate -> evaluate -> select -> mutate loop; return the best genome found.
+
+    ``evaluate(genome) -> float`` is the measured reward (GPU hook in production; any function
+    in tests). The loop:
+
+    1. **generate** — the first generation is ``config.population`` random genomes; later
+       generations are ``config.elite`` carried-over elites plus children mutated from the
+       previous generation's parents (tournament-chosen, so a lucky genome does not monopolise).
+    2. **evaluate** — every genome is scored once; a genome seen before (same key) is NOT
+       re-evaluated — its earlier reward is reused — so the GPU budget buys distinct kernels,
+       not re-measurements (the same "an unchanged tree is one more noise draw" rule the
+       trajectory contract enforces).
+    3. **select** — the generation is ranked by reward and its top ``elite`` seed the next.
+    4. **mutate** — children are ``mutate(parent)``; a fresh random genome is injected if the
+       previous generation collapsed to fewer distinct parents than the population needs.
+
+    ``seed`` makes the whole search reproducible (a recorded run can be replayed)."""
+    import random as _random
+    rng = _random.Random(seed)
+    cfg = config or EvolutionConfig()
+    if cfg.population < 1:
+        raise ValueError("population must be >= 1")
+    if not (0 <= cfg.elite <= cfg.population):
+        raise ValueError("elite must be in [0, population]")
+
+    cache: dict[tuple[str, ...], float] = {}
+
+    def _score(g: Genome) -> float:
+        k = g.key()
+        if k in cache:
+            return cache[k]
+        r = float(evaluate(g))
+        cache[k] = r
+        return r
+
+    history: list[GenerationRecord] = []
+    prev: list[Genome] = []
+
+    for gen in range(cfg.generations):
+        if gen == 0 or not prev:
+            genomes = [random_genome(rng, length=cfg.genome_length)
+                       for _ in range(cfg.population)]
+        else:
+            ranked = [g for g, _ in
+                      GenerationRecord(gen, prev, [_score(g) for g in prev]).ranked()]
+            genomes = list(ranked[:cfg.elite])
+            while len(genomes) < cfg.population:
+                contenders = [rng.choice(prev) for _ in range(min(3, len(prev)))]
+                winner = max(contenders, key=_score)
+                genomes.append(mutate(winner, rng, rate=cfg.mutation_rate))
+            if len({g.key() for g in genomes}) < cfg.population // 2:
+                while len({g.key() for g in genomes}) < cfg.population:
+                    genomes.append(random_genome(rng, length=cfg.genome_length))
+
+        seen: set[tuple[str, ...]] = set()
+        uniq: list[Genome] = []
+        for g in genomes:
+            if g.key() not in seen:
+                seen.add(g.key())
+                uniq.append(g)
+        rewards = [_score(g) for g in uniq]
+        history.append(GenerationRecord(gen, uniq, rewards))
+        prev = uniq
+
+    best: Genome | None = None
+    best_reward = float("-inf")
+    for rec in history:
+        for g, r in rec.ranked():
+            if r > best_reward:
+                best, best_reward = g, r
+    if best is None:
+        best_reward = 0.0
+    return EvolutionResult(history=history, best=best, best_reward=best_reward,
+                           evaluations=len(cache))
+
+
+def render_evolution(result: EvolutionResult) -> str:
+    """A compact digest of the search: per-generation best/mean, and the winning genome.
+
+    One line per generation (generation, distinct candidates, best reward, mean reward) so a
+    reader sees the search *progress* — a flat best across generations means the population
+    converged (or never found signal), a rising best means selection + mutation are paying."""
+    if not result.history:
+        return "Evolution: no generations run."
+    lines = ["generation | candidates | best reward | mean reward",
+             "---|---|---|---"]
+    for rec in result.history:
+        if not rec.rewards:
+            lines.append(f"{rec.index} | 0 | — | —")
+            continue
+        best = max(rec.rewards)
+        mean = sum(rec.rewards) / len(rec.rewards)
+        lines.append(f"{rec.index} | {len(rec.genomes)} | {best:+.3f} | {mean:+.3f}")
+    if result.best is not None:
+        lines.append("")
+        lines.append(f"best: {result.best.describe()}  (reward {result.best_reward:+.3f} "
+                     f"over {result.evaluations} evaluated genomes)")
+    return "\n".join(lines)
