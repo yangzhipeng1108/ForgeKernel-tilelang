@@ -80,7 +80,8 @@ NCU_CONFIGS = ([(label, ["gemm", label.split("@")[1], label.split("@")[0]])
 # because the pipeline's producer warpgroup needs setmaxnreg. Only the `a` form runs. Measured
 # on an RTX 6000D (driver 610.43.02 / CUDA 13.3): sm_120a executes, sm_120 fails to compile,
 # sm_100a compiles but fails to load with CUDA_ERROR_NO_BINARY_FOR_GPU.
-KB_ARCH_TO_TARGET = {"sm90": "sm_90a", "sm100": "sm_100a", "sm120": "sm_120a"}
+KB_ARCH_TO_TARGET = {"sm90": "sm_90a", "sm100": "sm_100a", "sm120": "sm_120a",
+                     "sm86": "sm_86"}
 
 # Rung name -> what the entry needs from it. Each maps to a function in the probe body below.
 RUNGS = {

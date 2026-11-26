@@ -216,13 +216,17 @@ def test_the_tilelang_kb_is_not_prefilled_from_the_dsl_or_cuda_trees():
                               r"cutlass\._mlir|CuTe DSL|tcgen05\.mma\.|wgmma\.mma_async")
     trees = sorted(p.name for p in TL_KB.iterdir() if p.is_dir())
     assert "sm90" in trees and "sm100" in trees and "sm120" in trees
+    # A status entry (State: PARTIAL/BROKEN/ABSENT) records an interface's condition, not a
+    # measured recipe, so it legitimately carries no "Measured on" block; only a WORKS entry
+    # (or one with no state line yet) is held to the evidence rule.
+    _non_works = re.compile(r"^>\s*State:\s*(?:PARTIAL|BROKEN|ABSENT)\b", re.MULTILINE)
     for arch in trees:
         entries = sorted((TL_KB / arch).glob("*.md"))
         assert "index.md" in [p.name for p in entries], arch
         for entry in entries:
             text = entry.read_text(encoding="utf-8")
             assert not dsl_spelling.search(text), (entry.name, dsl_spelling.search(text))
-            if entry.name != "index.md":
+            if entry.name != "index.md" and not _non_works.search(text):
                 assert "## Measured on" in text, entry.name
 
 
@@ -673,8 +677,15 @@ def test_the_kb_measurement_script_maps_directory_names_to_real_cuda_targets():
     assert mod.KB_ARCH_TO_TARGET["sm90"] == "sm_90a"
     assert mod.KB_ARCH_TO_TARGET["sm100"] == "sm_100a"
     assert mod.KB_ARCH_TO_TARGET["sm120"] == "sm_120a"
+    assert mod.KB_ARCH_TO_TARGET["sm86"] == "sm_86"   # Ampere: plain target, no 'a' variant
     for tree, target in mod.KB_ARCH_TO_TARGET.items():
-        assert target.startswith("sm_") and target[len("sm_"):][-1].isalpha(), (tree, target)
+        assert target.startswith("sm_"), (tree, target)
+        # Hopper/Blackwell need the accelerated 'a' variant; Ampere (sm_86) has no such suffix
+        # and must be the plain form (asserting an 'a' here would name a target nvcc rejects).
+        if tree == "sm86":
+            assert target == "sm_86", (tree, target)
+        else:
+            assert target[len("sm_"):][-1].isalpha(), (tree, target)
 
 
 def test_every_kb_skeleton_still_carries_an_unfilled_measured_on_block():

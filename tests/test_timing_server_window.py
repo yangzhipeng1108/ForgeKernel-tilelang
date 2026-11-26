@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-PATH = Path(r"E:\python\trae\pac\optimization\ForgeKernel"
-            r"\src\forgekernel\card_template\eval\timing.py")
+PATH = (Path(__file__).resolve().parents[1]
+        / "src" / "forgekernel" / "card_template" / "eval" / "timing.py")
 
 
 def _load(monkeypatch, fake_torch):

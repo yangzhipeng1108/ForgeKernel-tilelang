@@ -164,8 +164,9 @@ def test_the_driver_routes_a_cuda_task_to_its_prompts_and_its_kernel_file(tmp_pa
     (tmp_path / "notes" / driver._ORCH_CENSUS_RUNNER).write_text("")
     assert driver._ncu_mode(dsl) == driver._ORCH_CENSUS_CMD
     assert driver._ncu_mode(cu) == f"{driver._ORCH_CENSUS_CMD} --kernel kernel.cu"
-    assert "/cuda" in driver._bindings(cu)["{PROVENANCE_DIR}"]
-    assert not driver._bindings(dsl)["{PROVENANCE_DIR}"].endswith("cuda")
+    prov = Path(driver._bindings(cu)["{PROVENANCE_DIR}"])
+    assert prov.as_posix().endswith("/cuda")
+    assert not Path(driver._bindings(dsl)["{PROVENANCE_DIR}"]).as_posix().endswith("cuda")
 
 
 def test_the_cuda_student_timeline_note_teaches_the_cpp_marker(tmp_path):
@@ -372,13 +373,16 @@ def test_the_cuda_toolchain_check_names_what_is_missing(tmp_path, monkeypatch):
 
 
 def test_the_cuda_students_notice_names_headers_not_the_dsl(tmp_path):
-    cfg = {"loop": {"cuda_source_dirs": [str(tmp_path)], "dsl_source_dirs": ["/elsewhere"]}}
+    # A declared dir is normalized to an absolute path (``/elsewhere`` becomes ``<drive>:\elsewhere``
+    # on Windows), so assert on the identity, not a literal posix prefix.
+    elsewhere = tmp_path / "elsewhere"
+    cfg = {"loop": {"cuda_source_dirs": [str(tmp_path)], "dsl_source_dirs": [str(elsewhere)]}}
     pol = ap.from_config(cfg, oracle_mode="blackbox", repo_root=tmp_path, teacher_trees=[],
                          language="cuda-sol")
     note = pol.notice(ap.ROLE_STUDENT)
     assert "CUDA / CUTLASS headers" in note and "DSL package source" not in note and str(tmp_path) in note
     dsl = ap.from_config(cfg, oracle_mode="blackbox", repo_root=tmp_path, teacher_trees=[])
-    assert "DSL package source" in dsl.notice(ap.ROLE_STUDENT) and "/elsewhere" in dsl.notice(ap.ROLE_STUDENT)
+    assert "DSL package source" in dsl.notice(ap.ROLE_STUDENT) and "elsewhere" in dsl.notice(ap.ROLE_STUDENT)
     warns = ap.declaration_warnings({"loop": {}}, None, language="cuda-sol")
     assert any("cuda_source_dirs is empty" in w for w in warns)
 

@@ -31,7 +31,7 @@ untouched NCU output — the census is evidence, never a precondition.
 Three kernel flavours reach the same two lines, and each one is found differently:
 
 - **CuTe DSL** — the JIT is asked to dump (``CUTE_DSL_KEEP_CUBIN``), and the largest dump is read.
-- **CUDA C++** (``--kernel x.cu``) — no dump switch exists; the extension ``.so`` the card built
+- **CUDA C++** (``--kernel`` a CUDA source path) — no dump switch exists; the extension ``.so`` the card built
   from that exact source is located and its embedded cubins extracted (``cuobjdump -xelf``).
 - **TileLang** (``--kernel x_tl.py``) — nothing is built from C/C++, and no dump switch exists
   either, but every compile writes ``<cache>/<version>/cuda-binaries/<sha>/kernel.cubin`` as a

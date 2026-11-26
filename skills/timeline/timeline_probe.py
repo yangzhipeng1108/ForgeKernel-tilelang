@@ -319,7 +319,7 @@ def is_cuda_kernel(kernel: str) -> bool:
 # exist here. Two findings from an RTX 6000D make this workable:
 #
 #   * `T.import_source(text)` (called INSIDE the Kernel block) pastes `text` into the
-#     generated .cu verbatim -- no format step, so a literal `%clock64` survives;
+#     generated CUDA source verbatim -- no format step, so a literal `%clock64` survives;
 #   * a module-level `@T.macro` named `_seg` is callable from a prim_func body and its
 #     `T.call_extern` becomes a plain C call to whatever the imported source defined.
 #
@@ -340,7 +340,7 @@ def tilelang_preamble(stride: int = 1) -> str:
 
     Two constraints shape this:
 
-    - it is handed to `T.import_source`, which pastes it into the generated .cu
+    - it is handed to `T.import_source`, which pastes it into the generated CUDA source
       verbatim (no format step), so a literal `%clock64` survives;
     - the slab address is only known once the process has allocated the tensor, which
       happens when the kernel module is imported, so the address cannot be baked into the
