@@ -5057,7 +5057,12 @@ def _recon_artifacts_written(ctx: LoopContext, since: float | None = None) -> bo
             mtime = p.stat().st_mtime
         except OSError:  # missing (FileNotFoundError) or unreadable
             return False
-        if since is not None and mtime < since:
+        # Wall-clock vs file-mtime can differ by a fraction of a millisecond even for a
+        # write made "after" session_start (the FS stamps mtime from a slightly earlier
+        # read of the clock), which randomly misread a fresh write-up as stale. A small
+        # 50ms floor absorbs that jitter while a prior session's report (seconds+ older)
+        # still reads as stale.
+        if since is not None and mtime + 0.05 < since:
             return False
     return True
 

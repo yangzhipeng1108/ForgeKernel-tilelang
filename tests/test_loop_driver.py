@@ -1996,11 +1996,19 @@ def test_recon_finish_rejects_stale_artifacts_from_a_previous_run(tmp_path):
     from forgekernel.loop.driver import run_recon_step
 
     # stale residue: written BEFORE the recon session starts, waivers included —
-    # under the old existence-only gate this satisfied a finish outright
+    # under the old existence-only gate this satisfied a finish outright. Backdate the
+    # mtimes to model a genuinely prior session: a fresh write lands within the same
+    # millisecond as run_recon_step's session_start, which the freshness floor now (by
+    # design) reads as this-session, so a same-tick write cannot stand in for stale.
+    import os as _os
+    import time as _time
     (tmp_path / "recon-report.md").write_text(
         "previous operator's observations\nSASS-WAIVED: stale\n"
         "SCHED-WAIVED: stale\nLIVE-WAIVED: stale")
     (tmp_path / "candidates.md").write_text("stale A|B")
+    _stale = _time.time() - 3600
+    for _f in ("recon-report.md", "candidates.md"):
+        _os.utime(tmp_path / _f, (_stale, _stale))
 
     def refresh(prompt):  # second turn: the teacher re-affirms the write-up
         (tmp_path / "recon-report.md").write_text(
