@@ -78,21 +78,29 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    thin lazy shims (imported at call time) to keep the graph acyclic; `BackendError`
    is imported at module load (driver defines it before it imports pricing). Also needs
    `JOB_END_KILLED`/`job_abend` (loop.parse) and `meta_shapes`.
-5. ◑ **`loop/reopen.py`** — **first slice DONE** (reopen-budget core). The
-   self-contained reopen-budget part moved: the patch-class enums,
-   `_fruitless_reopen_streak`, `_reopen_capped_block`, `_INFEASIBLE_MENTION_BLOCK`,
-   `_CAUSE_ENUM`/`_CAUSE_ENUM_AUDIT`/`_INFEASIBLE_MENTION`, `_parse_cause_class`, and
-   `_teacher_prompt` (10 names). Only driver dep is `LoopContext` (annotation); the
-   rest come from prompt (`render_prompt`/`_meta_prompt`/`_bindings`) — a true leaf.
-   **Deferred:** the certify/harvest/axis-battle cluster (`run_kb_certify`,
-   `run_kb_harvest`, `kb_axis_debt`, `AxisBattle`, ...) and the whole "phase
-   exhaustion" section (`_phase_exhaustion`, `_run_lever_pricing` [245 lines],
-   `_lever_price_block`, `_persist_lever_table`, ...). Those are NOT leaves: they pull
-   16 driver helpers plus three constants defined *after* the reopen import point
-   (`_DECISION_ID`@4885, `_LEVER_DESIGN_BLOCK`@4004/4108, `TRUNCATION_STORM_BUDGET`@6555),
-   and `phase_exhaustion` is exactly where the pricing.py lazy shims point back. Moving
-   them needs those constants relocated first and is a separate, bigger change — not
-   worth the risk now.
+5. ✅ **`loop/reopen.py`** — **DONE** (both rings).
+   - Ring 1 (reopen-budget core, a true leaf): patch-class enums,
+     `_fruitless_reopen_streak`, `_reopen_capped_block`, `_INFEASIBLE_MENTION_BLOCK`,
+     `_CAUSE_ENUM`/`_CAUSE_ENUM_AUDIT`/`_INFEASIBLE_MENTION`, `_parse_cause_class`,
+     `_teacher_prompt` (10 names).
+   - Ring 2 (phase exhaustion + lever pricing, 24 names): `_phase_exhaustion`,
+     `_run_lever_pricing`, `_lever_price_block`, `_persist_lever_table`,
+     `_merge_lever_tables`, `_table_noise_pct`, `_ablation_block`, verdict/close/priced
+     notes, etc. 8 driver deps only — `BackendError` (load), `LoopContext`
+     (annotation), and `_agent_turn`/`_bank_evidence`/`_evidence_dir`/
+     `_lever_pricing_jobs_text`/`_milestone_dag`/`_seed_pricing_toolkits` (lazy shims,
+     all verified to have no back-reference into the section).
+   - To make ring 2 extractable, the three constants that ring 2 (and timeline/gap)
+     share were first moved to **`loop/shared.py`** (`_DECISION_ID`,
+     `_LEVER_DESIGN_BLOCK`, `TRUNCATION_STORM_BUDGET`) and imported back by driver early
+     (before any use); this removed the "constants defined after the import point"
+     blocker. `shared.py` depends only on pricing.
+   - `phase_exhaustion` being where the pricing.py lazy shims point back is fine: those
+     shims look names up on `driver` at call time and driver re-exports the moved
+     functions, so they still resolve.
+   - Still in driver (deferred, coupled to the agent core): the certify/harvest/
+     axis-battle cluster (`run_kb_certify`, `run_kb_harvest`, `kb_axis_debt`,
+     `AxisBattle`, ...).
 6. ✅ **`loop/comparisons.py`** ← "machine-aware comparisons" (53 defs/consts). DONE.
    Only 9 driver helpers needed (`BackendError` [load, like pricing], `LoopContext`
    [annotation], `_ablation_block`, `_best_good_ref`, `_lever_spec_refused`,
