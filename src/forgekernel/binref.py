@@ -223,7 +223,9 @@ def ref_tree_gpu_entry(card_text: str, sources: list[str]) -> str:
     binref tasks, and a guarded `cmd`."""
     card_text = re.sub(r"\n# Blackbox guard \(.*?\n}\n", "\n", card_text, flags=re.S)  # the card's own
     before, _, after = _split_dispatch(card_text)
-    names = [re.escape(Path(s).name) for s in sources]
+    # Anchored with \b: a source named `kernel.cu` must not prefix-match the TileLang cubin cache
+    # path `kernel.cubin`, which the loop's own seeded pricing tools name.
+    names = [re.escape(Path(s).name) + r"\b" for s in sources]
     head = ("#!/bin/bash\n# Recon tree of a sealed binary reference (forgekernel.binref) — tasks:\n"
             "#   build | check | crosscheck | bench (= ref) | ncu | binref (check + bench + ncu)"
             " | cmd <CMD> (guarded)\n")
