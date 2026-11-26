@@ -183,35 +183,55 @@ The facade contract above is now **enforced** by `tests/test_loop_facade.py`:
 So a future step cannot regress the facade unnoticed. Update the frozen set as part
 of any intentional rename/removal.
 
-## Status: split stops after step 4 (no clean leaf remains)
+## Outcome: split complete (driver 11,277 -> 7,904 lines)
 
-Steps 2–4 are done and gated. Steps 5–9 were investigated and **stopped here
-deliberately**, because the remaining sections are not leaves:
+Starting from an 11,277-line / 327-def God module, ten leaf modules were extracted,
+each a separate commit gated on the suite and on `tests/test_loop_facade.py`:
 
-| section | lines | top-level defs | defs referenced outside |
-|---|---|---|---|
-| prompt rendering | 492 | 23 | 15 |
-| machine-aware comparisons | 885 | 53 | 36 |
-| noeval rows | 508 | 14 | 10 (incl. `run_inner_loop`) |
-| meta loop | 320 | 24 | 13 |
-| reopen budget + KB certify/harvest | ~560 | ~30 | dense |
-| phase exhaustion + lever pricing | 734 | 17 | **`pricing.py` shims point back here** |
-| timeline + meta engine (incl. `run_meta_step`) | 3028 | 70 | densest |
-| out-of-run gap queue | 3629 | — | spine |
+| module | names | what |
+|---|---|---|
+| `loop/placeholder.py` | 8+regs | placeholder ledger |
+| `loop/harness_section.py` | 2 | card-owned harness hygiene/revert |
+| `loop/pricing.py` | 30+30 | dossier contract + price staleness |
+| `loop/prompt.py` | 23 | prompt rendering |
+| `loop/comparisons.py` | 53 | machine-aware comparisons |
+| `loop/reopen.py` | 34 | reopen budget + phase exhaustion + lever pricing |
+| `loop/shared.py` | 3 | shared constants (unblocked reopen ring 2) |
+| `loop/timeline.py` | 33 | timeline probe |
+| `loop/gap_queue.py` | 19 | out-of-run gap-queue core |
+| `loop/best_confirmation.py` | 7 | best confirmation + window credit |
 
-`placeholder`/`harness_section`/`pricing` were the real leaves (done). Everything
-left is the load-bearing spine — `run_inner_loop`, `run_meta_step`, `run_kb_harvest`,
-`_run_lever_pricing` — mutually referencing, and `phase_exhaustion` is exactly where
-the `pricing.py` lazy shims (`_lever_spec_refused`, `_persist_lever_table`,
-`_table_noise_pct`, `_fmt_pct`) point back to, so extracting it would **re-couple**
-`pricing.py`. Forcing any of these would be the sprawling, risky change this spec
-warns against. The God-module *risk* (silent breakage on refactor) is what the facade
-test above bounds; the line count is left as one cohesive engine on purpose.
+Key finding that shaped the work: several "sections" in the original spec were
+misnamed mixes. The real separable leaves were narrower than the section headers
+implied — e.g. "timeline probe" line 2539–3225 is the probe (extracted) while 3246+
+is `run_meta_step` (kept); "out-of-run gap queue" 4816–5108 is the queue core
+(extracted) while the rest is the recon/pricing engine (kept); "phase exhaustion"
+split into a clean reopen-budget leaf plus a lever-pricing ring that needed the
+shared constants relocated first.
 
-If more splitting is ever wanted, the safe next target is **`loop/prompt.py`** (step
-1: 15/23 outward refs, a mechanical re-export block) — it does not touch the pricing
-shims. The 4000–7600 "timeline" block is really the meta-phase engine and should be
-split by concern (milestone/resume/reopen/pacing), not by line span.
+**What remains in `driver.py` (~7,900 lines) is deliberately left there**: the
+orchestration core — `LoopContext`, `run_inner_iteration`, `run_inner_loop`,
+`run_meta_step` (736 lines), `run_recon_step`, `run_kb_harvest`, `run_kb_certify`,
+`run_distill_step`, `run_two_layer`, the recon/pricing toolkit and the meta engine.
+These are mutually recursive and not separable without re-coupling the extracted
+modules; forcing more would be the sprawling, risky change this spec warns against.
+The God-module *risk* (silent breakage on refactor) is bounded by the facade test,
+not by line count.
+
+### Pitfalls found and guarded (all recorded inline at their steps)
+
+- Tests that `monkeypatch.setattr(driver, "<name>", ...)` require the internal caller
+  to reach the name **through `driver`**, not a local module copy. Hit twice:
+  `_ncu_profiler` (comparisons) and `TRUNCATION_BACKOFF_S` (gap_queue); both fixed
+  with a call-time `driver.<name>` lookup and noted here so the next extraction does
+  not repeat it.
+- Top-level names can be **annotated assignments** (`ast.AnnAssign`), not just
+  `ast.Assign`; the first gap_queue pass dropped `TRUNCATION_BACKOFF_S` (an AnnAssign)
+  from `__all__`/re-export. All extracted modules were audited afterwards: no other
+  top-level AnnAssign was missed.
+- Constants shared across several not-yet-extracted sections (timeline, gap, phase)
+  must be relocated to a neutral module (`loop/shared.py`) **before** any of them is
+  extracted, or the extracted module references names defined later in driver.
 
 ## Acceptance
 
