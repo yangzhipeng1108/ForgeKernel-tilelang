@@ -212,6 +212,7 @@ EXTRACTED_MODULES = (
     "forgekernel.loop.placeholder",
     "forgekernel.loop.pricing",
     "forgekernel.loop.prompt",
+    "forgekernel.loop.comparisons",
 )
 
 

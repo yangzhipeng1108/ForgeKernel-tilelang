@@ -80,8 +80,16 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    `JOB_END_KILLED`/`job_abend` (loop.parse) and `meta_shapes`.
 5. **`loop/reopen.py`** ← "reopen budget" + "phase exhaustion" (6/17 and 17/21; phase
    exhaustion depends on reopen, extract together).
-6. **`loop/comparisons.py`** ← "machine-aware comparisons" (33/39 — almost entirely
-   inward-referenced, extract late).
+6. ✅ **`loop/comparisons.py`** ← "machine-aware comparisons" (53 defs/consts). DONE.
+   Only 9 driver helpers needed (`BackendError` [load, like pricing], `LoopContext`
+   [annotation], `_ablation_block`, `_best_good_ref`, `_lever_spec_refused`,
+   `_milestone_dag`, `_normalise_ablations`, `_orch_summary`, `_seed_pricing_toolkits`
+   [lazy shims]). Uses prompt/pricing helpers (`_best_keep_record`, `_is_cuda`,
+   `_is_tilelang`, `_price_log_*`, `parse_lever_prices`, ...) directly. **Pitfall hit
+   and fixed:** a test monkeypatches `driver._ncu_profiler`, but the internal caller
+   was in this module — so the internal call goes through `_call_ncu_profiler` →
+   `driver._ncu_profiler` so the patch still takes effect. Any name a test patches on
+   `driver` must be reached through `driver`, not a local copy.
 7. **`loop/timeline.py`** ← "timeline probe" (37/70 — 3,028 lines; the biggest single
    win once its leaves are out).
 8. **`loop/gap_queue.py`** ← "out-of-run gap queue" (23/89 — 3,629 lines; extract
