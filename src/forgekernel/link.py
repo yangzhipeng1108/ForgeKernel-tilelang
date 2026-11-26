@@ -74,6 +74,9 @@ DIAG = {
     "L-ROLE": "the warp peak exceeds the block, or a role is malformed",
     "L-RING": "the pipeline asks for a ring depth outside what the stages allow",
     "L-ORDER": "the pipeline is empty, has a cycle, or lists a stage twice",
+    "L-XGPU": "an edge crosses devices but names no transport the linker understands, so the "
+              "data movement cannot even be declared (cross-GPU seams are checked statically, "
+              "never timed — there is no GPU to measure them on)",
 }
 
 
@@ -137,6 +140,9 @@ def summarize(plan: LinkPlan) -> list[str]:
     budget = plan.reasons.get("expected_ms")
     if budget is not None:
         lines.append(f"expected_ms: {budget}  (summed declared budget, not a measurement)")
+    xgpu = plan.reasons.get("cross_gpu")
+    if xgpu:
+        lines.append(f"cross-GPU seams: {xgpu}  (declaration-checked, never timed)")
     return lines
 
 
@@ -271,7 +277,44 @@ def _handle_for_edge(prev_name: str, out_port: str, po_spec: dict,
             "L-PHASE", f"{prev_name}.{out_port} emits generation {pg}, "
                        f"{nxt_name}.{in_port} expects {ng} ({move}); tensor import hands "
                        f"off one generation — carry these in a ring of depth >= {depth}"))
+    diags += _cross_gpu_for_edge(prev_name, out_port, po_spec,
+                                 nxt_name, in_port, ni_spec)
     return diags
+
+
+def _cross_gpu_for_edge(prev_name: str, out_port: str, po_spec: dict,
+                        nxt_name: str, in_port: str, ni_spec: dict) -> list[Diagnostic]:
+    """Whether a cross-device seam is *declared* well enough to be modelled.
+
+    A port's optional ``device`` (int; absent = 0) says which GPU it lives on. When the producer
+    and consumer sit on **different devices**, the seam is a communication, not an in-SM move:
+    tensor import cannot carry it, a shared-memory residency solver does not bound it, and — with
+    no GPU here — its cost can never be measured, only declared. So the check is static and
+    minimal: the edge must name a ``transport`` the linker understands (``nvlink`` / ``pcie`` /
+    ... — ``comp.TRANSPORTS``) on at least one of the two ports. An edge across devices with no
+    known transport is ``L-XGPU`` — the graph claims a cross-GPU hand-off it cannot describe,
+    which is the state that would otherwise fuse into a kernel that reads another device's
+    memory and faults. The diagnostic names both devices and the transport it saw, so the fix
+    (declare the link) is obvious. A same-device edge is silent (the common case)."""
+    pd = po_spec.get("device", 0)
+    nd = ni_spec.get("device", 0)
+    if pd == nd:
+        return []
+    # which transport did either side declare, and is it a known one?
+    transports = [s.get("transport") for s in (po_spec, ni_spec)
+                  if s.get("transport") is not None]
+    known = [t for t in transports if t in comp.TRANSPORTS]
+    if known:
+        return []           # declared and understood: modellable, nothing to refuse
+    if transports:
+        return [Diagnostic(
+            "L-XGPU", f"{prev_name}.{out_port} (device {pd}) -> {nxt_name}.{in_port} "
+                      f"(device {nd}) crosses devices but names transport {transports[0]!r}, "
+                      f"not one of {list(comp.TRANSPORTS)} — the link cannot be modelled")]
+    return [Diagnostic(
+        "L-XGPU", f"{prev_name}.{out_port} (device {pd}) -> {nxt_name}.{in_port} "
+                  f"(device {nd}) crosses devices but declares no transport; declare one of "
+                  f"{list(comp.TRANSPORTS)} on the port so the link can be modelled")]
 
 
 def _bridge_hint(root, prev_name, po_spec, prev_contract, nxt_name, ni_spec,
@@ -559,6 +602,17 @@ def link(pipeline: list[str], *, root: str | Path | None = None, language: str |
     problems += res_problems
     if problems:
         raise LinkError(_coalesce(problems))
+
+    xgpu = 0
+    for frm, out, to, inp in wired:
+        _, pct = by_name[frm]
+        _, nct = by_name[to]
+        pd = (pct.get("outputs") or {}).get(out, {}).get("device", 0)
+        nd = (nct.get("inputs") or {}).get(inp, {}).get("device", 0)
+        if pd != nd:
+            xgpu += 1
+    if xgpu:
+        reasons["cross_gpu"] = f"{xgpu} edge(s) cross devices"
 
     return LinkPlan(stages=order, language=lang,
                     edges=[(a, b, c, d) for a, b, c, d in wired],
@@ -1132,3 +1186,144 @@ def _as_list(v):
         return v.detach().cpu().tolist()
     except AttributeError:
         return v
+
+
+# --- link outcome distilled into a KB recipe ----------------------------------------------
+#
+# A successful link is exactly the kind of finding a hardware KB is supposed to bank: "these
+# N stages, wired like THIS, fit a sm_XX CTA at THESE resource peaks with THIS ring depth." The
+# distinction it preserves is the one PipeLink draws: the plan was solved *on paper* (seams,
+# resource peaks, ring floor) but not yet *run* on the GPU, so the entry ships as a prospect
+# with state ``PARTIAL`` — the contract and budget are proven, the speed is not. Only a later
+# GPU run that fills its ``Measured on`` block earns ``WORKS``. This is the opposite of dumping
+# a green checkmark on an unmeasured fusion, which is the one thing a KB must never do.
+
+def render_kb_recipe(plan: LinkPlan, *, title: str | None = None,
+                     arch: str = "sm100", measured: bool = False) -> str:
+    """Distil a solved :class:`LinkPlan` into one KB recipe markdown entry.
+
+    The entry follows the KB TEMPLATE shape: title, a ``> State:`` line (``PARTIAL`` while only
+    the paper link is proven, ``WORKS`` once ``measured``), Purpose, When needed, the wired plan
+    as a runnable-shaped description, Gotchas drawn from the plan's own solved numbers, and a
+    Sources section of API/documentation links only — never a reference implementation's
+    symbols (the same rule ``loop/kb_lint`` enforces, so the entry passes that gate).
+
+    The numbers are whatever the linker solved: the per-resource peak (not the sum), the ring
+    depth and its reason, and the seam list. Nothing here is invented; a reader can trace each
+    value back to ``plan.resources`` / ``plan.ring_depth`` / ``plan.edges``."""
+    name = title or "linked_" + "_".join(
+        "".join(ch if ch.isalnum() else "_" for ch in s) for s in plan.stages)
+    state = "WORKS" if measured else "PARTIAL"
+    state_note = ("measured on hardware" if measured else
+                  "link-time contract and budget solved on paper; not yet run on a GPU")
+    peak = ", ".join(f"`{r}={plan.resources[r]}`" for r in RESOURCES if r in plan.resources)
+    if "warps" in plan.resources:
+        peak += (f", `warps={plan.resources['warps']}`" if peak else
+                 f"`warps={plan.resources['warps']}`")
+    seam_lines_list: list[str] = []
+    for frm, out, to, inp in plan.edges:
+        fn = _handoff_fn(_HANDLE_FOR_PLAN.get((frm, out), "reg"),
+                         _HANDLE_FOR_PLAN.get((to, inp), "reg"))
+        seam_lines_list.append(f"- `{frm}.{out}` -> `{to}.{inp}` ({fn})")
+    seam_lines = "\n".join(seam_lines_list) or "- (single stage; no seams)"
+    chain = " -> ".join(plan.stages)
+    ring_reason = plan.reasons.get("ring") or "minimum depth"
+    over_cap = [r for r in RESOURCES
+                if plan.caps and plan.caps.get(r) is not None and plan.resources.get(r, 0)
+                > plan.caps[r]]
+    cap_note = ("; peaks within the target's caps" if not over_cap
+                else "; OVER cap on " + ", ".join(over_cap) + " (link should have refused)")
+    return f"""# {name} (a {len(plan.stages)}-stage fused {plan.language} kernel, linked on paper)
+
+> State: {state} — {state_note}.
+
+## Purpose
+
+One fused `{plan.language}` kernel assembled by the PipeLink-style linker from
+`{chain}`: the stages are packed separately and linked into a single kernel, with every seam
+type-checked (dtype / shape / handle / generation) and the fused kernel's resources solved at
+link time. This entry records a plan that *solved* — the wiring fits and the resource peak is
+within the target — so the same fusion need not be re-derived from scratch.
+
+## When needed (trigger)
+
+- You are building a fused kernel out of the stages `{chain}` and want a known-fitting wiring
+  (and the resource budget it implies) as a starting point instead of solving the seam and cap
+  arithmetic yourself.
+- You are about to hand-write the hand-offs between these stages: the linker already chose the
+  move for each edge (see the seam list) and the ring depth (see below) — reuse them.
+
+## Linked plan
+
+- stages: `{chain}` (language `{plan.language}`)
+- resource peaks (peak simultaneous use, not the sum): {peak or "(none declared)"}{cap_note}
+- ring depth: `{plan.ring_depth}` ({ring_reason})
+- seams:
+{seam_lines}
+
+## Gotchas
+
+- **The resource number is a PEAK, not a sum.** A chain of eight stages that each claim 64 KB
+  of shared memory does not need 512 KB — residency overlaps only neighbours, so the peak is far
+  below the naive sum. Budgeting against the sum over-provisions and hides a kernel that would
+  actually fit.
+- **A differing handle kind is bridged, an unknown one is refused.** The linker generates the
+  move between any two known handle kinds (tmem / reg / smem); a port that names a kind it does
+  not understand is a link failure, not a silent wrong kernel.
+- **Generation mismatch needs a ring.** If a producer emits generation G and the consumer expects
+  G', tensor import hands off one generation, so the fusion needs a ring of depth `|G-G'|+1`.
+  The ring depth above is what the linker solved; honoring it at runtime is what makes the
+  pipeline overlap.
+- **This plan is solved, not measured.** The contract, budget and wiring are proven; the speed
+  is not. Fill the `## Measured on` block with a GPU run before citing any gain.
+
+## Measured on
+
+```text
+{'[filled — see the linked run]' if measured else '[to be measured] — link solved on paper; run the fused kernel on a GPU to certify.'}
+```
+
+## Sources
+
+- CUDA C++ Programming Guide — shared memory, occupancy and register limits:
+  <https://docs.nvidia.com/cuda/cuda-c-programming-guide/>
+- PTX ISA — async copies, warp-level MMA and synchronization:
+  <https://docs.nvidia.com/cuda/parallel-thread-execution/>
+- `src/forgekernel/link.py` — the linker that solved this plan (seam check, resource/residency
+  solver, ring sizing); `summarize(plan)` prints the same numbers this entry records.
+"""
+
+
+# Declared handle kind per (stage, port), filled by render_kb_recipe's caller when contracts
+# are available. Kept module-level so the seam list can name the move without re-reading disks;
+# an empty map defaults every port to `reg`, the most common accumulator home.
+_HANDLE_FOR_PLAN: dict[tuple[str, str], str] = {}
+
+
+def render_kb_recipe_for(pipeline: list[str], *, root: str | Path | None = None,
+                         title: str | None = None, arch: str = "sm100",
+                         measured: bool = False, **link_kw) -> str:
+    """Link ``pipeline`` and return its KB recipe entry (declared handles resolved first).
+
+    Convenience over :func:`render_kb_recipe`: it runs :func:`link`, reads each stage's
+    contract to fill the handle map the seam list needs, then renders. Raises
+    :class:`LinkError` if the pipeline does not link — an unlinkable pipeline has no recipe to
+    bank."""
+    global _HANDLE_FOR_PLAN
+    plan = link(pipeline, root=root, **link_kw)
+    handles: dict[tuple[str, str], str] = {}
+    for name in plan.stages:
+        cdir = comp.components_root(root) / name
+        try:
+            cct = comp.read_contract(cdir)
+        except comp.ComponentError:
+            continue
+        for side in ("inputs", "outputs"):
+            for port, spec in (cct.get(side) or {}).items():
+                handles[(name, port)] = spec.get("handle") or "reg"
+    _HANDLE_FOR_PLAN = handles
+    try:
+        return render_kb_recipe(plan, title=title, arch=arch, measured=measured)
+    finally:
+        _HANDLE_FOR_PLAN = {}
+

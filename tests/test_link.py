@@ -633,3 +633,87 @@ def test_tilelang_param_extent_comes_from_the_verify_shape(tmp_path):
     src = linkmod.render_fused(plan, root=tmp_path)
     assert "T.Tensor((4,), \"float32\")" in src        # verify.json pinned m=4
 
+def test_render_kb_recipe_distills_a_solved_plan(tmp_path):
+    _stage(tmp_path, "load", out_handle="smem")
+    _stage(tmp_path, "gemm", in_handle="reg", resources={"smem_bytes": 131072})
+    plan = linkmod.link(["load", "gemm"], root=tmp_path, caps={"smem_bytes": 227 * 1024})
+    md = linkmod.render_kb_recipe_for(["load", "gemm"], root=tmp_path)
+    # a paper link ships PARTIAL, never a green WORKS, until measured
+    assert "> State: PARTIAL" in md
+    assert "load.y" in md and "gemm.x" in md
+    assert "smem_bytes=131072" in md
+    assert "[to be measured]" in md
+    # deterministic name off the stages
+    assert md.splitlines()[0].startswith("# linked_load_gemm")
+
+
+def test_render_kb_recipe_measured_flips_to_works(tmp_path):
+    _stage(tmp_path, "a")
+    _stage(tmp_path, "b")
+    md = linkmod.render_kb_recipe_for(["a", "b"], root=tmp_path, measured=True)
+    assert "> State: WORKS" in md
+    assert "[filled" in md
+
+
+def test_render_kb_recipe_has_no_reference_implementation_tokens(tmp_path):
+    # kb_lint bans oracle / teacher / reference-implementation symbols at certification
+    _stage(tmp_path, "a")
+    _stage(tmp_path, "b")
+    md = linkmod.render_kb_recipe_for(["a", "b"], root=tmp_path)
+    low = md.lower()
+    for banned in ("oracle", "teacher", "reference implementation"):
+        assert banned not in low
+
+def _xgpu_stage(root: Path, name: str, *, in_device=0, out_device=0,
+                in_transport=None, out_transport=None):
+    d = root / "components" / name
+    d.mkdir(parents=True)
+    (d / comp.COMPONENT_TOML).write_text(
+        f'[component]\nname = "{name}"\nlanguages = ["cuda"]\nsummary = "{name}"\n',
+        encoding="utf-8")
+    in_spec = {"shape": ["m"], "dtype": "float32", "device": in_device}
+    out_spec = {"shape": ["m"], "dtype": "float32", "device": out_device}
+    if in_transport:
+        in_spec["transport"] = in_transport
+    if out_transport:
+        out_spec["transport"] = out_transport
+    contract = {"axes": ["m"], "inputs": {"x": in_spec}, "outputs": {"y": out_spec},
+                "semantics": name}
+    (d / comp.CONTRACT_JSON).write_text(json.dumps(contract), encoding="utf-8")
+    slot = d / "cuda"
+    slot.mkdir()
+    (slot / comp.IMPL_FILE["cuda"]).write_text("// impl\n", encoding="utf-8")
+    (slot / comp.VERIFY_JSON).write_text(
+        json.dumps({"shape": {"m": 4}, "tolerance": 0.0, "golden": {"torch": "OUT = IN"}}),
+        encoding="utf-8")
+
+
+def test_cross_device_edge_without_transport_is_refused(tmp_path):
+    _xgpu_stage(tmp_path, "a", out_device=0)
+    _xgpu_stage(tmp_path, "b", in_device=1)
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.link(["a", "b"], root=tmp_path)
+    assert any(d.code == "L-XGPU" for d in ei.value.diagnostics)
+
+
+def test_cross_device_edge_with_known_transport_links(tmp_path):
+    _xgpu_stage(tmp_path, "a", out_device=0, out_transport="nvlink")
+    _xgpu_stage(tmp_path, "b", in_device=1)
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    assert plan.reasons.get("cross_gpu") == "1 edge(s) cross devices"
+    assert any("cross-GPU seams" in ln for ln in linkmod.summarize(plan))
+
+
+def test_cross_device_edge_with_unknown_transport_is_refused(tmp_path):
+    _xgpu_stage(tmp_path, "a", out_device=0, out_transport="carrier-pigeon")
+    _xgpu_stage(tmp_path, "b", in_device=1)
+    with pytest.raises(linkmod.LinkError) as ei:
+        linkmod.link(["a", "b"], root=tmp_path)
+    assert any(d.code == "L-XGPU" for d in ei.value.diagnostics)
+
+
+def test_same_device_edge_is_silent_on_cross_gpu(tmp_path):
+    _xgpu_stage(tmp_path, "a", out_device=0)
+    _xgpu_stage(tmp_path, "b", in_device=0)
+    plan = linkmod.link(["a", "b"], root=tmp_path)
+    assert "cross_gpu" not in plan.reasons

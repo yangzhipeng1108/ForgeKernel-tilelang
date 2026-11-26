@@ -75,6 +75,16 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # and an unknown kind cannot be moved, so it is rejected at link time (L-HANDLE).
 HANDLE_KINDS = ("tmem", "reg", "smem")
 
+# Cross-GPU ports. A port may name the ``device`` it lives on (an int device index; absent
+# means device 0, the single-GPU case every existing component is). When two linked stages sit
+# on different devices the seam is not an in-SM tensor import but a *communication*, and the
+# linker can only check the declaration, never the transfer: no GPU to time it. So the port
+# must additionally name a ``transport`` the linker knows, and an unknown transport is refused
+# (L-XGPU) exactly as an unknown handle kind is (L-HANDLE). This is static, declaration-level
+# modelling of multi-GPU pipelines — it proves the graph is *wired* for cross-device data, not
+# that the transfer is fast.
+TRANSPORTS = ("nvlink", "pcie", "h2d", "d2h", "shmem_ipa", "rdma")
+
 # component.toml's known top-level tables. An unknown table is a finding, not silently
 # ignored: a typo'd ``[require]`` next to ``[requires]`` must not read as "no requires".
 # ``resources`` and ``roles`` are what a linker solves at link time (forgekernel.link):
@@ -365,6 +375,13 @@ def _port_handle_problems(spec: dict, where: str) -> list[str]:
         g = spec["generation"]
         if not isinstance(g, int) or isinstance(g, bool) or g < 0:
             out.append(f"{where}: generation must be a non-negative int, got {g!r}")
+    if "device" in spec:
+        d = spec["device"]
+        if not isinstance(d, int) or isinstance(d, bool) or d < 0:
+            out.append(f"{where}: device must be a non-negative int, got {d!r}")
+    if "transport" in spec and spec["transport"] not in TRANSPORTS:
+        out.append(f"{where}: transport must be one of {list(TRANSPORTS)}, "
+                   f"got {spec['transport']!r}")
     return out
 
 
