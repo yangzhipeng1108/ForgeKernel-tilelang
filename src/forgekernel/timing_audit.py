@@ -344,3 +344,93 @@ def ncu_reconciliation_warning(profiler: dict, timed_ms, verdict: HostBoundVerdi
             f"eval/ncu_run.py) or the GPU sat idle behind a host bottleneck. The bench "
             f"reports no host_enqueue_ms, so the two cannot be told apart; have "
             f"eval/bench.py report the enqueue clock (timing.py measure_windows).")
+
+
+# --- offline vs server dual evaluation (CUDA-L2's two measurement modes) ----------------
+#
+# CUDA-L2 times every kernel in two modes and reports both, because they answer different
+# deployment questions and disagree: on the same GPU its offline gain over cuBLAS was +19.2%
+# while its server-mode gain was +26.0% (H100: +17.5% offline vs +40.5% server). "Offline"
+# is the one-shot back-to-back batch window (this repo's device window) — kernel quality.
+# "Server" is the same kernel driven at a fixed offered request rate (this repo's server
+# window at ``server:<qps>``) — what a served deployment pays, where queueing behind other
+# requests and launch gaps at low batch change the ranking. A kernel can win one and lose
+# the other, so a run that only reads one mode can ship a regression behind its own back.
+#
+# The record already carries both (See IterationRecord.server_median_ms). This helper folds a
+# run's records into the dual view the digest shows and the divergence warning a reader needs.
+
+# Above this many ratio points of divergence between the offline and server gains, the two
+# modes are telling different stories about the same kernel. 0.05 = five percent — comfortably
+# above cross-job noise on a same-mode ratio, so a flagged divergence is a real mode split.
+MODE_DIVERGENCE = 0.05
+
+
+def _best_ratio(records, attr: str):
+    """The best (max) same-job ratio in ``records`` for the given ratio attribute."""
+    vals = [getattr(r, attr) for r in records
+            if getattr(r, attr, None) is not None and r.verdict == "KEEP"]
+    return max(vals) if vals else None
+
+
+@dataclass(frozen=True)
+class DualEval:
+    """A run's offline (device) vs server speedups, and whether they diverge."""
+
+    offline_ratio: float | None      # best KEEP vs_ref_device
+    server_ratio: float | None       # best KEEP vs_ref_server
+    server_qps: float | None         # the offered rate the server reading was taken at
+    divergence: float | None         # server_ratio - offline_ratio (None if either absent)
+
+    @property
+    def both_measured(self) -> bool:
+        return self.offline_ratio is not None and self.server_ratio is not None
+
+    @property
+    def diverges(self) -> bool:
+        return (self.divergence is not None
+                and abs(self.divergence) >= MODE_DIVERGENCE)
+
+
+def offline_vs_server(records) -> DualEval:
+    """The dual-evaluation view off a run's records.
+
+    Reads the best KEPT ratio in each mode (the loop keeps the best tree, so its reading in
+    both windows is the deployed claim). ``server_qps`` is taken from the record that carried
+    the best server ratio, so a divergence number is always read against the rate it was
+    measured at — a server ratio without its QPS is comparable to nothing (the field's own
+    contract)."""
+    offline = _best_ratio(records, "vs_ref_device")
+    server = _best_ratio(records, "vs_ref_server")
+    qps = None
+    if server is not None:
+        best = max((r for r in records if getattr(r, "vs_ref_server", None) is not None
+                    and r.verdict == "KEEP"),
+                   key=lambda r: r.vs_ref_server)
+        qps = getattr(best, "server_qps", None)
+    divergence = (server - offline) if (server is not None and offline is not None) else None
+    return DualEval(offline_ratio=offline, server_ratio=server, server_qps=qps,
+                    divergence=divergence)
+
+
+def dual_eval_note(dual: DualEval) -> str:
+    """The divergence warning (or a within-noise note), or "" when only one mode ran.
+
+    Never a stop — the gate window the run chose still decides its verdicts. This is the
+    second opinion a CUDA-L2 reader is trained to ask for: "did the offline win survive at
+    the served rate?" A kernel that improves offline but regresses in server mode is a
+    deployment regression the offline gate cannot see, so it must surface, loudly, even when
+    the run is green on the offline window."""
+    if not dual.both_measured:
+        return ""
+    qps_tag = f" at {dual.server_qps:g} req/s" if dual.server_qps is not None else ""
+    if not dual.diverges:
+        return (f"offline {dual.offline_ratio:.3f}x vs server {dual.server_ratio:.3f}x"
+                f"{qps_tag} — within noise ({dual.divergence:+.3f} < "
+                f"{MODE_DIVERGENCE:.3f}); the offline win holds at the served rate.")
+    direction = "stronger" if dual.divergence > 0 else "WEAKER"
+    return (f"OFFLINE/SERVER DIVERGENCE: offline {dual.offline_ratio:.3f}x vs server "
+            f"{dual.server_ratio:.3f}x{qps_tag} ({dual.divergence:+.3f}) — the server-mode "
+            f"gain is {direction} than offline. The offline gate cannot see this; confirm the "
+            f"kernel's deployed claim in server mode before citing the offline number.")
+
