@@ -121,8 +121,23 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    (annotation), `_bank_evidence`/`_evidence_dir`/`_read_milestone` (lazy shims, no
    back-reference). **Deferred:** `run_meta_step` + the meta engine stays in driver
    (the orchestration core, not a leaf).
-8. **`loop/gap_queue.py`** ← "out-of-run gap queue" (23/89 — 3,629 lines; extract
-   last, it sits on top of most of the above).
+8. ✅ **`loop/gap_queue.py`** — **first slice DONE** (the gap-queue core). The
+   "out-of-run gap queue" section was again mixed: 4816–5108 is the gap-queue core
+   (GapRow, parse/load/persist, recon-completion state, `_agent_turn`,
+   `_recon_prompt`; 18 names), while the rest is the recon/pricing/distill/two_layer
+   engine. Only the core moved. Needs 7 driver deps: `AgentError`/`ReconResult`/
+   `_recon_state_path` (module-load, defined before), `LoopContext` (annotation),
+   `_bank_evidence`/`_evidence_dir`/`_teacher` (lazy shims; no back-reference).
+   **Deferred:** `run_recon_step`, pricing toolkits, `run_distill_step`,
+   `run_two_layer`, `run_best_confirmation` stay in driver (orchestration core).
+   **Pitfall hit and fixed twice here:** (a) `TRUNCATION_BACKOFF_S` is an *annotated*
+   assignment (`AnnAssign`) — the first pass only collected `Assign`, so it was
+   dropped from `__all__`/re-export and conftest's `setattr(driver,
+   "TRUNCATION_BACKOFF_S", ())` failed; added it. (b) conftest patches that name on
+   `driver`, but `_agent_turn` read its own module global — the retry loop then used
+   the real 60–300 s backoff and the suite hung. `_agent_turn` now reads
+   `driver.TRUNCATION_BACKOFF_S` at call time. Same lesson as `_ncu_profiler`: any
+   name a test patches on `driver` must be read through `driver`.
 9. What remains in `driver.py` after 1–8 is the orchestration core
    (`LoopContext`, `run_inner_loop`, `run_meta_step`, `run_two_layer`,
    `run_kb_certify`, `MetaResult`, `KbCertifyResult`) — the genuinely driver-shaped
