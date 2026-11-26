@@ -33,9 +33,10 @@ filled with a `PROBE PASS` job id or a moved NCU census axis, and records the `a
 
 | Interface | Entry | Evidence |
 |---|---|---|
-| `cp.async` 16 B copy ring + `commit_group`/`wait_group` double buffering | `cp_async_ring.md` | `[to be measured]` |
-| `mma.sync` HMMA run + operand feed from `ldmatrix` | `mma_sync_hmma_run_register_feed.md` | `[to be measured]` |
-| smem swizzle / bank-conflict face for `ldmatrix`↔`stmatrix` | `smem_traffic_triage.md` | `[to be measured]` |
+| Half-precision GEMM: `mma.sync` HMMA + `cp.async` double-buffered feed | `hgemm_sm86_mma_cp_async.md` | `[to be measured]` |
+| `cp.async` 16 B copy ring + `commit_group`/`wait_group` double buffering | `hgemm_sm86_mma_cp_async.md` (mechanism) | `[to be measured]` |
+| `mma.sync` HMMA run + operand feed from `ldmatrix` | `hgemm_sm86_mma_cp_async.md` (mechanism) | `[to be measured]` |
+| smem swizzle / bank-conflict face for `ldmatrix`↔`stmatrix` | `hgemm_sm86_mma_cp_async.md` (gotcha 7) | `[to be measured]` |
 | Writing a GPU probe: one rung per process, verdicts to a file | `gpu_probe_ladder.md` | `[to be measured]` |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
