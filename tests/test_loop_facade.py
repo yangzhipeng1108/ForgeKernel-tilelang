@@ -217,6 +217,7 @@ EXTRACTED_MODULES = (
     "forgekernel.loop.shared",
     "forgekernel.loop.timeline",
     "forgekernel.loop.gap_queue",
+    "forgekernel.loop.best_confirmation",
 )
 
 

@@ -142,6 +142,16 @@ The order is leaf-ish → central. Suggested target modules under `loop/`:
    (`LoopContext`, `run_inner_loop`, `run_meta_step`, `run_two_layer`,
    `run_kb_certify`, `MetaResult`, `KbCertifyResult`) — the genuinely driver-shaped
    code. Target: `driver.py` under ~2,000 lines.
+   - ✅ **Tail leaf done: `loop/best_confirmation.py`** (7 names:
+     `CONFIRM_NODE_BAND_PCT`, `_keep_reading_of`, `_job_node`, `_pct_off`,
+     `_confirm_workload_medians`, `run_best_confirmation`, `apply_window_credit`).
+     A clean leaf — only `BackendError` (load) + `LoopContext` (annotation); the rest
+     from comparisons/prompt/trajectory/parse. `run_best_confirmation` is called only
+     from driver (via its re-export binding), so the test that monkeypatches it on
+     `driver` still takes effect.
+   - The remaining bulk (the ~5 giant orchestrators above + the recon/pricing/timeline
+     meta engine) is intentionally left in driver: it is mutually recursive core, not
+     separable leaves. Further line reduction is not worth the risk.
 
 ## How to do one step mechanically (avoid transcription bugs)
 
