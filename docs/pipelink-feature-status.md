@@ -13,7 +13,8 @@ lower 运行的真实 kernel。
 - 文档：`components/README.md`（用法）
 - 测试：`tests/test_link.py`（50 项 + 5 项 torch 跳过）、`tests/test_component.py`（29 项）
 
-最新提交：`7885ef4`。
+状态以 `main` 分支为准（`git log -- src/forgekernel/link.py src/forgekernel/component.py`
+看最近改动）；本文不固定提交号，避免每次提交后过时。
 
 ---
 

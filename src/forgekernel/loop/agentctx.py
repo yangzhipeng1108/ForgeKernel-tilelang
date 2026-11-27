@@ -65,7 +65,10 @@ _USE = re.compile(r"--model(?:=|\s+)(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
 _SH_ASSIGN = re.compile(r"\b(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"\n]*\"|'[^'\n]*'|[^\s;&|]+)")
 _CONFIG_DIR_ASSIGN = re.compile(r"\bCLAUDE_CONFIG_DIR=(\"[^\"\n]*\"|'[^'\n]*'|[^\s;&|]+)")
 _WINDOW_ASSIGN = re.compile(r"\bCLAUDE_CODE_AUTO_COMPACT_WINDOW=['\"]?([0-9_]+)")
-_SCRIPT_TOKEN = re.compile(r"(?<![\w/.-])((?:~|\$HOME|/)?[\w./~$-]*\.(?:sh|bash|zsh))\b")
+# A script token may be a posix path (``/a/b.sh``, ``~/x.sh``) or a Windows one
+# (``E:\\a\\b.sh``): the class carries ``:`` and ``\\`` so a drive-qualified path is captured
+# whole rather than leaving a bare ``b.sh`` that joins cwd and misses the real file.
+_SCRIPT_TOKEN = re.compile(r"(?<![\w/.-])((?:~|\$HOME)?[\w./~$:\\-]*\.(?:sh|bash|zsh))\b")
 
 # ``unset ANTHROPIC_BASE_URL`` / ``env -u ANTHROPIC_BASE_URL`` and their
 # variable forms make a leg first-party (official endpoint, 1M window, no clamp).

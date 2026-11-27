@@ -18,6 +18,13 @@ import pytest
 from forgekernel.loop import goal_ref as gr
 from forgekernel.loop.parse import parse_eval
 
+# The session tests below spawn a real agent through Popen(start_new_session=True) and reap it
+# with os.killpg/os.getpgid -- POSIX process groups that do not exist on Windows (killpg is
+# absent, start_new_session raises OSError). The subsystem runs on the Linux GPU box; skip these
+# there rather than fail on a Windows dev host.
+posix_only = pytest.mark.skipif(sys.platform == "win32",
+                                reason="goal-ref sessions use POSIX process groups (killpg)")
+
 SRC = Path(gr.__file__).resolve().parents[2]
 
 
@@ -248,6 +255,7 @@ def test_check_wants_the_report_and_the_bar_or_the_deadline(tmp_path):
 
 # -- the whole generation, stubbed --------------------------------------------------------
 
+@posix_only
 def test_generation_accepts_the_fastest_correct_candidate(tmp_path):
     g, gpus, trace = _gen(tmp_path, [WRONG_FAST, SLOW_OK, FAST_OK], exec_cmd="python3 probes/p.py")
     state = gr.generate(g)
@@ -295,6 +303,7 @@ def test_generation_accepts_the_fastest_correct_candidate(tmp_path):
                    milestone_valid=False).action == "reuse"
 
 
+@posix_only
 def test_a_library_call_is_never_the_reference(tmp_path):
     lib = "import flashinfer\ndef run(x, out):\n    flashinfer.copy(x, out)\n# MS=0.3 # OK\n"
     g, _, trace = _gen(tmp_path, [lib, SLOW_OK], hours=3 / 3600, kill_grace_s=0.5)
@@ -306,6 +315,7 @@ def test_a_library_call_is_never_the_reference(tmp_path):
     assert not state["arch"]["declare"]
 
 
+@posix_only
 def test_nothing_correct_fails_and_refuses_the_next_launch(tmp_path):
     g, _, _ = _gen(tmp_path, [WRONG_FAST], hours=2 / 3600, kill_grace_s=0.5)
     with pytest.raises(gr.GoalRefError, match="no eligible candidate"):
@@ -316,6 +326,7 @@ def test_nothing_correct_fails_and_refuses_the_next_launch(tmp_path):
                 milestone_valid=False)
 
 
+@posix_only
 def test_the_deadline_ends_a_session_that_does_not_stop(tmp_path):
     g, _, _ = _gen(tmp_path, [SLOW_OK], hours=4 / 3600, linger=600, kill_grace_s=0.5)
     t0 = time.time()
@@ -325,6 +336,7 @@ def test_the_deadline_ends_a_session_that_does_not_stop(tmp_path):
     assert state["attempts"][0]["rc"] != 0          # ended from outside
 
 
+@posix_only
 def test_the_session_keeps_a_report_window_past_the_deadline(tmp_path):
     """The leg's clock runs to deadline + report_s: a session still writing its report
     when the deadline passes is not ended there, and the leg is told the same bound."""
@@ -339,6 +351,7 @@ def test_the_session_keeps_a_report_window_past_the_deadline(tmp_path):
     assert int(env["FK_GOAL_DEADLINE"]) == int(state["deadline"] + 600)
 
 
+@posix_only
 def test_a_candidate_rewritten_after_its_evaluation_is_not_accepted(tmp_path):
     g, gpus, _ = _gen(tmp_path, [SLOW_OK, FAST_OK], tamper="002")
     state = gr.generate(g)
@@ -348,6 +361,7 @@ def test_a_candidate_rewritten_after_its_evaluation_is_not_accepted(tmp_path):
     assert not [b for b, _ in gpus[0].jobs if b.startswith("accept-002")]
 
 
+@posix_only
 def test_the_sessions_records_are_read_only_to_it(tmp_path):
     g, _, _ = _gen(tmp_path, [FAST_OK])
     gr.generate(g)
@@ -451,6 +465,7 @@ def test_the_session_needs_a_goal_capable_agent_command(tmp_path, monkeypatch):
         agent_cmd="claude -p", teacher_agent_cmd=f"bash {script} m")) is None
 
 
+@posix_only
 def test_an_orphaned_leg_is_ended_only_when_it_is_ours(tmp_path):
     g, _, _ = _gen(tmp_path, [SLOW_OK])
     sleeper = tmp_path / "sleeper.py"
