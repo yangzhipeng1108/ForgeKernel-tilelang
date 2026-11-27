@@ -91,6 +91,8 @@ are the kind of thing only a counter can settle:
 | **Re-running the archived probes** — one entry point, hardware readings appended per run | `_probes/revalidate_probes.py` | harness ✅ a probe runs in a subprocess under a timeout; sk / sk_fixed / ca2 / mla5 / g1(BN64) re-ran, all `cos=1.00000`; caught a real bug in the archived `sk.py` |
 | **The four winning probes as importable modules** — verdict baked into the API | `kernels/sm120_README.md` | ✅ all 4 re-ran on the 6000D: gemm SK8 182.8 TF / causal 145 TF / gqa 228 GB/s / mla 69.7 TF, `md=0` or `cos=1.00000` |
 | **Nine serving-path kernels** — gemm f16/fp8/lm_head, prefill, rmsnorm + the four above | `kernels/sm120_README.md` | ✅ all re-ran on the 6000D: f16 158.8 TF / fp8 375.2 TF / lm_head 73.3 TF (fp8 133.2) / prefill 143.8 TF / rmsnorm 1277.7 GB/s, all `cos~1.0` |
+| **SM12X PCIe collective backend** — the default is not the best (Cake→NCCL 6.6–8×), message size picks the backend, `NCCL_P2P_LEVEL=SYS` +18 %, 4 KB/16 MB probe tells latency-bound from bandwidth-bound | `sm120_pcie_collectives.md` | ⚠️ 8×6000D deployment (vLLM), not our probe: backend swap 8.1× prefill / 6.6× decode; small-msg wins latency path but SM12X has no multicast so it collapses to NCCL vs FP8-wire; confirm on the box |
+| **SM12X serving decode levers** — prefix cache moves long-context TTFT 38–54×; CUDA Graph lifts decode 10.97→29.23 steps/s (2.7×), so the `cuda_graph` gate is real | `sm120_serving_decode_levers.md` | ⚠️ 8×6000D deployment (vLLM): prefix-cache TTFT table + eager-vs-graph decode; this is why `ServingReading` records `prefix_cache`/`context_len` and `compare_to_baseline` refuses a cross-state ratio |
 
 ## Symptoms that will demand a recipe (no entry yet — probe it, then write it)
 

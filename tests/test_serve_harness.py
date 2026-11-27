@@ -111,6 +111,14 @@ def test_reading_from_fake_summary_maps_fields():
     assert r.gates == {}            # no run_gates -> nothing checked
 
 
+def test_reading_threads_prefix_cache_and_context_len_from_config():
+    out = json.dumps({"output_throughput": 730.0, "median_ttft_ms": 6400.0, "median_tps": 45.6})
+    r = run_once(_cfg(prefix_cache=True, input_len=32768), start_server=lambda c, e: object(),
+                 run_bench=lambda c: out, concurrency=16)
+    assert r.prefix_cache is True
+    assert r.context_len == 32768     # defaults to input_len
+
+
 def test_unmeasured_run_yields_none_not_zero():
     r = run_once(_cfg(), start_server=lambda c, e: object(),
                  run_bench=lambda c: "no json here", concurrency=16)
@@ -182,6 +190,39 @@ def test_compare_carries_blocked_gates():
     v = compare_to_baseline(cand, base)
     assert v["deployable"] is False
     assert v["blocked_gates"] == [GATE_GRAPH]
+
+
+def test_compare_refuses_across_prefix_cache_state():
+    # RTX 6000D: prefix cache moves a 512K TTFT from 239s to 4.4s (54x) -- comparing a cached
+    # run's tok/s/TTFT to an uncached one reports a workload change, not a faster kernel.
+    cand = ServingReading(16, 730.0, 4400.0, 46.0, prefix_cache=True)
+    base = ServingReading(16, 24.0, 239360.0, 0.7, prefix_cache=False)
+    v = compare_to_baseline(cand, base)
+    assert "tok_s_ratio" not in v and "ttft_ratio" not in v
+    assert "prefix-cache mismatch" in v["reason"]
+
+
+def test_compare_refuses_across_context_length():
+    cand = ServingReading(16, 300.0, 730.0, 40.0, context_len=32768)
+    base = ServingReading(16, 30.0, 4410.0, 5.0, context_len=524288)
+    v = compare_to_baseline(cand, base)
+    assert "tok_s_ratio" not in v
+    assert "context-length mismatch" in v["reason"]
+
+
+def test_compare_allows_ratio_when_prefix_cache_and_context_match():
+    cand = ServingReading(16, 730.0, 730.0, 46.0, prefix_cache=True, context_len=32768)
+    base = ServingReading(16, 522.0, 1460.0, 33.0, prefix_cache=True, context_len=32768)
+    v = compare_to_baseline(cand, base)
+    assert v["tok_s_ratio"] == pytest.approx(730.0 / 522.0)
+
+
+def test_compare_does_not_refuse_on_unknown_prefix_cache():
+    # None = not recorded -> cannot make the cross-workload claim, so fall through to the ratio.
+    cand = ServingReading(16, 730.0, 6400.0, 46.0)          # prefix_cache None
+    base = ServingReading(16, 522.0, 24400.0, 33.0, prefix_cache=True)
+    v = compare_to_baseline(cand, base)
+    assert v["tok_s_ratio"] == pytest.approx(730.0 / 522.0)
 
 
 # ---------------------------------------------------------------- sweep

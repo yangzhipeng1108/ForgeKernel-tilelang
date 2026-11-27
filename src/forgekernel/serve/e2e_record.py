@@ -50,6 +50,11 @@ class ServingReading:
     num_prompts: int | None = None
     backend: str | None = None          # the server backend this reading was taken against
     gates: dict[str, bool | None] = field(default_factory=dict)  # GATES -> True/False/None
+    # The two run facts that swing TTFT by tens of times (RTX 6000D: prefix cache moves a 512K
+    # TTFT from 239s to 4.4s, 54x), so a reading without them is not comparable to one that had
+    # the other setting. ``None`` = not recorded (the comparison then cannot make the claim).
+    prefix_cache: bool | None = None    # was prefix/KV-prefix caching enabled for this run
+    context_len: int | None = None      # the prompt length the run was measured at
 
     def gate(self, name: str) -> bool | None:
         return self.gates.get(name)
@@ -80,7 +85,8 @@ def _parse_float(value) -> float | None:
 
 
 def serving_reading_from_bench(args, summary: dict, *, backend: str | None = None,
-                               gates: dict | None = None) -> ServingReading:
+                               gates: dict | None = None, prefix_cache: bool | None = None,
+                               context_len: int | None = None) -> ServingReading:
     """Build a :class:`ServingReading` from a ``bench_serving`` run's args and JSON summary.
 
     ``args`` is what we ASKED for (concurrency, input/output length, prompt count) -- those are
@@ -88,17 +94,22 @@ def serving_reading_from_bench(args, summary: dict, *, backend: str | None = Non
     ``summary`` is the server's own result JSON (``sglang.bench_serving`` prints one); its key
     names are the upstream contract, read defensively so a version bump that renames a field
     degrades to None rather than crashing the harness. ``gates`` is the deploy-gate verdicts
-    from :mod:`forgekernel.serve.checks`, threaded through unchanged."""
+    from :mod:`forgekernel.serve.checks`, threaded through unchanged. ``prefix_cache`` is the
+    server's prefix-caching state (a TTFT-affecting fact the summary never carries); ``context_len``
+    defaults to the input length this run was measured at."""
+    input_len = getattr(args, "random_input_len", None)
     return ServingReading(
         concurrency=int(getattr(args, "max_concurrency", 0) or 0),
         tok_s=_parse_float(summary.get("output_throughput")),
         ttft_s=_parse_float(summary.get("median_ttft_ms", summary.get("mean_ttft_ms"))),
         tps_per_user=_parse_float(summary.get("median_tps", summary.get("mean_tps"))),
-        input_len=getattr(args, "random_input_len", None),
+        input_len=input_len,
         output_len=getattr(args, "random_output_len", None),
         num_prompts=getattr(args, "num_prompts", None),
         backend=backend,
         gates=dict(gates or {}),
+        prefix_cache=prefix_cache,
+        context_len=context_len if context_len is not None else input_len,
     )
 
 
@@ -115,6 +126,23 @@ def compare_to_baseline(candidate: ServingReading, baseline: ServingReading) -> 
         out["reason"] = (f"concurrency mismatch: candidate C={candidate.concurrency} vs "
                          f"baseline C={baseline.concurrency}; a tok/s ratio across "
                          f"concurrencies is a queueing artefact, not a win")
+        return out
+    # Prefix caching and context length swing TTFT by tens of times (RTX 6000D: a 512K TTFT of
+    # 239s becomes 4.4s with the cache on, 54x), so a tok/s/TTFT ratio across a differing
+    # prefix-cache state or a differing context length compares two different workloads, not a
+    # faster kernel. Reject like the concurrency mismatch instead of reporting a bogus win.
+    if (candidate.prefix_cache is not None and baseline.prefix_cache is not None
+            and candidate.prefix_cache != baseline.prefix_cache):
+        out["reason"] = (f"prefix-cache mismatch: candidate "
+                         f"{'on' if candidate.prefix_cache else 'off'} vs baseline "
+                         f"{'on' if baseline.prefix_cache else 'off'}; TTFT/throughput across a "
+                         f"differing prefix-cache state is not comparable")
+        return out
+    if (candidate.context_len is not None and baseline.context_len is not None
+            and candidate.context_len != baseline.context_len):
+        out["reason"] = (f"context-length mismatch: candidate {candidate.context_len} vs "
+                         f"baseline {baseline.context_len}; a ratio across differing prompt "
+                         f"lengths measures different workloads, not a faster kernel")
         return out
     if candidate.tok_s and baseline.tok_s:
         out["tok_s_ratio"] = candidate.tok_s / baseline.tok_s

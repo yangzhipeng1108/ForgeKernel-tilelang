@@ -39,7 +39,10 @@ class ServeConfig:
     ``serve_flags`` are appended verbatim to ``sglang serve`` (backend choices, page size,
     tp/ep ...); ``env`` is the server process environment; ``concurrencies`` the client loads to
     sweep. ``image`` / ``model_path`` are recorded so a reading knows what it was taken against.
-    A ``bench_extra_flags`` list threads any client-side flag the caller needs."""
+    A ``bench_extra_flags`` list threads any client-side flag the caller needs.
+
+    On a PCIe-only SM12X box (RTX 6000D, no NVLink) put ``NCCL_P2P_LEVEL=SYS`` in ``env`` -- it is
+    the cheapest small-message decode lever there (see hw_kb/tilelang/sm120/sm120_pcie_collectives.md)."""
 
     model_path: str
     image: str = "lmsysorg/sglang:dev"
@@ -55,6 +58,10 @@ class ServeConfig:
     python: str = "python3"
     bench_extra_flags: list[str] = field(default_factory=list)
     run_gates: tuple[str, ...] = ()
+    # prefix caching + context length: the two run facts that swing TTFT by tens of times on a
+    # Blackwell/PCIe box (RTX 6000D 512K TTFT 239s -> 4.4s with the cache, 54x). Recorded on every
+    # reading so compare_to_baseline can refuse a cross-workload ratio. None = not asserted.
+    prefix_cache: bool | None = None
 
 
 def serve_command(cfg: ServeConfig) -> list[str]:
@@ -132,7 +139,8 @@ def run_once(cfg: ServeConfig, *, start_server, run_bench, run_checks=None,
         for name in cfg.run_gates:
             gates[name] = result.get(name)
     return serving_reading_from_bench(_Args(cfg, concurrency), summary,
-                                      backend=cfg.backend, gates=gates)
+                                      backend=cfg.backend, gates=gates,
+                                      prefix_cache=cfg.prefix_cache)
 
 
 def run_sweep(cfg: ServeConfig, *, start_server, run_bench, run_checks=None) -> list[ServingReading]:
@@ -152,7 +160,8 @@ def run_sweep(cfg: ServeConfig, *, start_server, run_bench, run_checks=None) -> 
             for name in cfg.run_gates:
                 gates[name] = result.get(name)
         readings.append(serving_reading_from_bench(_Args(cfg, c), summary,
-                                                   backend=cfg.backend, gates=gates))
+                                                   backend=cfg.backend, gates=gates,
+                                                   prefix_cache=cfg.prefix_cache))
     return readings
 
 

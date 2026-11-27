@@ -215,7 +215,8 @@ def run_deployment(cfg: ServeConfig, *, start=None, bench=None, gate_runners=Non
                 res = run_checks(handle, cfg, gate_runners=gate_runners) or {}
                 for name in cfg.run_gates:
                     gates[name] = res.get(name)
-            readings.append(serving_reading_from_bench(_A, summary, backend=cfg.backend, gates=gates))
+            readings.append(serving_reading_from_bench(_A, summary, backend=cfg.backend, gates=gates,
+                                                       prefix_cache=cfg.prefix_cache))
     finally:
         if isinstance(handle, ServerHandle):
             handle.stop()
