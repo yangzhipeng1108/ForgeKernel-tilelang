@@ -362,6 +362,10 @@ def test_dry_run_prints_the_plan_and_creates_nothing(repo, capsys):
 def test_forge_init_copies_the_task_template(tmp_path, monkeypatch):
     real = launch.repo_root()
     monkeypatch.setattr(launch, "repo_root", lambda: tmp_path)
+    # forge init rewrites [task].arch to this box's GPU (sm86 on an RTX 3090), which would make
+    # the task need a KB the test never builds -- hardware-dependent. Pin "no GPU detected" so
+    # the template's own sm100 stands, matching the hw_kb/cutedsl/sm100 created below.
+    monkeypatch.setattr(launch.arch_mod, "detect_arch", lambda *a, **k: None)
     shutil.copytree(real / "tasks" / "_template", tmp_path / "tasks" / "_template")
     for kb in ("hw_kb/cutedsl/sm100",):
         (tmp_path / kb).mkdir(parents=True)
